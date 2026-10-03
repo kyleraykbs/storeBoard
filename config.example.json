@@ -1,0 +1,9 @@
+{
+  "configVersion": 1,
+  "dataDir": "/home/alice/.local/share/storeboard",
+  "socket": "/run/user/1000/storeboard.sock",
+  "folders": [
+    { "name": "photos", "path": "/home/alice/Pictures" },
+    { "name": "documents", "path": "/home/alice/Documents" }
+  ]
+}
