@@ -19,7 +19,7 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
 
 - `cmd/`, `internal/`, `pkg/api` — Go. `pkg/api` is the versioned JSON
   contract; every command takes `--json` and prints those shapes verbatim.
-- `nix/` — one NixOS module (daemon + CLI under `services.storeboardd`)
+- `nix/` — one NixOS module (daemon + CLI under `services.storeboard`)
   and the home-manager CLI module.
 - `agents/` — decisions, structure, terminology for agent sessions.
 - `DESIGN.md` — invariants every change is checked against.
@@ -51,8 +51,8 @@ the unix socket); human output is free to change, JSON shapes are not.
 
     # configuration.nix — one options set: runs the daemon and installs the
     # CLI for every user, pointed at the daemon's config via STOREBOARD_CONFIG
-    imports = [ inputs.storeboard.nixosModules.storeboardd ];
-    services.storeboardd = {
+    imports = [ inputs.storeboard.nixosModules.storeboard ];
+    services.storeboard = {
       enable = true;
       folders = [ { name = "photos"; path = "/srv/photos"; } ];
     };

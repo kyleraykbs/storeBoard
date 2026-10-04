@@ -1,6 +1,6 @@
 # NixOS module for storeboard — one options set for the daemon and its CLI.
 #
-#   services.storeboardd = {
+#   services.storeboard = {
 #     enable = true;
 #     folders = [
 #       { name = "photos"; path = "/srv/photos"; }
@@ -19,17 +19,17 @@
 let
   opts = import ./storeboard-options.nix { inherit lib pkgs; };
 
-  cfg = config.services.storeboardd;
+  cfg = config.services.storeboard;
 
   # The configuration the daemon reads: an explicit file when the user has
   # one (useful for secrets or externally managed config), the generated and
   # build-time-validated JSON otherwise.
-  configFile = if cfg.configFile != null then cfg.configFile else "/etc/storeboardd/config.json";
+  configFile = if cfg.configFile != null then cfg.configFile else "/etc/storeboard/config.json";
 
-  generatedConfig = opts.checkedConfig cfg.package cfg "storeboardd-config";
+  generatedConfig = opts.checkedConfig cfg.package cfg "storeboard-config";
 in
 {
-  options.services.storeboardd = {
+  options.services.storeboard = {
     enable = lib.mkEnableOption "the storeboard sync daemon";
 
     package = lib.mkOption {
@@ -85,11 +85,11 @@ in
             names = map (f: f.name) cfg.folders;
           in
           names == lib.unique names;
-        message = "services.storeboardd.folders: names must be unique";
+        message = "services.storeboard.folders: names must be unique";
       }
       {
         assertion = lib.all (f: lib.hasPrefix "/" f.path) cfg.folders;
-        message = "services.storeboardd.folders: every path must be absolute";
+        message = "services.storeboard.folders: every path must be absolute";
       }
     ];
 
@@ -109,7 +109,7 @@ in
     };
     users.groups.${cfg.group} = { };
 
-    systemd.services.storeboardd = {
+    systemd.services.storeboard = {
       description = "Storeboard sync daemon";
       wantedBy = [ "multi-user.target" ];
 
@@ -158,7 +158,7 @@ in
     # The generated configuration is written to /etc so it is obvious and
     # inspectable; a user-provided file is used exactly as it is.
     environment.etc = lib.mkIf (cfg.configFile == null) {
-      "storeboardd/config.json".source = generatedConfig;
+      "storeboard/config.json".source = generatedConfig;
     };
   };
 }

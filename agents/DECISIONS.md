@@ -40,7 +40,7 @@
 - Reversible: yes (mode is a constant in internal/server)
 
 ## [2026-10-04] One options set: the CLI rides with the daemon
-- Decision: `services.storeboardd` is the only NixOS options set — enabling
+- Decision: `services.storeboard` is the only NixOS options set — enabling
   it runs the daemon, installs `storeboard` for every user and sets
   `STOREBOARD_CONFIG` to the config file it reads. The separate
   `programs.storeboard` NixOS module (nix/storeboard-nixos.nix,
@@ -48,4 +48,14 @@
   `programs.storeboard` as that scope's single set.
 - Why: user direction — two option sets configured one thing, and their
   socket options could disagree, breaking `storeboard status`.
+- Reversible: yes
+
+## [2026-10-04] `storeboardd` is only a binary name
+- Decision: the options set is `services.storeboard`, the unit is
+  `storeboard.service`, the module file nix/storeboard.nix, the config
+  /etc/storeboard/config.json, and `nixosModules.storeboard` exports it (the
+  deleted CLI module's old name, now carrying the daemon module).
+  `storeboardd` survives only as the daemon binary — ExecStart, apps, cmd/.
+- Why: user direction — storeboard is the project; the d suffix marks the
+  process, not the namespace.
 - Reversible: yes
