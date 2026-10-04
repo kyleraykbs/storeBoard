@@ -1,4 +1,4 @@
-# NixOS service for storeboardd.
+# NixOS module for storeboard — one options set for the daemon and its CLI.
 #
 #   services.storeboardd = {
 #     enable = true;
@@ -6,6 +6,10 @@
 #       { name = "photos"; path = "/srv/photos"; }
 #     ];
 #   };
+#
+# Enabling it runs the daemon and installs `storeboard` for every user, with
+# STOREBOARD_CONFIG pointed at the config file the daemon reads — there is no
+# separate CLI module or option set to also enable.
 {
   config,
   lib,
@@ -88,6 +92,14 @@ in
         message = "services.storeboardd.folders: every path must be absolute";
       }
     ];
+
+    # The CLI rides with the daemon: one package holds both binaries, and the
+    # env var points every user's CLI at the file this module generates from
+    # the same options — the CLI and the daemon can never disagree about the
+    # socket. A home-manager config still wins when one exists: the CLI
+    # prefers an existing per-user file.
+    environment.systemPackages = [ cfg.package ];
+    environment.variables.STOREBOARD_CONFIG = "${configFile}";
 
     users.users.${cfg.user} = {
       isSystemUser = true;

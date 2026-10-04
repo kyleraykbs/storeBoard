@@ -28,10 +28,13 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
 
 ## Nix
 
-- `nix/storeboard-options.nix` — shared option set + `configJSON` generator.
-- `nix/storeboardd.nix` — NixOS service module (`services.storeboardd`).
-- `nix/storeboard-nixos.nix` — system-wide CLI + `/etc/storeboard/config.json`.
-- `nix/storeboard-hm.nix` — home-manager CLI + XDG config file.
+- `nix/storeboard-options.nix` — shared options + `configJSON`, generated
+  through `checkedConfig` so the build runs the real `config check`.
+- `nix/storeboardd.nix` — the NixOS module: `services.storeboardd` runs the
+  daemon, installs the CLI for every user and points `STOREBOARD_CONFIG` at
+  the daemon's config. The only NixOS options set.
+- `nix/storeboard-hm.nix` — home-manager CLI module (`programs.storeboard`),
+  that scope's only options set.
 
 ## agents/
 

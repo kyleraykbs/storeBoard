@@ -29,17 +29,6 @@
               inherit config lib pkgs;
               defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.storeboard;
             };
-          storeboard =
-            {
-              config,
-              lib,
-              pkgs,
-              ...
-            }:
-            import ./nix/storeboard-nixos.nix {
-              inherit config lib pkgs;
-              defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.storeboard;
-            };
           default = self.nixosModules.storeboardd;
         };
 
@@ -129,6 +118,107 @@
               storeboard --config ${./config.example.json} config check
               touch $out
             '';
+
+            # The module's contract: enabling services.storeboardd runs the
+            # daemon AND installs the CLI pointed at the daemon's config.
+            # Evaluated against stubbed NixOS options (the patch pattern),
+            # because module files are otherwise invisible to flake check.
+            module-service =
+              let
+                eval = lib.evalModules {
+                  specialArgs = { inherit pkgs; };
+                  modules = [
+                    # The NixOS options storeboardd.nix writes, stubbed:
+                    # enough to evaluate it without a whole system.
+                    (
+                      { lib, ... }:
+                      {
+                        options = {
+                          assertions = lib.mkOption {
+                            type = lib.types.listOf lib.types.anything;
+                            default = [ ];
+                          };
+                          environment.etc = lib.mkOption {
+                            type = lib.types.attrsOf lib.types.anything;
+                            default = { };
+                          };
+                          environment.systemPackages = lib.mkOption {
+                            type = lib.types.listOf lib.types.package;
+                            default = [ ];
+                          };
+                          environment.variables = lib.mkOption {
+                            type = lib.types.attrsOf lib.types.str;
+                            default = { };
+                          };
+                          systemd.services = lib.mkOption {
+                            type = lib.types.attrsOf lib.types.anything;
+                            default = { };
+                          };
+                          users.groups = lib.mkOption {
+                            type = lib.types.attrsOf lib.types.anything;
+                            default = { };
+                          };
+                          users.users = lib.mkOption {
+                            type = lib.types.attrsOf lib.types.anything;
+                            default = { };
+                          };
+                        };
+                      }
+                    )
+                    (
+                      {
+                        config,
+                        lib,
+                        pkgs,
+                        ...
+                      }:
+                      import ./nix/storeboardd.nix {
+                        inherit config lib pkgs;
+                        defaultPackage = storeboard;
+                      }
+                    )
+                    {
+                      config.services.storeboardd = {
+                        enable = true;
+                        folders = [
+                          {
+                            name = "photos";
+                            path = "/srv/photos";
+                          }
+                        ];
+                      };
+                    }
+                  ];
+                };
+
+                cfg = eval.config;
+
+                problems = lib.filter (p: p != null) [
+                  (
+                    if lib.elem storeboard cfg.environment.systemPackages then
+                      null
+                    else
+                      "the CLI is not installed by the module"
+                  )
+                  (
+                    if cfg.environment.variables.STOREBOARD_CONFIG or null == "/etc/storeboardd/config.json" then
+                      null
+                    else
+                      "STOREBOARD_CONFIG does not point at the daemon's config"
+                  )
+                  (
+                    if cfg.systemd.services.storeboardd.serviceConfig.ExecStart or null != null then
+                      null
+                    else
+                      "no daemon unit"
+                  )
+                  (if lib.all (a: a.assertion) cfg.assertions then null else "an assertion failed")
+                ];
+              in
+              if problems == [ ] then
+                pkgs.runCommand "check-module-service" { } "touch $out"
+              else
+                throw "services.storeboardd: ${lib.concatStringsSep "; " problems}";
           };
 
           formatter = pkgs.nixfmt;

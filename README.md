@@ -19,7 +19,8 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
 
 - `cmd/`, `internal/`, `pkg/api` — Go. `pkg/api` is the versioned JSON
   contract; every command takes `--json` and prints those shapes verbatim.
-- `nix/` — NixOS service module, NixOS + home-manager CLI modules.
+- `nix/` — one NixOS module (daemon + CLI under `services.storeboardd`)
+  and the home-manager CLI module.
 - `agents/` — decisions, structure, terminology for agent sessions.
 - `DESIGN.md` — invariants every change is checked against.
 
@@ -48,13 +49,15 @@ the unix socket); human output is free to change, JSON shapes are not.
     # flake.nix
     inputs.storeboard.url = "codeberg.org/kyleraykbs/storeboard";
 
-    # configuration.nix
+    # configuration.nix — one options set: runs the daemon and installs the
+    # CLI for every user, pointed at the daemon's config via STOREBOARD_CONFIG
     imports = [ inputs.storeboard.nixosModules.storeboardd ];
     services.storeboardd = {
       enable = true;
       folders = [ { name = "photos"; path = "/srv/photos"; } ];
     };
 
-    # home-manager
+    # home-manager — optional, per-user: installs the CLI for one user and
+    # writes their XDG config (it wins over the system-wide one)
     imports = [ inputs.storeboard.homeManagerModules.storeboard ];
     programs.storeboard.enable = true;

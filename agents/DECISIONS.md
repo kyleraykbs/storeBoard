@@ -38,3 +38,14 @@
   DESIGN.md pins the invariant: no privileged verb ships while the socket is
   world-accessible.
 - Reversible: yes (mode is a constant in internal/server)
+
+## [2026-10-04] One options set: the CLI rides with the daemon
+- Decision: `services.storeboardd` is the only NixOS options set — enabling
+  it runs the daemon, installs `storeboard` for every user and sets
+  `STOREBOARD_CONFIG` to the config file it reads. The separate
+  `programs.storeboard` NixOS module (nix/storeboard-nixos.nix,
+  nixosModules.storeboard) is gone; home-manager keeps its own
+  `programs.storeboard` as that scope's single set.
+- Why: user direction — two option sets configured one thing, and their
+  socket options could disagree, breaking `storeboard status`.
+- Reversible: yes
