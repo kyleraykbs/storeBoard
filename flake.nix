@@ -180,12 +180,18 @@
                     {
                       config.services.storeboard = {
                         enable = true;
-                        folders = [
-                          {
-                            name = "photos";
-                            path = "/srv/photos";
-                          }
-                        ];
+                        peer = "laptop";
+                        peers = {
+                          laptop.endpoints = [ "192.168.1.10:4242" ];
+                          desktop.endpoints = [ "192.168.1.11:4242" ];
+                        };
+                        groups.family = {
+                          peers = [
+                            "laptop"
+                            "desktop"
+                          ];
+                          folders.photos.mount = "/srv/photos";
+                        };
                       };
                     }
                   ];

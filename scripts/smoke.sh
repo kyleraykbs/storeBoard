@@ -48,10 +48,21 @@ cat >"$config" <<EOF
   "configVersion": 1,
   "dataDir": "$work/data",
   "socket": "$socket",
-  "folders": [
-    { "name": "photos", "path": "$work/Pictures" },
-    { "name": "documents", "path": "$work/Documents" }
-  ]
+  "peer": "laptop",
+  "peers": {
+    "laptop": { "endpoints": ["127.0.0.1:4242"] },
+    "desktop": { "endpoints": [] }
+  },
+  "groups": {
+    "family": {
+      "peers": ["laptop", "desktop"],
+      "folders": {
+        "photos": { "mount": "$work/Pictures" },
+        "documents": {}
+      }
+    }
+  },
+  "mounts": { "documents": "$work/docs" }
 }
 EOF
 
@@ -66,8 +77,13 @@ done
 
 echo "== status, both modes"
 "$CLI" --config "$config" status | grep -q "photos"
+# Group model end to end: identity, membership, and the local mount
+# override winning over the group's default.
 "$CLI" --config "$config" status --json |
-	jq -e --arg s "$socket" '.apiVersion == 1 and .socket == $s and (.folders | length == 2)' >/dev/null
+	jq -e --arg s "$socket" --arg w "$work" '
+		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
+		(.groups | length == 1) and (.folders | length == 2) and
+		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs"))' >/dev/null
 
 echo "== second daemon refused on a live socket"
 if "$DAEMON" --config "$config" 2>/dev/null; then

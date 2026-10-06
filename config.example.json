@@ -2,8 +2,20 @@
   "configVersion": 1,
   "dataDir": "/home/alice/.local/share/storeboard",
   "socket": "/run/user/1000/storeboard.sock",
-  "folders": [
-    { "name": "photos", "path": "/home/alice/Pictures" },
-    { "name": "documents", "path": "/home/alice/Documents" }
-  ]
+  "peer": "laptop",
+  "peers": {
+    "laptop": { "endpoints": ["192.168.1.10:4242"] },
+    "desktop": { "endpoints": ["192.168.1.11:4242", "[fd00::11]:4242"] },
+    "phone": { "endpoints": [] }
+  },
+  "groups": {
+    "family": {
+      "peers": ["laptop", "desktop", "phone"],
+      "folders": {
+        "photos": { "mount": "/home/alice/Pictures" },
+        "documents": {}
+      }
+    }
+  },
+  "mounts": { "documents": "/mnt/docs" }
 }

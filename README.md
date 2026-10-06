@@ -26,8 +26,20 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
 
 ## Configuration
 
-Strict JSON; unknown keys are an error. See `config.example.json`, and
-validate any file with:
+Strict JSON; unknown keys are an error. The model, in full in
+`config.example.json`:
+
+- `peer` — this machine's name (hostname fallback while no groups exist).
+- `peers` — named devices with declared `host:port` endpoints; discovery is
+  config-only, the daemon never invents a peer.
+- `groups` — peer memberships that own `folders`; each folder declares a
+  default `mount`; folder names are unique across all groups.
+- `mounts` — this machine's local override of a group folder's mount.
+  Effective mount: local override → group default → `<dataDir>/mounts/<name>`.
+- everything the daemon stores (store, journal, index) lives under the one
+  `dataDir`.
+
+Validate any file with:
 
     storeboard --config config.example.json config check --json
 
@@ -54,7 +66,16 @@ the unix socket); human output is free to change, JSON shapes are not.
     imports = [ inputs.storeboard.nixosModules.storeboard ];
     services.storeboard = {
       enable = true;
-      folders = [ { name = "photos"; path = "/srv/photos"; } ];
+      peer = "laptop";
+      peers = {
+        laptop.endpoints = [ "192.168.1.10:4242" ];
+        desktop.endpoints = [ "192.168.1.11:4242" ];
+      };
+      groups.family = {
+        peers = [ "laptop" "desktop" ];
+        folders.photos.mount = "/srv/photos";
+      };
+      mounts = { };  # this machine's local mount overrides
     };
 
     # home-manager — optional, per-user: installs the CLI for one user and

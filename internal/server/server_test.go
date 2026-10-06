@@ -25,7 +25,20 @@ func testConfig(t *testing.T) *config.Config {
 		ConfigVersion: config.ConfigVersion,
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "storeboard.sock"),
-		Folders:       []api.Folder{{Name: "photos", Path: "/home/kyle/Pictures"}},
+		Peer:          "laptop",
+		Peers: map[string]config.Peer{
+			"laptop":  {Endpoints: []string{"192.168.1.10:4242"}},
+			"desktop": {Endpoints: []string{"192.168.1.11:4242"}},
+		},
+		Groups: map[string]config.Group{
+			"family": {
+				Peers: []string{"laptop", "desktop"},
+				Folders: map[string]config.GroupFolder{
+					"photos": {Mount: "/home/kyle/Pictures"},
+				},
+			},
+		},
+		Mounts: map[string]string{},
 	}
 }
 
@@ -115,14 +128,25 @@ func TestStatusDocument(t *testing.T) {
 	if st.Socket != cfg.Socket || st.DataDir != cfg.DataDir {
 		t.Errorf("document does not echo the config: %+v", st)
 	}
-	if len(st.Folders) != 1 || st.Folders[0].Name != "photos" {
-		t.Errorf("folders = %+v, want the configured photo folder", st.Folders)
+	if st.Peer != "laptop" {
+		t.Errorf("peer = %q, want laptop", st.Peer)
+	}
+	if len(st.Peers) != 2 {
+		t.Errorf("peers = %+v, want two", st.Peers)
+	}
+	if len(st.Groups) != 1 || st.Groups[0].Name != "family" ||
+		len(st.Groups[0].Folders) != 1 || st.Groups[0].Folders[0] != "photos" {
+		t.Errorf("groups = %+v, want family owning photos", st.Groups)
+	}
+	if len(st.Folders) != 1 || st.Folders[0].Name != "photos" ||
+		st.Folders[0].Group != "family" || st.Folders[0].Mount != "/home/kyle/Pictures" {
+		t.Errorf("folders = %+v, want photos in family at its group mount", st.Folders)
 	}
 }
 
 func TestStatusDocumentFoldersAlwaysAnArray(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Folders = nil
+	cfg.Groups = map[string]config.Group{}
 	srv, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)

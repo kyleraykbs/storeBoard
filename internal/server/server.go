@@ -105,12 +105,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	folders := s.cfg.Folders
-	if folders == nil {
-		// The contract says the array is always present; a nil slice would
-		// marshal to null and break `.folders[]` in jq.
-		folders = []api.Folder{}
-	}
+	// The config's view builders sort and return non-nil slices: the
+	// contract says arrays, never null — a nil slice would marshal to null
+	// and break `.folders[]` in jq.
 	writeJSON(w, http.StatusOK, api.Status{
 		APIVersion:    api.Version,
 		Version:       version.Version,
@@ -118,7 +115,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
 		Socket:        s.cfg.Socket,
 		DataDir:       s.cfg.DataDir,
-		Folders:       folders,
+		Peer:          s.cfg.Peer,
+		Peers:         s.cfg.PeerList(),
+		Groups:        s.cfg.GroupList(),
+		Folders:       s.cfg.Folders(),
 	})
 }
 
@@ -135,7 +135,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("storeboardd listening",
 		"socket", s.cfg.Socket,
 		"version", version.Version,
-		"folders", len(s.cfg.Folders),
+		"folders", len(s.cfg.Folders()),
 	)
 
 	select {

@@ -43,12 +43,23 @@ one, it changes here first, deliberately, with a decision log entry.
     (mode 0666, internal/server). Tightening the socket — and the threat
     model that decides who may talk to it — precedes `send`, `receive`, or
     anything else that acts.
+11. Peers are declared, never invented: the config (Nix-generated) is the
+    authoritative peer list, and the daemon learns a peer only from it.
+    Address discovery (DNS, NAT traversal) may layer on top later;
+    declaration stays authoritative, and removing a peer revokes it.
+12. Every folder resolves to exactly one local mount point through a fixed
+    precedence — local override, group default, then inside the one
+    storage directory — and the config names its owner group, so no path
+    is ever ambiguous about what syncs there.
 
-## Enforced today (2026-10-03)
+## Enforced today (2026-10-06)
 
 - 6, 7: strict config, three-point validation, versioned status document.
 - 10: holds trivially (only `/v1/status` exists) and is pinned in code and
   here.
+- 11: config is the only place peers exist — there is no transport yet to
+  learn from.
+- 12: enforced by `Validate` plus the mount-precedence tests.
 - 1, 2, 3, 4, 5: forward-looking — nothing violates them because nothing
   writes yet; they bind the sync engine when it lands.
 - 8, 9: forward-looking; both shape interfaces (hooks, wire format) that do

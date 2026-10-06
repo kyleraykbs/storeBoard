@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -103,11 +104,19 @@ func versionCmd(args []string, stdout, stderr io.Writer) error {
 // well-formed document — "valid": false plus the error — so the command is
 // scriptable in both directions.
 type checkReport struct {
-	Path    string   `json:"path"`
-	Valid   bool     `json:"valid"`
-	Error   string   `json:"error,omitempty"`
-	Socket  string   `json:"socket,omitempty"`
-	Folders []string `json:"folders,omitempty"`
+	Path    string        `json:"path"`
+	Valid   bool          `json:"valid"`
+	Error   string        `json:"error,omitempty"`
+	Socket  string        `json:"socket,omitempty"`
+	Peer    string        `json:"peer,omitempty"`
+	Peers   []string      `json:"peers,omitempty"`
+	Groups  []string      `json:"groups,omitempty"`
+	Folders []checkFolder `json:"folders,omitempty"`
+}
+
+type checkFolder struct {
+	Name  string `json:"name"`
+	Group string `json:"group"`
 }
 
 // configCheck validates a real file: a missing file is a failure, not
@@ -153,14 +162,22 @@ func configCheck(configPath string, args []string, stdout, stderr io.Writer) err
 
 	report.Valid = true
 	report.Socket = cfg.Socket
-	report.Folders = make([]string, 0, len(cfg.Folders))
-	for _, f := range cfg.Folders {
-		report.Folders = append(report.Folders, f.Name)
+	report.Peer = cfg.Peer
+	for _, p := range cfg.PeerList() {
+		report.Peers = append(report.Peers, p.Name)
+	}
+	for _, g := range cfg.GroupList() {
+		report.Groups = append(report.Groups, g.Name)
+	}
+	folders := cfg.Folders()
+	report.Folders = make([]checkFolder, 0, len(folders))
+	for _, f := range folders {
+		report.Folders = append(report.Folders, checkFolder{Name: f.Name, Group: f.Group})
 	}
 	if jsonOut {
 		return writeJSON(stdout, report)
 	}
-	fmt.Fprintf(stdout, "config OK: %s (%d folders)\n", path, len(cfg.Folders))
+	fmt.Fprintf(stdout, "config OK: %s (%d folders)\n", path, len(folders))
 	return nil
 }
 
@@ -225,15 +242,39 @@ func fetch(ctx context.Context, socket, path string) ([]byte, error) {
 func renderStatus(w io.Writer, st *api.Status) {
 	fmt.Fprintf(w, "storeboard %s (api v%d), up %s\n",
 		st.Version, st.APIVersion, time.Duration(st.UptimeSeconds)*time.Second)
+	if st.Peer != "" {
+		fmt.Fprintf(w, "peer    %s\n", st.Peer)
+	}
 	fmt.Fprintf(w, "socket  %s\n", st.Socket)
 	fmt.Fprintf(w, "data    %s\n", st.DataDir)
+
+	fmt.Fprintf(w, "\npeers (%d):\n", len(st.Peers))
+	if len(st.Peers) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	}
+	for _, p := range st.Peers {
+		endpoints := "-"
+		if len(p.Endpoints) > 0 {
+			endpoints = strings.Join(p.Endpoints, " ")
+		}
+		fmt.Fprintf(w, "  %s\n    %s\n", p.Name, endpoints)
+	}
+
+	fmt.Fprintf(w, "\ngroups (%d):\n", len(st.Groups))
+	if len(st.Groups) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	}
+	for _, g := range st.Groups {
+		fmt.Fprintf(w, "  %s\n    peers   %s\n    folders %s\n",
+			g.Name, strings.Join(g.Peers, ", "), strings.Join(g.Folders, ", "))
+	}
+
 	fmt.Fprintf(w, "\nfolders (%d):\n", len(st.Folders))
 	if len(st.Folders) == 0 {
 		fmt.Fprintln(w, "  (none)")
-		return
 	}
 	for _, f := range st.Folders {
-		fmt.Fprintf(w, "  %s\n    %s\n", f.Name, f.Path)
+		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n", f.Name, f.Group, f.Mount)
 	}
 }
 

@@ -12,8 +12,10 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
 ## Internals
 
 - `internal/config` — strict JSON config (unknown keys are errors), XDG
-  defaults, `--config` > `$STOREBOARD_CONFIG` > XDG path, validation
-  (configVersion 1, unique folder names, absolute paths).
+  defaults, `--config` > existing XDG > `$STOREBOARD_CONFIG` path, the
+  peer/group/folder/mount model with validation (configVersion 1, host:port
+  endpoints, group membership, global folder names, absolute mounts) and
+  the sorted `PeerList`/`GroupList`/`Folders` views the status serves.
 - `internal/server` — the unix-socket HTTP server, socket lifecycle (stale
   takeover, live-daemon refusal, cleanup) and the `/v1/status` document.
 - `internal/cli` — the command set; stdout carries reports/data, stderr
@@ -23,8 +25,9 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
 
 ## Public
 
-- `pkg/api` — the versioned JSON contract: `Status`, `Folder`, `Version`.
-  The daemon serves it, the CLI renders it, the config file reuses `Folder`.
+- `pkg/api` — the versioned JSON contract: `Status`, `Peer`, `Group`,
+  `Folder`, `Version`. The daemon serves it and the CLI renders it; the
+  config file speaks the same peer/group/folder/mount vocabulary.
 
 ## Nix
 

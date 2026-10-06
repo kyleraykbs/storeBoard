@@ -2,9 +2,16 @@
 #
 #   services.storeboard = {
 #     enable = true;
-#     folders = [
-#       { name = "photos"; path = "/srv/photos"; }
-#     ];
+#     peer = "laptop";
+#     peers = {
+#       laptop.endpoints = [ "192.168.1.10:4242" ];
+#       desktop.endpoints = [ "192.168.1.11:4242" ];
+#     };
+#     groups.family = {
+#       peers = [ "laptop" "desktop" ];
+#       folders.photos.mount = "/home/kyle/Pictures";
+#     };
+#     mounts = { };   # this machine's local mount overrides
 #   };
 #
 # Enabling it runs the daemon and installs `storeboard` for every user, with
@@ -74,22 +81,43 @@ in
       description = "Apply the systemd sandboxing options.";
     };
 
-    inherit (opts) socket dataDir folders;
+    inherit (opts)
+      socket
+      dataDir
+      peer
+      peers
+      groups
+      mounts
+      ;
   };
 
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion =
-          let
-            names = map (f: f.name) cfg.folders;
-          in
-          names == lib.unique names;
-        message = "services.storeboard.folders: names must be unique";
+        assertion = cfg.groups == { } || cfg.peer != "";
+        message = "services.storeboard.peer: required while groups are declared — name this machine";
       }
       {
-        assertion = lib.all (f: lib.hasPrefix "/" f.path) cfg.folders;
-        message = "services.storeboard.folders: every path must be absolute";
+        assertion = cfg.peer == "" || lib.all (g: lib.elem cfg.peer g.peers) (lib.attrValues cfg.groups);
+        message = "services.storeboard.peer must be a member of every group";
+      }
+      {
+        assertion =
+          let
+            names = lib.concatMap (g: lib.attrNames g.folders) (lib.attrValues cfg.groups);
+          in
+          names == lib.unique names;
+        message = "services.storeboard.groups: folder names must be unique across groups";
+      }
+      {
+        assertion =
+          let
+            groupMounts = lib.concatMap (g: lib.mapAttrsToList (_: f: f.mount) g.folders) (
+              lib.attrValues cfg.groups
+            );
+          in
+          lib.all (m: m == null || lib.hasPrefix "/" m) (groupMounts ++ lib.attrValues cfg.mounts);
+        message = "services.storeboard: mount points must be absolute";
       }
     ];
 

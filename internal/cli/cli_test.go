@@ -58,7 +58,15 @@ func TestVersionHuman(t *testing.T) {
 func TestConfigCheckValidFile(t *testing.T) {
 	path := writeConfig(t, `{
 		"configVersion": 1,
-		"folders": [{"name": "photos", "path": "/home/kyle/Pictures"}]
+		"peer": "laptop",
+		"peers": { "laptop": { "endpoints": ["127.0.0.1:4242"] } },
+		"groups": {
+			"family": {
+				"peers": ["laptop"],
+				"folders": { "photos": { "mount": "/home/kyle/Pictures" } }
+			}
+		},
+		"mounts": {}
 	}`)
 
 	var out, errOut bytes.Buffer
@@ -76,8 +84,17 @@ func TestConfigCheckValidFile(t *testing.T) {
 	if report.Path != path {
 		t.Errorf("path = %q, want %q", report.Path, path)
 	}
-	if len(report.Folders) != 1 || report.Folders[0] != "photos" {
-		t.Errorf("folders = %v, want [photos]", report.Folders)
+	if report.Peer != "laptop" {
+		t.Errorf("peer = %q, want laptop", report.Peer)
+	}
+	if len(report.Peers) != 1 || report.Peers[0] != "laptop" {
+		t.Errorf("peers = %v, want [laptop]", report.Peers)
+	}
+	if len(report.Groups) != 1 || report.Groups[0] != "family" {
+		t.Errorf("groups = %v, want [family]", report.Groups)
+	}
+	if len(report.Folders) != 1 || report.Folders[0].Name != "photos" || report.Folders[0].Group != "family" {
+		t.Errorf("folders = %+v, want photos in family", report.Folders)
 	}
 }
 
@@ -148,7 +165,15 @@ func TestStatusRoundTrip(t *testing.T) {
 		ConfigVersion: config.ConfigVersion,
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "storeboard.sock"),
-		Folders:       []api.Folder{{Name: "photos", Path: "/home/kyle/Pictures"}},
+		Peer:          "laptop",
+		Peers:         map[string]config.Peer{"laptop": {Endpoints: []string{"127.0.0.1:4242"}}},
+		Groups: map[string]config.Group{
+			"family": {
+				Peers:   []string{"laptop"},
+				Folders: map[string]config.GroupFolder{"photos": {Mount: "/home/kyle/Pictures"}},
+			},
+		},
+		Mounts: map[string]string{},
 	}
 	srv, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

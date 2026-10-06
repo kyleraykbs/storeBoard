@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
 func writeConfig(t *testing.T, contents string) string {
@@ -30,8 +28,34 @@ func setXDG(t *testing.T) (dataHome, runtimeDir string) {
 	return dataHome, runtimeDir
 }
 
+// valid returns the baseline model: this peer, two more devices, one group
+// with two folders, one local mount override.
+func valid() *Config {
+	return &Config{
+		ConfigVersion: ConfigVersion,
+		DataDir:       "/var/lib/storeboard",
+		Socket:        "/run/storeboard.sock",
+		Peer:          "laptop",
+		Peers: map[string]Peer{
+			"laptop":  {Endpoints: []string{"192.168.1.10:4242"}},
+			"desktop": {Endpoints: []string{"192.168.1.11:4242", "[fd00::11]:4242"}},
+			"phone":   {Endpoints: []string{}},
+		},
+		Groups: map[string]Group{
+			"family": {
+				Peers: []string{"laptop", "desktop", "phone"},
+				Folders: map[string]GroupFolder{
+					"photos":    {Mount: "/home/kyle/Pictures"},
+					"documents": {},
+				},
+			},
+		},
+		Mounts: map[string]string{"documents": "/mnt/docs"},
+	}
+}
+
 func TestLoadRejectsUnknownKeys(t *testing.T) {
-	path := writeConfig(t, `{"configVersion": 1, "folars": []}`)
+	path := writeConfig(t, `{"configVersion": 1, "folars": {}}`)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("unknown key accepted")
@@ -41,7 +65,7 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
-func TestLoadFillsDefaults(t *testing.T) {
+func TestLoadFillsDefaultsAndClaimsHostname(t *testing.T) {
 	dataHome, runtimeDir := setXDG(t)
 	path := writeConfig(t, `{}`)
 
@@ -58,8 +82,15 @@ func TestLoadFillsDefaults(t *testing.T) {
 	if want := filepath.Join(runtimeDir, "storeboard.sock"); cfg.Socket != want {
 		t.Errorf("socket = %q, want %q", cfg.Socket, want)
 	}
-	if cfg.Folders == nil || len(cfg.Folders) != 0 {
-		t.Errorf("folders = %#v, want a non-nil empty slice", cfg.Folders)
+	// A nameless fresh install claims the hostname and registers itself.
+	if cfg.Peer == "" {
+		t.Error("peer is empty; the hostname default did not apply")
+	}
+	if _, ok := cfg.Peers[cfg.Peer]; !ok {
+		t.Errorf("peer %q not registered in peers: %#v", cfg.Peer, cfg.Peers)
+	}
+	if cfg.Groups == nil || cfg.Mounts == nil {
+		t.Error("maps must be non-nil after load")
 	}
 }
 
@@ -102,16 +133,40 @@ func TestLoadFillsBlankStringsFromDefaults(t *testing.T) {
 	}
 }
 
-func TestValidate(t *testing.T) {
-	valid := func() *Config {
-		return &Config{
-			ConfigVersion: ConfigVersion,
-			DataDir:       "/var/lib/storeboard",
-			Socket:        "/run/storeboard.sock",
-			Folders:       []api.Folder{{Name: "photos", Path: "/home/kyle/Pictures"}},
-		}
-	}
+func TestLoadFullModel(t *testing.T) {
+	path := writeConfig(t, `{
+		"configVersion": 1,
+		"peer": "laptop",
+		"peers": {
+			"laptop":  { "endpoints": ["192.168.1.10:4242"] },
+			"desktop": { "endpoints": ["192.168.1.11:4242"] }
+		},
+		"groups": {
+			"family": {
+				"peers": ["laptop", "desktop"],
+				"folders": { "photos": { "mount": "/home/alice/Pictures" } }
+			}
+		},
+		"mounts": {}
+	}`)
 
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Peer != "laptop" {
+		t.Errorf("peer = %q, want laptop", cfg.Peer)
+	}
+	g, ok := cfg.Groups["family"]
+	if !ok {
+		t.Fatalf("groups = %#v, want family", cfg.Groups)
+	}
+	if g.Folders["photos"].Mount != "/home/alice/Pictures" {
+		t.Errorf("photos mount = %q", g.Folders["photos"].Mount)
+	}
+}
+
+func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -123,13 +178,47 @@ func TestValidate(t *testing.T) {
 		{"relative data dir", func(c *Config) { c.DataDir = "var/lib" }, "absolute"},
 		{"empty socket", func(c *Config) { c.Socket = "" }, "socket"},
 		{"relative socket", func(c *Config) { c.Socket = "run/s.sock" }, "absolute"},
-		{"empty folder name", func(c *Config) { c.Folders[0].Name = "" }, "empty name"},
-		{"folder name with slash", func(c *Config) { c.Folders[0].Name = "a/b" }, "identifier"},
-		{"duplicate folder name", func(c *Config) {
-			c.Folders = append(c.Folders, api.Folder{Name: "photos", Path: "/other"})
-		}, "duplicated"},
-		{"relative folder path", func(c *Config) { c.Folders[0].Path = "Pictures" }, "absolute"},
-		{"empty folder path", func(c *Config) { c.Folders[0].Path = "" }, "path is empty"},
+		{"peer not declared", func(c *Config) { c.Peer = "ghost" }, "not declared in peers"},
+		{"peer name is a path", func(c *Config) {
+			c.Peer = "a/b"
+			c.Peers["a/b"] = Peer{}
+		}, "identifier"},
+		{"peer key is a path", func(c *Config) { c.Peers["a/b"] = Peer{} }, "identifier"},
+		{"endpoint without port", func(c *Config) {
+			c.Peers["laptop"] = Peer{Endpoints: []string{"192.168.1.10"}}
+		}, "host:port"},
+		{"endpoint with dead port", func(c *Config) {
+			c.Peers["laptop"] = Peer{Endpoints: []string{"192.168.1.10:0"}}
+		}, "1-65535"},
+		{"group without peers", func(c *Config) { c.Groups["family"] = Group{Peers: nil, Folders: map[string]GroupFolder{"photos": {}}} }, "no peers"},
+		{"group with unknown peer", func(c *Config) {
+			c.Groups["family"] = Group{Peers: []string{"laptop", "stranger"}, Folders: map[string]GroupFolder{"photos": {}}}
+		}, "unknown peer"},
+		{"group without this peer", func(c *Config) {
+			c.Groups["family"] = Group{Peers: []string{"desktop", "phone"}, Folders: map[string]GroupFolder{"photos": {}}}
+		}, "not a member"},
+		{"duplicate folder across groups", func(c *Config) {
+			c.Groups["work"] = Group{
+				Peers:   []string{"laptop", "desktop"},
+				Folders: map[string]GroupFolder{"photos": {}},
+			}
+		}, "global"},
+		{"relative group mount", func(c *Config) {
+			c.Groups["family"] = Group{
+				Peers:   []string{"laptop", "desktop", "phone"},
+				Folders: map[string]GroupFolder{"photos": {Mount: "Pictures"}},
+			}
+		}, "absolute"},
+		{"folder name is a path", func(c *Config) {
+			c.Groups["family"] = Group{
+				Peers:   []string{"laptop", "desktop", "phone"},
+				Folders: map[string]GroupFolder{"a/b": {}},
+			}
+		}, "identifier"},
+		{"mount override for unknown folder", func(c *Config) {
+			c.Mounts["ghost"] = "/mnt/ghost"
+		}, "unknown folder"},
+		{"relative mount override", func(c *Config) { c.Mounts["photos"] = "pics" }, "absolute"},
 	}
 
 	for _, tt := range tests {
@@ -147,6 +236,74 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestMountPrecedence(t *testing.T) {
+	cfg := valid()
+	cfg.DataDir = "/var/lib/storeboard"
+
+	byName := map[string]struct{ group, mount string }{}
+	for _, f := range cfg.Folders() {
+		byName[f.Name] = struct{ group, mount string }{f.Group, f.Mount}
+	}
+
+	// Local override beats the group's default mount.
+	if got := byName["documents"]; got.mount != "/mnt/docs" {
+		t.Errorf("documents mount = %q, want the local override /mnt/docs", got.mount)
+	}
+	// The group default applies when the peer declares no override.
+	if got := byName["photos"]; got.mount != "/home/kyle/Pictures" {
+		t.Errorf("photos mount = %q, want the group default", got.mount)
+	}
+	// Nothing declared: the folder lands inside the one storage directory.
+	cfg.Mounts = map[string]string{}
+	if got := byName["documents"]; got.mount != "/mnt/docs" {
+		t.Errorf("precondition broken: %q", got.mount)
+	}
+	cfg.Groups["family"] = Group{
+		Peers:   []string{"laptop", "desktop", "phone"},
+		Folders: map[string]GroupFolder{"documents": {}},
+	}
+	for _, f := range cfg.Folders() {
+		if f.Name == "documents" {
+			if want := cfg.DefaultMountDir("documents"); f.Mount != want {
+				t.Errorf("undeclared mount = %q, want the storage-dir default %q", f.Mount, want)
+			}
+			if f.Group != "family" {
+				t.Errorf("group = %q, want family", f.Group)
+			}
+		}
+	}
+}
+
+func TestViewsAreSortedAndNonNil(t *testing.T) {
+	cfg := valid()
+	cfg.Peers["alpha"] = Peer{Endpoints: []string{}}
+	cfg.Groups["aaa"] = Group{Peers: []string{"laptop", "desktop", "phone"}, Folders: map[string]GroupFolder{}}
+
+	peers := cfg.PeerList()
+	if len(peers) != 4 || peers[0].Name != "alpha" || peers[3].Name != "phone" {
+		t.Errorf("peers not sorted: %#v", peers)
+	}
+	groups := cfg.GroupList()
+	if len(groups) != 2 || groups[0].Name != "aaa" || groups[1].Name != "family" {
+		t.Errorf("groups not sorted: %#v", groups)
+	}
+	folders := cfg.Folders()
+	if len(folders) != 2 || folders[0].Name != "documents" || folders[1].Name != "photos" {
+		t.Errorf("folders not sorted: %#v", folders)
+	}
+
+	empty := &Config{ConfigVersion: ConfigVersion, DataDir: "/d", Socket: "/s", Peers: map[string]Peer{}, Groups: map[string]Group{}, Mounts: map[string]string{}}
+	if peers := empty.PeerList(); peers == nil {
+		t.Error("Peers() nil on empty config")
+	}
+	if groups := empty.GroupList(); groups == nil {
+		t.Error("Groups() nil on empty config")
+	}
+	if folders := empty.Folders(); folders == nil {
+		t.Error("Folders() nil on empty config")
 	}
 }
 

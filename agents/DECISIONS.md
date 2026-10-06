@@ -1,61 +1,13 @@
-# Decisions
 
-## [2026-10-03] Module path and binary names
-- Decision: `codeberg.org/kyleraykbs/storeboard`, binaries `storeboard` (CLI)
-  and `storeboardd` (daemon).
-- Why: matches the repo directory and the musoak pattern (name + name+d).
-- Reversible: no (touches every import)
-
-## [2026-10-03] Foundation scope: config, JSON contract, status document
-- Decision: the first pass ships the flake, the Nix modules, strict JSON
-  config with `config check`, and a daemon serving a versioned `/v1/status`
-  document over a unix socket. Sync engine, peer transport and the NDJSON
-  event stream come in later passes.
-- Why: the JSON/config contracts shape everything else; the engine needs
-  protocol design first.
-- Reversible: yes
-
-## [2026-10-03] Status document carries no folder state yet
-- Decision: `folders` in the status document is `[{name, path}]`; no `state`
-  field until the sync engine defines its enum.
-- Why: the JSON shapes are a versioned contract — adding fields is
-  compatible, giving an existing field a new meaning later is not.
-- Reversible: yes
-
-## [2026-10-03] Config path precedence
-- Decision: `--config` > an existing `$XDG_CONFIG_HOME/storeboard/config.json`
-  > `$STOREBOARD_CONFIG` > the XDG default location.
-- Why: a per-user file is the more specific declaration, so home-manager
-  beats the NixOS module's /etc file when both are enabled (the layering
-  musoak documents); the env var serves machines with no user file.
-- Reversible: yes
-
-## [2026-10-03] Socket is world-writable for now
-- Decision: the daemon chmods its unix socket to 0666; the only verb it
-  serves is the status document.
-- Why: the NixOS CLI runs as an arbitrary user while the system service runs
-  as its own user, and group plumbing can wait for the threat model.
-  DESIGN.md pins the invariant: no privileged verb ships while the socket is
-  world-accessible.
-- Reversible: yes (mode is a constant in internal/server)
-
-## [2026-10-04] One options set: the CLI rides with the daemon
-- Decision: `services.storeboard` is the only NixOS options set — enabling
-  it runs the daemon, installs `storeboard` for every user and sets
-  `STOREBOARD_CONFIG` to the config file it reads. The separate
-  `programs.storeboard` NixOS module (nix/storeboard-nixos.nix,
-  nixosModules.storeboard) is gone; home-manager keeps its own
-  `programs.storeboard` as that scope's single set.
-- Why: user direction — two option sets configured one thing, and their
-  socket options could disagree, breaking `storeboard status`.
-- Reversible: yes
-
-## [2026-10-04] `storeboardd` is only a binary name
-- Decision: the options set is `services.storeboard`, the unit is
-  `storeboard.service`, the module file nix/storeboard.nix, the config
-  /etc/storeboard/config.json, and `nixosModules.storeboard` exports it (the
-  deleted CLI module's old name, now carrying the daemon module).
-  `storeboardd` survives only as the daemon binary — ExecStart, apps, cmd/.
-- Why: user direction — storeboard is the project; the d suffix marks the
-  process, not the namespace.
-- Reversible: yes
+## [2026-10-06] Config model: peers → groups → folders, local mounts
+- Decision: config declares `peers` (name → host:port endpoints), `groups`
+  (peer membership + folders, each folder with an optional default mount),
+  and `mounts` (this machine's per-folder override of a group folder's
+  mount). Effective mount: local override → group default →
+  `<dataDir>/mounts/<name>`. This machine names itself with `peer`
+  (hostname fallback only while no groups are declared). Folder names are
+  global across groups; every group must include this peer; endpoints must
+  parse as host:port. All state lives under the one `dataDir`.
+- Why: user direction — folders belong to groups of peers, each peer picks
+  its own local mountpoint, one storage directory owns everything.
+- Reversible: yes (pre-release; configVersion stays 1)
