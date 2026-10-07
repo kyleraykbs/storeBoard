@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
@@ -362,7 +363,7 @@ func (e *Engine) writeConflictCopy(fs *FolderState, want *pending, ent *Entry) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	dst := filepath.Join(fs.root, want.conflictName)
-	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode); err != nil {
+	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
 		e.logger.Warn("write conflict copy", "folder", fs.name, "path", want.conflictName, "error", err)
 		return
 	}
@@ -423,7 +424,7 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 		}
 	}
 
-	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode); err != nil {
+	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
 		return err
 	}
 	_ = fs.db.Put(ent)
@@ -431,8 +432,11 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 }
 
 // writeBlobTo materialises a stored blob at dst: temp file, fsync, rename —
-// then mode, mtime and owner are set (DESIGN invariant 3).
-func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32) error {
+// then mode, mtime and owner are set (DESIGN invariant 3). The mtime is the
+// entry's, not the write's: a materialised file must look exactly like the
+// one it mirrors, both for the tools that sort by it (photos, videos) and
+// for the scanner, whose fast path is "size and mtime unchanged".
+func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32, mtime int64) error {
 	blob, err := e.store.Open(sum)
 	if err != nil {
 		return err
@@ -473,6 +477,12 @@ func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32) erro
 	}
 	_ = os.Chmod(dst, perm.Perm())
 	e.chownPath(fs, dst)
+	if mtime != 0 {
+		when := time.Unix(0, mtime)
+		if err := os.Chtimes(dst, when, when); err != nil {
+			e.logger.Warn("set mtime", "folder", fs.name, "path", dst, "error", err)
+		}
+	}
 	return nil
 }
 

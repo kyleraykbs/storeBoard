@@ -579,7 +579,7 @@ func TestMaterialisedEntriesTakeFolderPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ent := &Entry{Path: "sub/dir/a.txt", Blob: sum, Size: int64(len(content)), MTime: time.Now().UnixNano(), Mode: 0o600}
+	ent := &Entry{Path: "sub/dir/a.txt", Blob: sum, Size: int64(len(content)), MTime: time.Now().Add(-3 * time.Hour).UnixNano(), Mode: 0o600}
 	if err := n.eng.applyEntry(fs, ent); err != nil {
 		t.Fatal(err)
 	}
@@ -591,6 +591,9 @@ func TestMaterialisedEntriesTakeFolderPermissions(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("file mode = %04o, want the entry's 0600", fi.Mode().Perm())
+	}
+	if fi.ModTime().UnixNano() != ent.MTime {
+		t.Errorf("file mtime = %d, want the entry's %d — a materialised file must look like the one it mirrors", fi.ModTime().UnixNano(), ent.MTime)
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() || int(st.Gid) != os.Getgid() {
 		t.Errorf("file owner = %v, want the resolved %d:%d", fi.Sys(), os.Getuid(), os.Getgid())
