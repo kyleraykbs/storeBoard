@@ -75,11 +75,13 @@
             ldflags = [
               "-X codeberg.org/kyleraykbs/storeboard/internal/version.Version=${version}"
             ];
-            # The tests start a real daemon on a real socket and drive the
-            # CLI against it.
+            # The tests start real daemons on real sockets and drive the CLI
+            # against them; -p 1 keeps the packages from competing for the
+            # same machine while the deploy builds (a loaded builder is how
+            # the first timeout flake got through).
             checkPhase = ''
               runHook preCheck
-              go test ./...
+              go test -p 1 ./...
               runHook postCheck
             '';
             meta = {

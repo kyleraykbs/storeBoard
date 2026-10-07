@@ -18,6 +18,13 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 )
 
+// testWait bounds every waitFor in this file. It is deliberately far larger
+// than any single step needs (a scan tick, one round trip, one apply): the
+// deploy builds run these tests on machines that are also syncing large
+// folders, and a starved 50 ms scan tick can take seconds. The waits are
+// assertions that a thing eventually happens, not that it happens fast.
+const testWait = 45 * time.Second
+
 // node is one daemon's engine + wire in a test.
 type node struct {
 	t      *testing.T
@@ -162,7 +169,7 @@ func TestReplicaSyncsEditsAndDeletes(t *testing.T) {
 
 	// A creates a file: B must receive the content.
 	writeFile(t, filepath.Join(rootA, "hello.txt"), "one", time.Now())
-	waitFor(t, 10*time.Second, "file on B", func() bool {
+	waitFor(t, testWait, "file on B", func() bool {
 		return exists(filepath.Join(rootB, "hello.txt"))
 	})
 	if got := readFile(t, filepath.Join(rootB, "hello.txt")); got != "one" {
@@ -172,7 +179,7 @@ func TestReplicaSyncsEditsAndDeletes(t *testing.T) {
 	// B edits it: A must converge on the newer content.
 	time.Sleep(150 * time.Millisecond)
 	writeFile(t, filepath.Join(rootB, "hello.txt"), "two", time.Now().Add(2*time.Second))
-	waitFor(t, 10*time.Second, "edit on A", func() bool {
+	waitFor(t, testWait, "edit on A", func() bool {
 		p := filepath.Join(rootA, "hello.txt")
 		data, err := os.ReadFile(p)
 		return err == nil && string(data) == "two"
@@ -189,10 +196,10 @@ func TestReplicaSyncsEditsAndDeletes(t *testing.T) {
 	if err := os.Remove(filepath.Join(rootA, "hello.txt")); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 10*time.Second, "delete propagated", func() bool {
+	waitFor(t, testWait, "delete propagated", func() bool {
 		return !exists(filepath.Join(rootB, "hello.txt"))
 	})
-	waitFor(t, 5*time.Second, "trashed copy", func() bool {
+	waitFor(t, testWait, "trashed copy", func() bool {
 		return exists(filepath.Join(b.cfg.DataDir, "trash", "docs", "hello.txt"))
 	})
 	if got := readFile(t, filepath.Join(b.cfg.DataDir, "trash", "docs", "hello.txt")); got != "two" {
@@ -247,7 +254,7 @@ func TestConcurrentWritesConflictAndConverge(t *testing.T) {
 		root string
 	}{{"a", rootA}, {"b", rootB}} {
 		root := n.root
-		waitFor(t, 10*time.Second, "conflict convergence on "+n.name, func() bool {
+		waitFor(t, testWait, "conflict convergence on "+n.name, func() bool {
 			return converged(root)
 		})
 	}
@@ -286,7 +293,7 @@ func TestStreamedFolderAttachDetachAndRemerge(t *testing.T) {
 
 	// While the holder answers, the mount is live: the file is visible
 	// through the mount path, which is a symlink into the daemon's views.
-	waitFor(t, 10*time.Second, "attached view", func() bool {
+	waitFor(t, testWait, "attached view", func() bool {
 		if b.eng.Snapshot()[0].State != stateAttached {
 			return false
 		}
@@ -301,10 +308,10 @@ func TestStreamedFolderAttachDetachAndRemerge(t *testing.T) {
 
 	// The holder goes away: the folder is replaced by a writable empty dir.
 	a.stop()
-	waitFor(t, 15*time.Second, "detach", func() bool {
+	waitFor(t, testWait, "detach", func() bool {
 		return b.eng.Snapshot()[0].State == stateDetached
 	})
-	waitFor(t, 5*time.Second, "mount looks empty", func() bool {
+	waitFor(t, testWait, "mount looks empty", func() bool {
 		entries, err := os.ReadDir(mountB)
 		return err == nil && len(entries) == 0
 	})
@@ -317,13 +324,13 @@ func TestStreamedFolderAttachDetachAndRemerge(t *testing.T) {
 	a2 := mkNode(t, "a", "b", epA, epB, rootA, true)
 	startNode(t, a2)
 
-	waitFor(t, 15*time.Second, "reattach with both files", func() bool {
+	waitFor(t, testWait, "reattach with both files", func() bool {
 		if b.eng.Snapshot()[0].State != stateAttached {
 			return false
 		}
 		return exists(filepath.Join(mountB, "offline.txt")) && exists(filepath.Join(mountB, "hello.txt"))
 	})
-	waitFor(t, 10*time.Second, "offline file synced to holder", func() bool {
+	waitFor(t, testWait, "offline file synced to holder", func() bool {
 		return exists(filepath.Join(rootA, "offline.txt"))
 	})
 	if got := readFile(t, filepath.Join(rootA, "offline.txt")); got != "kept" {
@@ -662,7 +669,7 @@ func TestDetachedFolderDoesNotTombstoneItsContent(t *testing.T) {
 	startNode(t, a)
 	startNode(t, b)
 
-	waitFor(t, 10*time.Second, "attached with the holder's file", func() bool {
+	waitFor(t, testWait, "attached with the holder's file", func() bool {
 		return exists(filepath.Join(mountB, "hello.txt"))
 	})
 	before := b.eng.folders[0].db.Get("hello.txt")
@@ -671,7 +678,7 @@ func TestDetachedFolderDoesNotTombstoneItsContent(t *testing.T) {
 	}
 
 	a.stop()
-	waitFor(t, 10*time.Second, "detached", func() bool {
+	waitFor(t, testWait, "detached", func() bool {
 		return b.eng.Snapshot()[0].State == stateDetached
 	})
 
