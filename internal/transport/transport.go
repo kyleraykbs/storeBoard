@@ -134,6 +134,12 @@ type Manager struct {
 	// while that write is in flight races whatever removes those paths next
 	// (tests do exactly that, and a restart does it for real).
 	wg sync.WaitGroup
+
+	// cancel ends the context Run derived from the caller's. Close uses it
+	// so teardown never depends on the caller cancelling first: a caller
+	// that just calls Close (every transport test does) would otherwise
+	// leave the dial and listen loops waiting on a context that never ends.
+	cancel context.CancelFunc
 }
 
 // spawn runs fn on a goroutine Close will wait for.
@@ -212,8 +218,14 @@ func (m *Manager) selfEndpoints() []string {
 	return self.Endpoints
 }
 
-// Run opens the listeners and the dial loops and serves until ctx ends.
+// Run opens the listeners and the dial loops and serves until ctx ends or
+// Close is called.
 func (m *Manager) Run(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	m.cancel = cancel
+	m.mu.Unlock()
+
 	m.runListeners(ctx)
 
 	for _, p := range m.sortedPeers() {
@@ -561,9 +573,13 @@ func (m *Manager) Snapshot() []api.Connection {
 
 // Close tears the transport down and waits for every link goroutine: a
 // handler caught mid-apply must finish before the caller removes or reopens
-// the paths it writes to.
+// the paths it writes to. It cancels the context Run derived, so teardown
+// works whether or not the caller got there first.
 func (m *Manager) Close() {
 	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+	}
 	ls := m.listen
 	m.listen = nil
 	m.mu.Unlock()
