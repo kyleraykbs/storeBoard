@@ -185,9 +185,17 @@ in
         # Pure Go, nothing to JIT.
         MemoryDenyWriteExecute = true;
         SystemCallArchitectures = "native";
-        # The daemon speaks its unix socket and nothing else so far; the peer
-        # transport must extend this list when it lands.
-        RestrictAddressFamilies = [ "AF_UNIX" ];
+        # The wire is TCP over the nebula overlay: the sandbox must allow
+        # the same families the daemon serves (its local socket plus the
+        # declared IPv4/IPv6 endpoints). This list bit once — leaving only
+        # AF_UNIX made every bind and dial fail with "address family not
+        # supported by protocol", invisible to any test that runs outside
+        # systemd's sandbox.
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+        ];
       };
     };
 
