@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -438,12 +439,12 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 
 	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
 
-	go m.serveLink(ctx, p, c, reader, key)
+	go m.serveLink(ctx, p, c, reader, key, direction)
 }
 
 // serveLink consumes one live connection: it answers pings and detects the
 // peer going away.
-func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key string) {
+func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key, direction string) {
 	defer m.dropLink(p, c, key)
 
 	w := &linkWriter{c: c}
@@ -477,6 +478,11 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if ctx.Err() == nil && !isClosed(err) {
+				// A link dying without a daemon restart is worth a line:
+				// every reconnect drops dependent mounts until it returns.
+				m.logger.Info("link closed", "peer", p.name, "direction", direction, "error", err)
+			}
 			return
 		}
 		switch trimmed := strings.TrimSpace(line); trimmed {
@@ -555,4 +561,10 @@ func (m *Manager) Close() {
 			c.Close()
 		}
 	}
+}
+
+// isClosed reports errors that mean this side closed the connection: normal
+// during shutdown and duplicate-link churn, noise as a "link closed" line.
+func isClosed(err error) bool {
+	return errors.Is(err, net.ErrClosed)
 }

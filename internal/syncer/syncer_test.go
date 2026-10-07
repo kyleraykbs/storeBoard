@@ -598,3 +598,46 @@ func TestMaterialisedEntriesTakeFolderPermissions(t *testing.T) {
 		}
 	}
 }
+
+// A folder root on another filesystem (a pool, an external disk): a delete
+// must still land in the trash, copying when rename cannot cross — a failed
+// delete that still tombstones makes the scanner resurrect the file.
+func TestTrashAcrossFilesystems(t *testing.T) {
+	base, err := os.MkdirTemp("/dev/shm", "storeboard-xdev")
+	if err != nil {
+		t.Skipf("no second filesystem to cross with: %v", err)
+	}
+	defer os.RemoveAll(base)
+
+	mount := filepath.Join(base, "docs")
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	if sameDevice(fs.root, n.cfg.DataDir) {
+		t.Skip("data dir and folder root share a filesystem here; nothing to cross")
+	}
+
+	writeFile(t, filepath.Join(fs.root, "gone.txt"), "bye", time.Now())
+	if err := n.eng.applyDelete(fs, &Entry{Path: "gone.txt"}); err != nil {
+		t.Fatalf("applyDelete: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.root, "gone.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file still in the folder: %v", err)
+	}
+	if got := readFile(t, filepath.Join(n.cfg.DataDir, "trash", "docs", "gone.txt")); got != "bye" {
+		t.Fatalf("trashed content = %q", got)
+	}
+}
+
+// sameDevice reports whether two existing paths live on one filesystem.
+func sameDevice(a, b string) bool {
+	sa, ea := os.Stat(a)
+	sb, eb := os.Stat(b)
+	if ea != nil || eb != nil {
+		return true
+	}
+	da, oka := sa.Sys().(*syscall.Stat_t)
+	db, okb := sb.Sys().(*syscall.Stat_t)
+	return !oka || !okb || da.Dev == db.Dev
+}

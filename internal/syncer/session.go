@@ -2,11 +2,13 @@ package syncer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
@@ -98,7 +100,14 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 				continue
 			}
 			if Dominates(rem.VV, loc.VV) {
-				e.applyDelete(fs, loc)
+				if err := e.applyDelete(fs, loc); err != nil {
+					// The file is still on disk: tombstoning it now would
+					// make the scanner resurrect it later, so keep the live
+					// entry and push it back instead.
+					e.logger.Warn("delete not applied; keeping the local file", "folder", fs.name, "path", loc.Path, "error", err)
+					_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+					continue
+				}
 				merged := MergeVV(loc.VV, rem.VV)
 				_ = fs.db.Put(&Entry{Path: rem.Path, Deleted: true, VV: merged})
 			} else {
@@ -468,25 +477,63 @@ func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32) erro
 }
 
 // applyDelete moves a locally present file to the trash (nothing is ever
-// destroyed) before the tombstone is recorded by the caller.
-func (e *Engine) applyDelete(fs *FolderState, loc *Entry) {
+// destroyed) before the tombstone is recorded by the caller. It reports an
+// error when the file could not be moved, so the caller can keep the entry
+// alive instead of tombstoning a file that is still on disk.
+func (e *Engine) applyDelete(fs *FolderState, loc *Entry) error {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	src := filepath.Join(fs.root, loc.Path)
-	if _, err := os.Stat(src); err != nil {
-		return
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil // already gone
 	}
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
-	if err := os.MkdirAll(filepath.Dir(filepath.Join(trash, loc.Path)), 0o700); err != nil {
-		return
-	}
 	dst := filepath.Join(trash, loc.Path)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return
+		return err
 	}
-	if err := os.Rename(src, dst); err != nil {
-		e.logger.Warn("trash delete", "folder", fs.name, "path", loc.Path, "error", err)
-		return
+	if err := moveOrCopy(src, dst, info.Mode()); err != nil {
+		return err
 	}
 	e.logger.Info("deleted (moved to trash)", "folder", fs.name, "path", loc.Path)
+	return nil
+}
+
+// moveOrCopy renames src onto dst, falling back to copy-then-remove when the
+// rename cannot cross filesystems. The trash lives under the one data
+// directory while folder roots may sit on other mounts (a pool, an external
+// disk); without the fallback a delete fails silently, the caller still
+// records the tombstone, and the scanner then resurrects the file it was
+// told to delete — a loop that never converges.
+func moveOrCopy(src, dst string, mode os.FileMode) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
 }

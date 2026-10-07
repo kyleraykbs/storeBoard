@@ -63,3 +63,19 @@
   bytes did not describe).
 - **Reversible:** yes, within configVersion 1 (new optional keys; omitting
   them restores pure inheritance).
+
+## 2026-10-07 — Trash moves cross filesystems; a failed delete never tombstones
+
+- **Decision:** `applyDelete` reports failure, and the caller records the
+  tombstone only when the file actually left the folder. The move into
+  `<dataDir>/trash/<folder>/` falls back to copy-then-remove when `rename`
+  returns `EXDEV`, because the trash lives under the data directory while
+  folder roots can sit on other mounts (amanita's pool hit exactly this).
+- **Why:** a rename that fails silently while the tombstone propagates
+  leaves the file on disk, the scanner indexes it again as a new version,
+  and the delete/resurrect loop never converges — observed live as
+  continuous re-sync traffic on projectArchive.
+- **Also:** the transport now logs why a link closed (`link closed`,
+  peer/direction/error): links to amanita were dying every couple of
+  minutes with no daemon restart, and nothing recorded the reason.
+- **Reversible:** yes (behavior-preserving for same-filesystem deletes).
