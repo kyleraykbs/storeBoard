@@ -339,8 +339,38 @@ func TestResolvePath(t *testing.T) {
 		t.Errorf("environment lost: %q", got)
 	}
 	t.Setenv(ConfigEnvVar, "  ")
+	// Blank environment falls back to the system file — pointed at a path
+	// that does not exist here, so the expectation stays deterministic.
+	SystemConfigPath = "/no-such-storeboard-test/config.json"
+	defer func() { SystemConfigPath = "/etc/storeboard/config.json" }()
 	if got := ResolvePath(""); got != "" {
 		t.Errorf("blank environment = %q, want empty", got)
+	}
+}
+
+func TestResolvePathSystemFallback(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv(ConfigEnvVar, "")
+
+	// A host-dependent /etc file would make this test non-deterministic;
+	// point the candidate at the test's own fixtures.
+	SystemConfigPath = filepath.Join(t.TempDir(), "absent.json")
+	defer func() { SystemConfigPath = "/etc/storeboard/config.json" }()
+
+	if got := ResolvePath(""); got != "" {
+		t.Fatalf("ResolvePath = %q with no existing candidates, want empty", got)
+	}
+
+	// The system file is the last candidate: a deployed host has one, and a
+	// shell that never saw STOREBOARD_CONFIG must still find the daemon.
+	exists := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(exists, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	SystemConfigPath = exists
+
+	if got := ResolvePath(""); got != exists {
+		t.Errorf("ResolvePath = %q, want the system file %q", got, exists)
 	}
 }
 

@@ -146,11 +146,19 @@ func (c *Config) DefaultMountDir(folder string) string {
 	return filepath.Join(c.DataDir, "mounts", folder)
 }
 
+// SystemConfigPath is the system-wide config the NixOS module installs.
+// The CLI uses it as a last resort when neither a per-user file nor the
+// environment names one — an environment variable only reaches sessions
+// that sourced /etc/set-environment, and a shell spawned without that
+// (an agent shell, a terminal inside an editor) would otherwise resolve to
+// a per-user default socket no system daemon is listening on.
+var SystemConfigPath = "/etc/storeboard/config.json"
+
 // ResolvePath decides which configuration file to load: the explicit flag,
 // then an existing per-user file — the more specific declaration beats a
 // system-wide default, so a home-manager configuration wins over the
-// NixOS module's /etc file — then the environment. An empty result means
-// Load falls back to DefaultPath().
+// NixOS module's /etc file — then the environment, then the system file
+// itself. An empty result means Load falls back to DefaultPath().
 func ResolvePath(explicit string) string {
 	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
 		return trimmed
@@ -160,7 +168,13 @@ func ResolvePath(explicit string) string {
 			return p
 		}
 	}
-	return strings.TrimSpace(os.Getenv(ConfigEnvVar))
+	if env := strings.TrimSpace(os.Getenv(ConfigEnvVar)); env != "" {
+		return env
+	}
+	if _, err := os.Stat(SystemConfigPath); err == nil {
+		return SystemConfigPath
+	}
+	return ""
 }
 
 // Load reads the configuration from path. An empty path selects DefaultPath();
