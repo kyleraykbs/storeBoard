@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 	"codeberg.org/kyleraykbs/storeboard/internal/version"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -24,13 +25,14 @@ import (
 // no privileged verb ships while this holds.
 const socketMode = 0o666
 
-// Server is the daemon: one unix socket, one document.
+// Server is the daemon: one unix socket, one document, and the peer wire.
 type Server struct {
 	cfg       *config.Config
 	logger    *slog.Logger
 	startedAt time.Time
 	http      *http.Server
 	listener  net.Listener
+	transport *transport.Manager
 }
 
 // New prepares the state and socket directories, then binds the socket. A
@@ -81,6 +83,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		logger:    logger,
 		startedAt: time.Now(),
 		listener:  ln,
+		transport: transport.New(cfg, logger),
 	}
 	s.http = &http.Server{Handler: s.handler()}
 	return s, nil
@@ -119,12 +122,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Peers:         s.cfg.PeerList(),
 		Groups:        s.cfg.GroupList(),
 		Folders:       s.cfg.Folders(),
+		Connections:   s.transport.Snapshot(),
 	})
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully. The socket
 // file itself is removed by Close.
 func (s *Server) Run(ctx context.Context) error {
+	s.transport.Run(ctx)
+
 	errCh := make(chan error, 1)
 	go func() {
 		if err := s.http.Serve(s.listener); err != nil && err != http.ErrServerClosed {
@@ -150,6 +156,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 // Close stops the server and removes the socket file.
 func (s *Server) Close() error {
+	s.transport.Close()
 	s.http.Close()
 	if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
 		return err

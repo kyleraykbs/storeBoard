@@ -146,6 +146,11 @@ func TestStatusDocument(t *testing.T) {
 	if !st.Folders[0].KeepOffline {
 		t.Error("photos: keepOffline = false, want the keep default")
 	}
+	// The transport manager reports the declared other peer even before the
+	// wire is live (it is dialing or backing off).
+	if len(st.Connections) != 1 || st.Connections[0].Peer != "desktop" {
+		t.Errorf("connections = %+v, want one entry for desktop", st.Connections)
+	}
 }
 
 func TestStatusDocumentFoldersAlwaysAnArray(t *testing.T) {

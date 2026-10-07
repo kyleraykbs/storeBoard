@@ -212,7 +212,11 @@
                       "the CLI is not installed by the module"
                   )
                   (
-                    if cfg.environment.variables.STOREBOARD_CONFIG or null == "/etc/storeboard/config.json" then
+                    let
+                      v = cfg.environment.variables.STOREBOARD_CONFIG or null;
+                      etc = cfg.environment.etc."storeboard/config.json".source or null;
+                    in
+                    if v != null && etc != null && v == toString etc then
                       null
                     else
                       "STOREBOARD_CONFIG does not point at the daemon's config"

@@ -57,8 +57,15 @@ one, it changes here first, deliberately, with a decision log entry.
     (the sambaMounts lesson). On reconnect the view returns and the delta
     remerges. Which folders stream is each machine's own `keepOffline`
     declaration (default true: hold a replica that works offline).
+14. The peer wire is newline-delimited JSON over TCP. Both sides open with
+    a hello (protocol, name, version); a disagreement on the protocol
+    version ends the connection, and a name that is not declared in config
+    is rejected — a link can never introduce a peer (invariant 11 holds on
+    the wire too). Unknown frames are tolerated and noted. The wire carries
+    status-grade data only (names, versions, keepalives); TLS with device
+    certificates, built on the threat model, precedes anything sensitive.
 
-## Enforced today (2026-10-06)
+## Enforced today (2026-10-07)
 
 - 6, 7: strict config, three-point validation, versioned status document.
 - 10: holds trivially (only `/v1/status` exists) and is pinned in code and
@@ -70,5 +77,8 @@ one, it changes here first, deliberately, with a decision log entry.
   behaviour itself binds the transport when it lands.
 - 1, 2, 3, 4, 5: forward-looking — nothing violates them because nothing
   writes yet; they bind the sync engine when it lands.
-- 8, 9: forward-looking; both shape interfaces (hooks, wire format) that do
-  not exist yet.
+- 14: enforced — the transport implements the hello, the version agreement,
+  the declared-names-only rule and NDJSON framing (internal/transport);
+  sync frames extend it additively.
+- 8: forward-looking — hooks do not exist yet; when they land, they
+  configure the sync, they never carry it.

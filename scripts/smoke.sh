@@ -12,6 +12,7 @@ DAEMON="$STOREBOARD_BIN/storeboardd"
 work="$(mktemp -d)"
 socket="$work/storeboard.sock"
 config="$work/config.json"
+config2="$work/config2.json"
 pid=""
 cleanup() {
 	if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
@@ -50,8 +51,8 @@ cat >"$config" <<EOF
   "socket": "$socket",
   "peer": "laptop",
   "peers": {
-    "laptop": { "endpoints": ["127.0.0.1:4242"] },
-    "desktop": { "endpoints": [] }
+    "laptop": { "endpoints": ["127.0.0.1:42421"] },
+    "desktop": { "endpoints": ["127.0.0.1:42422"] }
   },
   "groups": {
     "family": {
@@ -92,12 +93,61 @@ if "$DAEMON" --config "$config" 2>/dev/null; then
 	exit 1
 fi
 
+echo "== two daemons connect over the wire"
+cat >"$config2" <<EOF
+{
+  "configVersion": 1,
+  "dataDir": "$work/data2",
+  "socket": "$work/s2.sock",
+  "peer": "desktop",
+  "peers": {
+    "laptop": { "endpoints": ["127.0.0.1:42421"] },
+    "desktop": { "endpoints": ["127.0.0.1:42422"] }
+  },
+  "groups": {
+    "family": {
+      "peers": ["laptop", "desktop"],
+      "folders": { "photos": { "mount": "$work/Pictures" } }
+    }
+  },
+  "mounts": { "photos": "$work/Pictures" }
+}
+EOF
+
+"$DAEMON" --config "$config2" &
+pid2=$!
+
+for _ in $(seq 20); do
+	[ -S "$work/s2.sock" ] && break
+	sleep 0.05
+done
+[ -S "$work/s2.sock" ] || { echo "FAIL: second daemon socket never appeared" >&2; exit 1; }
+
+# Each daemon dials the other's declared endpoint; both must report a
+# connected link to their counterpart.
+for _ in $(seq 40); do
+	if "$CLI" --config "$config" status --json |
+		jq -e '.connections[] | select(.peer == "desktop") | .state == "connected"' >/dev/null 2>&1 &&
+		"$CLI" --config "$config2" status --json |
+		jq -e '.connections[] | select(.peer == "laptop") | .state == "connected"' >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.1
+done
+"$CLI" --config "$config" status --json |
+	jq -e '.connections[] | select(.peer == "desktop") | .state == "connected"' >/dev/null ||
+	{ echo "FAIL: peers did not connect" >&2; exit 1; }
+"$CLI" --config "$config2" status --json |
+	jq -e '.connections[] | select(.peer == "laptop") | .state == "connected"' >/dev/null ||
+	{ echo "FAIL: reverse link did not connect" >&2; exit 1; }
+
 echo "== clean shutdown removes the socket"
-kill "$pid"
-if wait "$pid"; then pid=""; else
+kill "$pid" "$pid2"
+if wait "$pid" && wait "$pid2"; then pid=""; pid2=""; else
 	echo "FAIL: daemon exited nonzero on SIGTERM" >&2
 	exit 1
 fi
 [ ! -e "$socket" ] || { echo "FAIL: socket left behind" >&2; exit 1; }
+[ ! -e "$work/s2.sock" ] || { echo "FAIL: second socket left behind" >&2; exit 1; }
 
 echo "smoke OK"

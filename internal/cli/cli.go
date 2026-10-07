@@ -281,6 +281,18 @@ func renderStatus(w io.Writer, st *api.Status) {
 		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n    keepOffline %s\n",
 			f.Name, f.Group, f.Mount, kept)
 	}
+
+	fmt.Fprintf(w, "\nconnections (%d):\n", len(st.Connections))
+	if len(st.Connections) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	}
+	for _, c := range st.Connections {
+		detail := c.State
+		if c.State != "connected" && c.Error != "" {
+			detail = fmt.Sprintf("%s  (%s)", c.State, c.Error)
+		}
+		fmt.Fprintf(w, "  %s\n    %s\n", c.Peer, detail)
+	}
 }
 
 func writeJSON(w io.Writer, v any) error {

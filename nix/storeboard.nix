@@ -31,9 +31,16 @@ let
   # The configuration the daemon reads: an explicit file when the user has
   # one (useful for secrets or externally managed config), the generated and
   # build-time-validated JSON otherwise.
-  configFile = if cfg.configFile != null then cfg.configFile else "/etc/storeboard/config.json";
-
+  #
+  # ExecStart embeds the STORE path of the generated file, not the /etc
+  # symlink: a config change produces a new store path, which changes the
+  # unit file, which makes nixos-rebuild switch RESTART the daemon. Without
+  # that the daemon would keep running with yesterday's model until
+  # somebody remembered to restart it by hand. The /etc copy stays for the
+  # CLI fallback and humans; it is the same store path.
   generatedConfig = opts.checkedConfig cfg.package cfg "storeboard-config";
+
+  configFile = if cfg.configFile != null then cfg.configFile else generatedConfig;
 in
 {
   options.services.storeboard = {

@@ -1,0 +1,503 @@
+// Package transport is storeboard's peer wire: every daemon listens on the
+// endpoints declared for itself and dials the endpoints declared for every
+// other peer, exchanging newline-delimited JSON.
+//
+// The first line in both directions is a hello; after that the connection
+// carries ping/pong keepalives and (later) the sync protocol. Nothing here
+// is privileged: a connection learns a peer's name and version and nothing
+// else, matching the status-document trust tier. Peers are never learned
+// from the wire — an undeclared name is a rejected connection.
+package transport
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/version"
+	"codeberg.org/kyleraykbs/storeboard/pkg/api"
+)
+
+// WireVersion is the protocol version this build speaks (DESIGN invariant 9:
+// peers advertise and agree on a version before anything flows).
+const WireVersion = 1
+
+const (
+	handshakeTimeout = 10 * time.Second
+	dialTimeout      = 5 * time.Second
+	maxBackoff       = 60 * time.Second
+	bindRetry        = 5 * time.Second
+)
+
+// pingInterval is a var only so tests can run keepalive rounds quickly.
+var pingInterval = 30 * time.Second
+
+// States, mirrored in api.Connection docs.
+const (
+	stateConnected   = "connected"
+	stateDialing     = "dialing"
+	stateBackoff     = "backoff"
+	stateUnaddressed = "unaddressed"
+)
+
+type hello struct {
+	Protocol int    `json:"protocol"`
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+}
+
+// peerState is one declared peer's link bookkeeping. Every field is guarded
+// by mu; the linkReset channel is closed (and replaced) whenever a live
+// link dies, waking the dial loop without polling.
+type peerState struct {
+	name    string
+	endps   []string // dial targets, from the peer's registry entry
+	state   string
+	since   time.Time
+	lastErr string
+	attempt int
+
+	conn      net.Conn
+	linkReset chan struct{}
+
+	mu sync.Mutex
+}
+
+func (p *peerState) connected() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn != nil
+}
+
+func (p *peerState) snapshot() api.Connection {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := api.Connection{
+		Peer:  p.name,
+		State: p.state,
+		Since: p.since,
+		Error: p.lastErr,
+	}
+	if p.conn != nil {
+		out.Endpoint = p.conn.RemoteAddr().String()
+	} else if len(p.endps) > 0 {
+		out.Endpoint = p.endps[0]
+	}
+	return out
+}
+
+func (p *peerState) backoff() time.Duration {
+	if p.attempt == 0 {
+		return 0
+	}
+	d := time.Duration(1<<min(p.attempt, 6)) * time.Second
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	return d
+}
+
+// Manager owns the listener, the dial loops and every peer's link state.
+type Manager struct {
+	cfg    *config.Config
+	logger *slog.Logger
+
+	mu     sync.Mutex
+	peers  map[string]*peerState
+	listen []net.Listener
+}
+
+// New prepares the manager. No sockets are opened until Run.
+func New(cfg *config.Config, logger *slog.Logger) *Manager {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	m := &Manager{cfg: cfg, logger: logger, peers: map[string]*peerState{}}
+	now := time.Now().UTC()
+	for name, p := range cfg.Peers {
+		if name == cfg.Peer {
+			continue
+		}
+		st := &peerState{
+			name:      name,
+			endps:     p.Endpoints,
+			state:     stateDialing,
+			since:     now,
+			linkReset: make(chan struct{}),
+		}
+		if len(st.endps) == 0 {
+			st.state = stateUnaddressed
+			st.lastErr = "no endpoints declared"
+		}
+		m.peers[name] = st
+	}
+	return m
+}
+
+// selfEndpoints are the addresses this daemon serves on.
+func (m *Manager) selfEndpoints() []string {
+	self, ok := m.cfg.Peers[m.cfg.Peer]
+	if !ok {
+		return nil
+	}
+	return self.Endpoints
+}
+
+// Run opens the listeners and the dial loops and serves until ctx ends.
+func (m *Manager) Run(ctx context.Context) {
+	m.runListeners(ctx)
+
+	for _, p := range m.sortedPeers() {
+		if p.state == stateUnaddressed {
+			continue
+		}
+		go m.dialLoop(ctx, p)
+	}
+}
+
+func (m *Manager) sortedPeers() []*peerState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*peerState, 0, len(m.peers))
+	for _, p := range m.peers {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
+}
+
+// runListeners binds every self endpoint. A bind can fail at boot because
+// the nebula address is not assigned yet; it retries instead of dying.
+func (m *Manager) runListeners(ctx context.Context) {
+	for _, ep := range m.selfEndpoints() {
+		go m.listenLoop(ctx, ep)
+	}
+}
+
+func (m *Manager) listenLoop(ctx context.Context, ep string) {
+	for {
+		ln, err := net.Listen("tcp", ep)
+		if err == nil {
+			m.mu.Lock()
+			m.listen = append(m.listen, ln)
+			m.mu.Unlock()
+			m.logger.Info("transport listening", "endpoint", ep)
+			m.acceptLoop(ctx, ln)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		m.logger.Warn("transport bind failed; retrying", "endpoint", ep, "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(bindRetry):
+		}
+	}
+}
+
+func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
+	acceptErr := make(chan error, 1)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			go m.accept(ctx, c)
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		ln.Close()
+	case err := <-acceptErr:
+		m.logger.Warn("transport accept loop ended", "error", err)
+	}
+}
+
+func (m *Manager) accept(ctx context.Context, c net.Conn) {
+	h, reader, err := m.handshake(c)
+	if err != nil {
+		m.logger.Warn("rejected inbound connection", "remote", c.RemoteAddr().String(), "error", err)
+		c.Close()
+		return
+	}
+	m.register(ctx, h, c, reader, "inbound")
+}
+
+// dialLoop keeps one peer's link up: dial → handshake → serve until it
+// dies → back off and go again.
+func (m *Manager) dialLoop(ctx context.Context, p *peerState) {
+	for ctx.Err() == nil {
+		if p.connected() {
+			reset := p.resetChan()
+			select {
+			case <-ctx.Done():
+				return
+			case <-reset:
+			}
+			continue
+		}
+		delay := p.backoff()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		m.tryDial(ctx, p)
+	}
+}
+
+func (p *peerState) resetChan() chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.linkReset
+}
+
+func (m *Manager) tryDial(ctx context.Context, p *peerState) {
+	if p.connected() {
+		return
+	}
+
+	p.mu.Lock()
+	p.state = stateDialing
+	p.since = time.Now().UTC()
+	p.mu.Unlock()
+
+	for _, ep := range p.endps {
+		if p.connected() {
+			return
+		}
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "tcp", ep)
+		if err != nil {
+			m.noteDialFailure(p, ep, err)
+			continue
+		}
+		h, reader, herr := m.handshake(c)
+		if herr != nil {
+			m.noteDialFailure(p, ep, herr)
+			c.Close()
+			continue
+		}
+		if h.Name != p.name {
+			c.Close()
+			m.noteDialFailure(p, ep, fmt.Errorf("endpoint answered as %q", h.Name))
+			continue
+		}
+		m.register(ctx, h, c, reader, "outbound")
+		return
+	}
+}
+
+func (m *Manager) noteDialFailure(p *peerState, ep string, err error) {
+	p.mu.Lock()
+	p.attempt++
+	p.state = stateBackoff
+	p.since = time.Now().UTC()
+	p.lastErr = fmt.Sprintf("%s: %v", ep, err)
+	p.mu.Unlock()
+	m.logger.Debug("dial failed", "peer", p.name, "endpoint", ep, "error", err)
+}
+
+// handshake performs the hello exchange with hard deadlines. It returns the
+// bufio reader it used, because bytes it buffered past the hello line would
+// otherwise be lost when the serving loop builds its own reader.
+func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
+	var got hello
+	_ = c.SetDeadline(time.Now().Add(handshakeTimeout))
+	defer c.SetDeadline(time.Time{})
+
+	line, err := json.Marshal(hello{Protocol: WireVersion, Name: m.cfg.Peer, Version: version.Version})
+	if err != nil {
+		return got, nil, err
+	}
+	if _, err := c.Write(append(line, '\n')); err != nil {
+		return got, nil, fmt.Errorf("write hello: %w", err)
+	}
+
+	reader := bufio.NewReader(c)
+	if err := json.NewDecoder(reader).Decode(&got); err != nil {
+		return got, reader, fmt.Errorf("read hello: %w", err)
+	}
+	switch {
+	case got.Protocol != WireVersion:
+		return got, reader, fmt.Errorf("wire protocol %d, want %d", got.Protocol, WireVersion)
+	case got.Name == "":
+		return got, reader, fmt.Errorf("empty peer name")
+	case got.Name == m.cfg.Peer:
+		return got, reader, fmt.Errorf("peer claims to be me")
+	default:
+		if _, ok := m.cfg.Peers[got.Name]; !ok {
+			return got, reader, fmt.Errorf("undeclared peer %q", got.Name)
+		}
+	}
+	return got, reader, nil
+}
+
+// connKey identifies a connection independently of which end looks at it:
+// the sorted pair of local and remote addresses. Two daemons that dial each
+// other simultaneously compute the same keys, so both keep the same
+// connection and the tie-break is stable.
+func connKey(c net.Conn) string {
+	local, remote := c.LocalAddr().String(), c.RemoteAddr().String()
+	pair := []string{local, remote}
+	sort.Strings(pair)
+	return pair[0] + "|" + pair[1]
+}
+
+// register adopts a handshaked connection. When a link to that peer already
+// exists, the connection with the smaller key survives and the other is
+// closed — whichever side runs the check second closes its own.
+func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *bufio.Reader, direction string) {
+	key := connKey(c)
+
+	m.mu.Lock()
+	p, ok := m.peers[h.Name]
+	m.mu.Unlock()
+	if !ok {
+		// The config cannot have changed mid-handshake (it is fixed for the
+		// process), so this is purely defensive.
+		c.Close()
+		return
+	}
+
+	p.mu.Lock()
+	if p.conn != nil && p.conn != c {
+		old := p.conn
+		if connKey(old) <= key {
+			// The existing link wins; drop the new one.
+			p.mu.Unlock()
+			m.logger.Debug("duplicate link dropped", "peer", h.Name, "direction", direction)
+			c.Close()
+			return
+		}
+		// The new link has the smaller key: it wins, the old dies.
+		old.Close()
+	}
+	p.conn = c
+	p.attempt = 0
+	p.state = stateConnected
+	p.since = time.Now().UTC()
+	p.lastErr = ""
+	p.mu.Unlock()
+
+	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
+
+	go m.serveLink(ctx, p, c, reader, key)
+}
+
+// serveLink consumes one live connection: it answers pings and detects the
+// peer going away.
+func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key string) {
+	defer m.dropLink(p, c, key)
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	go func() {
+		t := time.NewTicker(pingInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				c.Close()
+				return
+			case <-stop:
+				return
+			case <-t.C:
+				c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if _, err := c.Write([]byte("{\"ping\"}\n")); err != nil {
+					c.Close()
+					return
+				}
+				c.SetWriteDeadline(time.Time{})
+			}
+		}
+	}()
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		switch strings.TrimSpace(line) {
+		case "{\"ping\"}":
+			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.Write([]byte("{\"pong\"}\n"))
+			c.SetWriteDeadline(time.Time{})
+		case "{\"pong\"}":
+			// keepalive answer; nothing to do
+		case "":
+		default:
+			// Unknown frame: tolerated (invariant 9, additive protocol)
+			// but noted — sync frames land later.
+			m.logger.Debug("unknown frame", "peer", p.name, "bytes", len(line))
+		}
+	}
+}
+
+// dropLink tears down a connection that just died, if it is still the
+// registered one, and wakes the dial loop.
+func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
+	c.Close()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn == c {
+		p.conn = nil
+		p.attempt++
+		p.state = stateBackoff
+		p.since = time.Now().UTC()
+		p.lastErr = "connection closed"
+		close(p.linkReset)
+		p.linkReset = make(chan struct{})
+	}
+}
+
+// Snapshot lists every declared peer's link state, sorted by name; the
+// status document serves it verbatim.
+func (m *Manager) Snapshot() []api.Connection {
+	m.mu.Lock()
+	peers := make([]*peerState, 0, len(m.peers))
+	for _, p := range m.peers {
+		peers = append(peers, p)
+	}
+	m.mu.Unlock()
+
+	sort.Slice(peers, func(i, j int) bool { return peers[i].name < peers[j].name })
+	out := make([]api.Connection, 0, len(peers))
+	for _, p := range peers {
+		out = append(out, p.snapshot())
+	}
+	return out
+}
+
+// Close tears the transport down.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	ls := m.listen
+	m.listen = nil
+	m.mu.Unlock()
+	for _, ln := range ls {
+		ln.Close()
+	}
+	for _, p := range m.peers {
+		p.mu.Lock()
+		c := p.conn
+		p.conn = nil
+		p.mu.Unlock()
+		if c != nil {
+			c.Close()
+		}
+	}
+}

@@ -43,16 +43,28 @@ type Folder struct {
 	KeepOffline bool   `json:"keepOffline"`
 }
 
+// Connection is this machine's link to one declared peer, as the daemon
+// currently sees it. State is one of: connected, dialing, backoff,
+// unaddressed.
+type Connection struct {
+	Peer     string    `json:"peer"`
+	Endpoint string    `json:"endpoint,omitempty"`
+	State    string    `json:"state"`
+	Since    time.Time `json:"since"`
+	Error    string    `json:"error,omitempty"`
+}
+
 // Status is the daemon's status document, served at GET /v1/status.
 type Status struct {
-	APIVersion    int       `json:"apiVersion"`
-	Version       string    `json:"version"`
-	StartedAt     time.Time `json:"startedAt"`
-	UptimeSeconds int64     `json:"uptimeSeconds"`
-	Socket        string    `json:"socket"`
-	DataDir       string    `json:"dataDir"`
-	Peer          string    `json:"peer"`
-	Peers         []Peer    `json:"peers"`
-	Groups        []Group   `json:"groups"`
-	Folders       []Folder  `json:"folders"`
+	APIVersion    int          `json:"apiVersion"`
+	Version       string       `json:"version"`
+	StartedAt     time.Time    `json:"startedAt"`
+	UptimeSeconds int64        `json:"uptimeSeconds"`
+	Socket        string       `json:"socket"`
+	DataDir       string       `json:"dataDir"`
+	Peer          string       `json:"peer"`
+	Peers         []Peer       `json:"peers"`
+	Groups        []Group      `json:"groups"`
+	Folders       []Folder     `json:"folders"`
+	Connections   []Connection `json:"connections"`
 }
