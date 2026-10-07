@@ -69,7 +69,19 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 		info, serr := os.Lstat(fs.mount)
 		switch {
 		case os.IsNotExist(serr):
-			// A fresh machine: the path simply is not there yet.
+			// A fresh machine: the path simply is not there yet — and
+			// neither, quite possibly, is the directory it belongs in (a
+			// declaration like ~/remote/Videos on a machine that never had
+			// a ~/remote). The mount point is a promise the daemon keeps,
+			// so the chain up to the nearest existing ancestor is created
+			// the way a replica's mkdir -p would be.
+			if err := e.ensureMountParent(fs); err != nil {
+				fs.state = stateBusy
+				fs.busy = api.BusyNotDir
+				fs.root = detached
+				e.logger.Error("create mount path parents", "folder", fs.name, "path", fs.mount, "error", err)
+				return
+			}
 		case serr != nil:
 			fs.state = stateBusy
 			fs.busy = api.BusyNotDir
@@ -349,4 +361,30 @@ func (e *Engine) chownLink(fs *FolderState, path string) {
 		return
 	}
 	_ = os.Lchown(path, fs.perm.uid, fs.perm.gid)
+}
+
+// ensureMountParent creates the directories between a streamed mount path
+// and the nearest existing ancestor, so a declared mount point works on a
+// machine that has never had one (the whole ~/remote style tree is the
+// daemon's to make, per the config's declaration). The new levels get the
+// folder's resolved mode — and, once they exist, they become the reference
+// the folder's own permissions are inherited from, exactly as if the user
+// had made them.
+func (e *Engine) ensureMountParent(fs *FolderState) error {
+	parent := filepath.Dir(fs.mount)
+	var missing []string
+	for p := parent; p != "/" && p != "." && p != ""; p = filepath.Dir(p) {
+		if _, err := os.Stat(p); err == nil {
+			break
+		}
+		missing = append(missing, p)
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o755); err != nil {
+			return err
+		}
+		e.logger.Info("created mount path parent", "folder", fs.name, "path", missing[i])
+		e.applyDir(fs, missing[i])
+	}
+	return nil
 }

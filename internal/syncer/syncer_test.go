@@ -909,3 +909,32 @@ func TestMergeDetachedDifferentContentStillConflicts(t *testing.T) {
 		t.Fatalf("view holds %d entries for note.txt, want the winner and a conflict copy: %v", len(names), names)
 	}
 }
+
+// A declared streamed mount works on a machine that has never had one: the
+// daemon creates the path's whole chain, like mkdir -p, and mounts there.
+func TestStreamedMountCreatesItsPath(t *testing.T) {
+	base := t.TempDir()
+	mount := filepath.Join(base, "remote", "nested", "Videos")
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	if s := n.eng.Snapshot()[0]; s.State != stateDetached {
+		t.Fatalf("state = %q (busy %q), want detached with the path created", s.State, s.Busy)
+	}
+	fi, err := os.Lstat(mount)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("mount path is not a symlink: %v %v", fi, err)
+	}
+	for _, dir := range []string{filepath.Join(base, "remote"), filepath.Join(base, "remote", "nested")} {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			t.Fatalf("%s was not created: %v %v", dir, fi, err)
+		}
+	}
+	// The user's files land in the mount as usual.
+	writeFile(t, filepath.Join(mount, "note.txt"), "offline", time.Now())
+	if got := readFile(t, filepath.Join(n.eng.detachedDir(fs), "note.txt")); got != "offline" {
+		t.Fatalf("content through the mount = %q", got)
+	}
+}
