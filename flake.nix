@@ -190,8 +190,13 @@
                             "laptop"
                             "desktop"
                           ];
-                          folders.photos.mount = "/srv/photos";
+                          folders = {
+                            photos.mount = "/srv/photos";
+                            archive = { };
+                          };
                         };
+                        # Stream one folder instead of replicating it.
+                        keepOffline.archive = false;
                       };
                     }
                   ];

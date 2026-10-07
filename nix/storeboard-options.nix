@@ -120,6 +120,20 @@ rec {
     '';
   };
 
+  keepOffline = lib.mkOption {
+    type = lib.types.attrsOf lib.types.bool;
+    default = { };
+    example = {
+      projectStorage = false;
+    };
+    description = ''
+      Per-folder switch on THIS machine: true (default for anything
+      undeclared) keeps a full local replica that works offline; false
+      streams the folder from a holder — mounted live while a holder is
+      reachable, an empty dummy dir when none is, remerged on reconnect.
+    '';
+  };
+
   # The configuration file both binaries read: strict JSON, configVersion 1,
   # unknown keys an error. Sections appear only when the calling scope has
   # the options — a CLI file carries the socket, the daemon file the model.
@@ -140,7 +154,8 @@ rec {
         folders = lib.mapAttrs (_: f: lib.optionalAttrs (f.mount != null) { mount = f.mount; }) g.folders;
       }) cfg.groups;
     }
-    // lib.optionalAttrs (cfg ? mounts) { mounts = cfg.mounts; };
+    // lib.optionalAttrs (cfg ? mounts) { mounts = cfg.mounts; }
+    // lib.optionalAttrs (cfg ? keepOffline) { keepOffline = cfg.keepOffline; };
 
   # The config file, validated by the real `storeboard config check` during
   # the build: nixos-rebuild fails with the validator's message, and the file

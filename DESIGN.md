@@ -51,6 +51,12 @@ one, it changes here first, deliberately, with a decision log entry.
     precedence — local override, group default, then inside the one
     storage directory — and the config names its owner group, so no path
     is ever ambiguous about what syncs there.
+13. Remote (streamed) folders never dangle. While a holder is reachable the
+    folder mounts live; when none is, the mount point is replaced by an
+    empty dummy dir — nothing in the mount table ever points at nothing
+    (the sambaMounts lesson). On reconnect the view returns and the delta
+    remerges. Which folders stream is each machine's own `keepOffline`
+    declaration (default true: hold a replica that works offline).
 
 ## Enforced today (2026-10-06)
 
@@ -60,6 +66,8 @@ one, it changes here first, deliberately, with a decision log entry.
 - 11: config is the only place peers exist — there is no transport yet to
   learn from.
 - 12: enforced by `Validate` plus the mount-precedence tests.
+- 13: the `keepOffline` switch exists and validates; the mount-or-dummy
+  behaviour itself binds the transport when it lands.
 - 1, 2, 3, 4, 5: forward-looking — nothing violates them because nothing
   writes yet; they bind the sync engine when it lands.
 - 8, 9: forward-looking; both shape interfaces (hooks, wire format) that do

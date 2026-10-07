@@ -84,6 +84,13 @@ type Config struct {
 
 	// Mounts overrides a group folder's default mount on THIS machine.
 	Mounts map[string]string `json:"mounts"`
+
+	// KeepOffline, per folder, decides what THIS machine does with a group
+	// folder: true (the default for anything undeclared) keeps a full local
+	// replica that works offline; false streams the folder from a holder —
+	// mounted live while a holder is reachable, an empty dummy dir when
+	// none is, remerged on reconnect.
+	KeepOffline map[string]bool `json:"keepOffline"`
 }
 
 // Default returns the built-in configuration with the XDG defaults filled in.
@@ -207,6 +214,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Mounts == nil {
 		cfg.Mounts = map[string]string{}
 	}
+	if cfg.KeepOffline == nil {
+		cfg.KeepOffline = map[string]bool{}
+	}
 	for name, g := range cfg.Groups {
 		if g.Folders == nil {
 			g.Folders = map[string]GroupFolder{}
@@ -315,6 +325,12 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	for folder := range c.KeepOffline {
+		if _, ok := folderGroup[folder]; !ok {
+			return fmt.Errorf("keepOffline: unknown folder %q", folder)
+		}
+	}
+
 	return nil
 }
 
@@ -353,7 +369,7 @@ func (c *Config) GroupList() []api.Group {
 // mount point — local override, else the group's declared default, else
 // inside the one storage directory. Sorted by (globally unique) name.
 func (c *Config) Folders() []api.Folder {
-	out := make([]api.Folder, 0, len(c.Mounts))
+	out := make([]api.Folder, 0, len(c.Mounts)+len(c.KeepOffline))
 	for groupName, g := range c.Groups {
 		for folder, gf := range g.Folders {
 			mount := c.Mounts[folder]
@@ -363,7 +379,18 @@ func (c *Config) Folders() []api.Folder {
 			if mount == "" {
 				mount = c.DefaultMountDir(folder)
 			}
-			out = append(out, api.Folder{Name: folder, Group: groupName, Mount: mount})
+			// Absent from the map means keep: a replica is the conservative
+			// default, and streaming is the opt-out.
+			keepOffline := true
+			if v, ok := c.KeepOffline[folder]; ok {
+				keepOffline = v
+			}
+			out = append(out, api.Folder{
+				Name:        folder,
+				Group:       groupName,
+				Mount:       mount,
+				KeepOffline: keepOffline,
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

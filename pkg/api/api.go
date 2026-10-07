@@ -30,13 +30,17 @@ type Group struct {
 	Folders []string `json:"folders"`
 }
 
-// Folder is one shared folder with its effective local mount point on this
-// machine: the local override, the group's declared default, or a default
-// inside the storage directory — whichever applies.
+// Folder is one shared folder as this machine sees it: its effective local
+// mount point (local override, group default, or a default inside the
+// storage directory) and how it is kept. KeepOffline true means this
+// machine holds a full local replica that works offline; false means the
+// folder is streamed from a holder — mounted live while one is reachable,
+// replaced by an empty dummy dir when none is, and remerged on reconnect.
 type Folder struct {
-	Name  string `json:"name"`
-	Group string `json:"group"`
-	Mount string `json:"mount"`
+	Name        string `json:"name"`
+	Group       string `json:"group"`
+	Mount       string `json:"mount"`
+	KeepOffline bool   `json:"keepOffline"`
 }
 
 // Status is the daemon's status document, served at GET /v1/status.

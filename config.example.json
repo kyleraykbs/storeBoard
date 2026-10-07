@@ -13,9 +13,11 @@
       "peers": ["laptop", "desktop", "phone"],
       "folders": {
         "photos": { "mount": "/home/alice/Pictures" },
-        "documents": {}
+        "documents": {},
+        "archive": {}
       }
     }
   },
-  "mounts": { "documents": "/mnt/docs" }
+  "mounts": { "documents": "/mnt/docs", "archive": "/mnt/archive" },
+  "keepOffline": { "archive": false }
 }

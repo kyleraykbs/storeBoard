@@ -274,7 +274,12 @@ func renderStatus(w io.Writer, st *api.Status) {
 		fmt.Fprintln(w, "  (none)")
 	}
 	for _, f := range st.Folders {
-		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n", f.Name, f.Group, f.Mount)
+		kept := "no"
+		if f.KeepOffline {
+			kept = "yes"
+		}
+		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n    keepOffline %s\n",
+			f.Name, f.Group, f.Mount, kept)
 	}
 }
 

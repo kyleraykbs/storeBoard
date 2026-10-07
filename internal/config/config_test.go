@@ -50,7 +50,8 @@ func valid() *Config {
 				},
 			},
 		},
-		Mounts: map[string]string{"documents": "/mnt/docs"},
+		Mounts:      map[string]string{"documents": "/mnt/docs"},
+		KeepOffline: map[string]bool{},
 	}
 }
 
@@ -219,6 +220,12 @@ func TestValidate(t *testing.T) {
 			c.Mounts["ghost"] = "/mnt/ghost"
 		}, "unknown folder"},
 		{"relative mount override", func(c *Config) { c.Mounts["photos"] = "pics" }, "absolute"},
+		{"keepOffline for unknown folder", func(c *Config) {
+			c.KeepOffline["ghost"] = false
+		}, "unknown folder"},
+		{"stream instead of keep", func(c *Config) {
+			c.KeepOffline["documents"] = false
+		}, ""},
 	}
 
 	for _, tt := range tests {
@@ -273,6 +280,20 @@ func TestMountPrecedence(t *testing.T) {
 			if f.Group != "family" {
 				t.Errorf("group = %q, want family", f.Group)
 			}
+		}
+	}
+
+	// KeepOffline: undeclared means keep a replica.
+	for _, f := range cfg.Folders() {
+		if !f.KeepOffline {
+			t.Errorf("folder %q: keepOffline = false, want the keep default", f.Name)
+		}
+	}
+	// Declared false streams the folder instead of replicating it.
+	cfg.KeepOffline["documents"] = false
+	for _, f := range cfg.Folders() {
+		if f.Name == "documents" && f.KeepOffline {
+			t.Error("documents: keepOffline = true, want the declared false")
 		}
 	}
 }

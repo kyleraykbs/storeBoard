@@ -88,6 +88,7 @@ in
       peers
       groups
       mounts
+      keepOffline
       ;
   };
 

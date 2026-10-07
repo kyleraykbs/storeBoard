@@ -142,6 +142,10 @@ func TestStatusDocument(t *testing.T) {
 		st.Folders[0].Group != "family" || st.Folders[0].Mount != "/home/kyle/Pictures" {
 		t.Errorf("folders = %+v, want photos in family at its group mount", st.Folders)
 	}
+	// Undeclared in KeepOffline means keep a replica.
+	if !st.Folders[0].KeepOffline {
+		t.Error("photos: keepOffline = false, want the keep default")
+	}
 }
 
 func TestStatusDocumentFoldersAlwaysAnArray(t *testing.T) {

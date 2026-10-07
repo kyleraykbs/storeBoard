@@ -26,7 +26,7 @@ echo "== version"
 echo "== config check: valid example"
 "$CLI" --config config.example.json config check | grep -q "config OK"
 "$CLI" --config config.example.json config check --json |
-	jq -e '.valid and (.folders | length == 2)' >/dev/null
+	jq -e '.valid and (.folders | length == 3)' >/dev/null
 
 echo "== config check: typo rejected, reported as JSON"
 echo '{"configVersion": 1, "folars": []}' >"$work/bad.json"
@@ -83,7 +83,8 @@ echo "== status, both modes"
 	jq -e --arg s "$socket" --arg w "$work" '
 		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
 		(.groups | length == 1) and (.folders | length == 2) and
-		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs"))' >/dev/null
+		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs")) and
+		([.folders[].keepOffline] | all)' >/dev/null
 
 echo "== second daemon refused on a live socket"
 if "$DAEMON" --config "$config" 2>/dev/null; then
