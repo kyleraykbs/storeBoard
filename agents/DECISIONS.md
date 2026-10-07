@@ -79,3 +79,18 @@
   peer/direction/error): links to amanita were dying every couple of
   minutes with no daemon restart, and nothing recorded the reason.
 - **Reversible:** yes (behavior-preserving for same-filesystem deletes).
+
+## 2026-10-07 — A streamed folder is scanned only while attached
+
+- **Decision:** `scanOnce` skips streamed folders whose state is not
+  `attached`, and a detach no longer triggers a scan. The detached dir is a
+  scratchpad for offline writes (merged into the view on attach); it is
+  never treated as the folder's content.
+- **Why:** the detach flips the scanned root from the view to the empty
+  scratchpad, so a scan saw every known file as vanished and tombstoned the
+  whole folder; the next attach resurrected it with fresh versions, and
+  every holder reconnect (~2 min, live) churned the entire dataset — 101 GB
+  read in 4 minutes, 37 GB RSS on the client, 40 GB written on the holder,
+  and a status socket too starved to answer.
+- **Reversible:** yes — the only scanning the change removes is one that
+  could only produce false tombstones.

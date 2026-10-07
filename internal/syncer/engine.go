@@ -164,10 +164,10 @@ func (e *Engine) scanLoop(ctx context.Context, fs *FolderState) {
 }
 
 func (e *Engine) scanOnce(fs *FolderState) {
+	fs.scanMu.Lock()
 	// Re-resolve every pass: an inherited permission follows the directory
 	// it came from, so a chown or chmod of the mount's parent is honoured on
 	// the next scan rather than at the next restart.
-	fs.scanMu.Lock()
 	fs.perm = e.resolvePerms(fs)
 	if fs.streamed {
 		// The mount target is the one directory the daemon owns on behalf
@@ -175,7 +175,17 @@ func (e *Engine) scanOnce(fs *FolderState) {
 		// time"). Replicas are the user's directories and are never chmod'ed.
 		e.applyDir(fs, fs.root)
 	}
+	// A streamed folder is only scanned while it is attached. The detached
+	// dir is a scratchpad for offline writes (merged back in on attach),
+	// not the folder's content: scanning it sees every known file as
+	// vanished and tombstones it — and the next attach then resurrects the
+	// whole folder with fresh versions, so every reconnect churned the
+	// entire mesh (GB-sized reads and rewrites on both sides).
+	scan := !fs.streamed || fs.state == stateAttached
 	fs.scanMu.Unlock()
+	if !scan {
+		return
+	}
 
 	changed, err := e.scan(fs)
 	if err != nil {
@@ -283,8 +293,9 @@ func (e *Engine) evaluateMounts() {
 			e.attach(fs)
 			e.scanOnce(fs)
 		case !connected && state == stateAttached:
+			// No scan after a detach: the root just became the empty
+			// scratchpad, and scanning that would tombstone the folder.
 			e.detach(fs)
-			e.scanOnce(fs)
 		}
 	}
 }

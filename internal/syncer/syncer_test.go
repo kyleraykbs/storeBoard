@@ -641,3 +641,53 @@ func sameDevice(a, b string) bool {
 	db, okb := sb.Sys().(*syscall.Stat_t)
 	return !oka || !okb || da.Dev == db.Dev
 }
+
+// Losing the holder must not cost the folder its content. The detached dir
+// is a scratchpad, not the folder: scanning it used to tombstone every known
+// file, and each reattach then resurrected the whole folder with fresh
+// versions — rider and holder rewrote gigabtyes on every reconnect.
+func TestDetachedFolderDoesNotTombstoneItsContent(t *testing.T) {
+	old := scanInterval
+	scanInterval = 50 * time.Millisecond
+	defer func() { scanInterval = old }()
+
+	epA, epB := twoEndpoints(t)
+	rootA := filepath.Join(t.TempDir(), "docs")
+	mountB := filepath.Join(t.TempDir(), "remote-docs")
+
+	a := mkNode(t, "a", "b", epA, epB, rootA, true)
+	b := mkNode(t, "b", "a", epB, epA, mountB, false)
+	writeFile(t, filepath.Join(rootA, "hello.txt"), "from-holder", time.Now())
+
+	startNode(t, a)
+	startNode(t, b)
+
+	waitFor(t, 10*time.Second, "attached with the holder's file", func() bool {
+		return exists(filepath.Join(mountB, "hello.txt"))
+	})
+	before := b.eng.folders[0].db.Get("hello.txt")
+	if before == nil || before.Deleted {
+		t.Fatalf("no live entry after attach: %+v", before)
+	}
+
+	a.stop()
+	waitFor(t, 10*time.Second, "detached", func() bool {
+		return b.eng.Snapshot()[0].State == stateDetached
+	})
+
+	for i := 0; i < 5; i++ {
+		b.eng.scanOnce(b.eng.folders[0])
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	after := b.eng.folders[0].db.Get("hello.txt")
+	if after == nil || after.Deleted {
+		t.Fatalf("entry tombstoned while detached: %+v", after)
+	}
+	if after.VV["b"] != before.VV["b"] {
+		t.Fatalf("version bumped while detached: %v -> %v", before.VV, after.VV)
+	}
+	if got := readFile(t, filepath.Join(rootA, "hello.txt")); got != "from-holder" {
+		t.Fatalf("holder content = %q", got)
+	}
+}
