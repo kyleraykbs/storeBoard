@@ -54,6 +54,20 @@ type Connection struct {
 	Error    string    `json:"error,omitempty"`
 }
 
+// FolderSync is one folder's engine state on this machine. State is one of:
+// replica (a full local copy that syncs), attached (a streamed folder
+// mounted live), detached (a streamed folder replaced by an empty dir while
+// no holder is reachable), busy (something else owns the mount path, e.g. a
+// samba mount, and the engine leaves it alone).
+type FolderSync struct {
+	Folder    string    `json:"folder"`
+	Root      string    `json:"root"`
+	State     string    `json:"state"`
+	Entries   int       `json:"entries"`
+	Conflicts int       `json:"conflicts"`
+	LastScan  time.Time `json:"lastScan"`
+}
+
 // Status is the daemon's status document, served at GET /v1/status.
 type Status struct {
 	APIVersion    int          `json:"apiVersion"`
@@ -67,4 +81,5 @@ type Status struct {
 	Groups        []Group      `json:"groups"`
 	Folders       []Folder     `json:"folders"`
 	Connections   []Connection `json:"connections"`
+	Sync          []FolderSync `json:"sync"`
 }

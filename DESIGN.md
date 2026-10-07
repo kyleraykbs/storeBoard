@@ -65,20 +65,43 @@ one, it changes here first, deliberately, with a decision log entry.
     status-grade data only (names, versions, keepalives); TLS with device
     certificates, built on the threat model, precedes anything sensitive.
 
+## Sync engine (2026-10-07)
+
+- Content is content-addressed (`<dataDir>/store/<sha256>`), shared by all
+  folders on a machine, written temp → fsync → rename.
+- Every folder keeps an append-only NDJSON journal (`<dataDir>/journal/`)
+  replayed into memory at open and checkpointed; each entry carries a
+  version vector.
+- A scan (default every 15 s, `STOREBOARD_SCAN_INTERVAL` overrides) hashes
+  only files whose size or mtime moved; vanished files become tombstones.
+- Peers exchange index deltas; a side that lacks or is behind a version
+  asks for the blob (`want` → `blob` chunks → `blobEnd`); a side that is
+  ahead pushes its index entry. Concurrent edits resolve deterministically
+  (newer mtime wins, blob hash breaks ties): the winner keeps the path on
+  both machines, the loser is parked as `<name>.conflict-<blob8>` and
+  indexed like any other file, so conflict copies themselves replicate.
+- Deletes propagate as tombstones; the survivor's file is moved to
+  `<dataDir>/trash/<folder>/`, never unlinked.
+- A remote update that would land on top of an unscanned local change
+  parks that change as a conflict copy first.
+
 ## Enforced today (2026-10-07)
 
+- 1, 2: nothing is destroyed without a copy — remote deletes go to trash,
+  the store is append-only, disputed content is parked as `.conflict-*`.
+- 3: temp → fsync → rename for every write; journals are append-only with
+  a checkpoint at open.
+- 5: version vectors per file; the deterministic winner/conflict-copy rule
+  converges replicas without ping-pong.
 - 6, 7: strict config, three-point validation, versioned status document.
-- 10: holds trivially (only `/v1/status` exists) and is pinned in code and
-  here.
-- 11: config is the only place peers exist — there is no transport yet to
-  learn from.
+- 10: still only status-grade verbs over the local socket; the wire carries
+  names, versions, journals and file content over the nebula overlay.
+- 11: config-only peers; the transport rejects undeclared names.
 - 12: enforced by `Validate` plus the mount-precedence tests.
-- 13: the `keepOffline` switch exists and validates; the mount-or-dummy
-  behaviour itself binds the transport when it lands.
-- 1, 2, 3, 4, 5: forward-looking — nothing violates them because nothing
-  writes yet; they bind the sync engine when it lands.
-- 14: enforced — the transport implements the hello, the version agreement,
-  the declared-names-only rule and NDJSON framing (internal/transport);
-  sync frames extend it additively.
-- 8: forward-looking — hooks do not exist yet; when they land, they
-  configure the sync, they never carry it.
+- 13: attach/detach/remerge implemented (views + symlink swap + detached
+  dir merge). Streams are currently full local mirrors; eviction and
+  on-demand fetch are later work.
+- 14: hello/version/NDJSON framing in the transport; `index`/`want`/`blob`/
+  `blobEnd` extend it additively.
+- 4, 8, 9: forward-looking — policies/hooks and min/max protocol
+  negotiation do not exist yet.

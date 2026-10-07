@@ -48,6 +48,24 @@ Resolution: `--config` > an existing
 default. The Nix modules generate and validate the file at build time, so a
 bad option value fails nixos-rebuild instead of failing at startup.
 
+## Sync and mounts
+
+- **Replicas** (`keepOffline = true`) hold the folder's content under the
+  mount path and sync it with every other replica: creates, edits and
+  deletes (deletes land in `<dataDir>/trash/<folder>/`).
+- **Streamed** folders (`keepOffline = false`) are daemon-managed views: the
+  mount path is a symlink into `<dataDir>/views/<folder>`, live while a
+  holder answers. When no holder is reachable the path is swapped to an
+  empty writable dir (`<dataDir>/detached/<folder>`); what is written there
+  is merged back into the view on reconnect and synced onwards. A path
+  owned by something else (a samba mount, a real directory) is left alone
+  and reported as `busy`.
+- Concurrent edits to one file resolve deterministically on every replica
+  (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
+  conflicts are visible in `status --json` (`.sync[]`).
+- Scans run every 15 s; `STOREBOARD_SCAN_INTERVAL` (a duration, e.g.
+  `200ms`) overrides that for tests and tight loops.
+
 ## Query the daemon
 
     storeboardd --config config.example.json &

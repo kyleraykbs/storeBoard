@@ -41,6 +41,23 @@ let
   generatedConfig = opts.checkedConfig cfg.package cfg "storeboard-config";
 
   configFile = if cfg.configFile != null then cfg.configFile else generatedConfig;
+
+  # Folder name → effective mount, resolved exactly like the engine does:
+  # local override, else the group's default, else inside dataDir.
+  folderMounts = lib.concatMapAttrs (
+    _: g: lib.mapAttrs (fname: f: if cfg.mounts ? ${fname} then cfg.mounts.${fname} else if f.mount != null then f.mount else "${cfg.dataDir}/mounts/${fname}") g.folders
+  ) cfg.groups;
+
+  # What the engine may write: replica roots directly, streamed mounts plus
+  # their parent (the symlink swap). "-" tolerates a path that does not
+  # exist yet rather than failing the unit.
+  folderReadWrite = lib.concatMap (
+    fname:
+    let
+      m = folderMounts.${fname};
+    in
+    if cfg.keepOffline.${fname} or true then [ "-${m}" ] else [ "-${m}" "-${builtins.dirOf m}" ]
+  ) (lib.attrNames folderMounts);
 in
 {
   options.services.storeboard = {
@@ -55,13 +72,17 @@ in
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "storeboard";
-      description = "User the service runs as.";
+      default = "root";
+      description = ''
+        User the service runs as. Defaults to root because the engine writes
+        into people's home folders and materialises mounts there; the
+        syncthing tag made the same call for the same reason.
+      '';
     };
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "storeboard";
+      default = "root";
       description = "Group the service runs as.";
     };
 
@@ -137,13 +158,17 @@ in
     environment.systemPackages = [ cfg.package ];
     environment.variables.STOREBOARD_CONFIG = "${configFile}";
 
-    users.users.${cfg.user} = {
-      isSystemUser = true;
-      group = cfg.group;
-      home = cfg.dataDir;
-      description = "storeboard daemon";
+    users.users = lib.optionalAttrs (cfg.user != "root") {
+      ${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.group;
+        home = cfg.dataDir;
+        description = "storeboard daemon";
+      };
     };
-    users.groups.${cfg.group} = { };
+    users.groups = lib.optionalAttrs (cfg.group != "root") {
+      ${cfg.group} = { };
+    };
 
     systemd.services.storeboard = {
       description = "Storeboard sync daemon";
@@ -164,17 +189,27 @@ in
         RuntimeDirectory = "storeboard";
         RuntimeDirectoryMode = "0755";
         WorkingDirectory = cfg.dataDir;
-        # The daemon owns its state dir today. When the sync engine lands,
-        # every configured folder path joins this list (and ProtectHome with
-        # it) — see agents/TODO.md.
-        ReadWritePaths = [ cfg.dataDir ];
+        # Folders live in people's homes.
+        ReadWritePaths = [ cfg.dataDir ] ++ folderReadWrite;
+        # Content has to land owned by the human, not by root.
+        AmbientCapabilities = [
+          "CAP_CHOWN"
+          "CAP_FOWNER"
+          "CAP_DAC_OVERRIDE"
+        ];
+        CapabilityBoundingSet = [
+          "CAP_CHOWN"
+          "CAP_FOWNER"
+          "CAP_DAC_OVERRIDE"
+        ];
       }
       // lib.optionalAttrs cfg.hardening {
         NoNewPrivileges = true;
         PrivateTmp = true;
         PrivateDevices = true;
         ProtectSystem = "strict";
-        ProtectHome = true;
+        # The engine syncs and mounts inside home directories.
+        ProtectHome = false;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;

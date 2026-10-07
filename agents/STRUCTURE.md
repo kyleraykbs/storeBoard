@@ -16,6 +16,16 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
   peer/group/folder/mount model with validation (configVersion 1, host:port
   endpoints, group membership, global folder names, absolute mounts) and
   the sorted `PeerList`/`GroupList`/`Folders` views the status serves.
+- `internal/store` — the content-addressed blob store: sha256-keyed files
+  under `<dataDir>/store`, scratch under `<dataDir>/tmp`, adopt = fsync +
+  rename.
+- `internal/syncer` — the engine: per-folder journals with version vectors
+  (`filedb.go`), the scanner (`scan.go`), the session protocol
+  (`session.go`: index/want/blob/blobEnd, conflict resolution, trash) and
+  the mounts (`mounts.go`: views, symlink swap, detached dirs, remerge).
+- `internal/transport` — the peer wire: listener, dial loops, hello
+  handshake, keepalives, cross-dial tie-break; hands frames to a Handler
+  (the engine).
 - `internal/server` — the unix-socket HTTP server, socket lifecycle (stale
   takeover, live-daemon refusal, cleanup) and the `/v1/status` document.
 - `internal/cli` — the command set; stdout carries reports/data, stderr

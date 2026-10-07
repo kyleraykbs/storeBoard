@@ -105,14 +105,58 @@ func (p *peerState) backoff() time.Duration {
 	return d
 }
 
+// Handler receives peer lifecycle and frames. The sync engine implements it;
+// the transport itself only keeps links alive.
+type Handler interface {
+	// OnPeerConnected reports a live, handshaked link. send writes one
+	// newline-terminated frame; it is safe from any goroutine.
+	OnPeerConnected(peer string, send func([]byte) error)
+	// OnPeerFrame delivers one frame line from a peer.
+	OnPeerFrame(peer string, line []byte)
+	// OnPeerDisconnected reports a link going away.
+	OnPeerDisconnected(peer string)
+}
+
 // Manager owns the listener, the dial loops and every peer's link state.
 type Manager struct {
 	cfg    *config.Config
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	peers  map[string]*peerState
-	listen []net.Listener
+	mu      sync.Mutex
+	peers   map[string]*peerState
+	listen  []net.Listener
+	handler Handler
+}
+
+// SetHandler installs the frame consumer. Call before Run.
+func (m *Manager) SetHandler(h Handler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handler = h
+}
+
+func (m *Manager) getHandler() Handler {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.handler
+}
+
+// linkWriter serializes writes on one connection: keepalives and sync
+// frames share the socket.
+type linkWriter struct {
+	mu sync.Mutex
+	c  net.Conn
+}
+
+func (w *linkWriter) write(b []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.c.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return err
+	}
+	_, err := w.c.Write(b)
+	_ = w.c.SetWriteDeadline(time.Time{})
+	return err
 }
 
 // New prepares the manager. No sockets are opened until Run.
@@ -402,6 +446,12 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key string) {
 	defer m.dropLink(p, c, key)
 
+	w := &linkWriter{c: c}
+	handler := m.getHandler()
+	if handler != nil {
+		handler.OnPeerConnected(p.name, w.write)
+	}
+
 	stop := make(chan struct{})
 	defer close(stop)
 
@@ -416,12 +466,10 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			case <-stop:
 				return
 			case <-t.C:
-				c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if _, err := c.Write([]byte("{\"ping\"}\n")); err != nil {
+				if err := w.write([]byte("{\"ping\"}\n")); err != nil {
 					c.Close()
 					return
 				}
-				c.SetWriteDeadline(time.Time{})
 			}
 		}
 	}()
@@ -431,18 +479,22 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		if err != nil {
 			return
 		}
-		switch strings.TrimSpace(line) {
+		switch trimmed := strings.TrimSpace(line); trimmed {
 		case "{\"ping\"}":
-			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			c.Write([]byte("{\"pong\"}\n"))
-			c.SetWriteDeadline(time.Time{})
+			if err := w.write([]byte("{\"pong\"}\n")); err != nil {
+				return
+			}
 		case "{\"pong\"}":
 			// keepalive answer; nothing to do
 		case "":
 		default:
-			// Unknown frame: tolerated (invariant 9, additive protocol)
-			// but noted — sync frames land later.
-			m.logger.Debug("unknown frame", "peer", p.name, "bytes", len(line))
+			if handler != nil {
+				handler.OnPeerFrame(p.name, []byte(trimmed))
+				continue
+			}
+			// No handler yet: tolerate and note (invariant 9, additive
+			// protocol).
+			m.logger.Debug("unhandled frame", "peer", p.name, "bytes", len(line))
 		}
 	}
 }
@@ -461,6 +513,9 @@ func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
 		p.lastErr = "connection closed"
 		close(p.linkReset)
 		p.linkReset = make(chan struct{})
+		if h := m.getHandler(); h != nil {
+			h.OnPeerDisconnected(p.name)
+		}
 	}
 }
 

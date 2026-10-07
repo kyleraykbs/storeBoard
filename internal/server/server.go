@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/syncer"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 	"codeberg.org/kyleraykbs/storeboard/internal/version"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
@@ -25,7 +26,8 @@ import (
 // no privileged verb ships while this holds.
 const socketMode = 0o666
 
-// Server is the daemon: one unix socket, one document, and the peer wire.
+// Server is the daemon: one unix socket, one document, the peer wire, and
+// the sync engine behind it.
 type Server struct {
 	cfg       *config.Config
 	logger    *slog.Logger
@@ -33,6 +35,7 @@ type Server struct {
 	http      *http.Server
 	listener  net.Listener
 	transport *transport.Manager
+	engine    *syncer.Engine
 }
 
 // New prepares the state and socket directories, then binds the socket. A
@@ -78,13 +81,21 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("chmod %s: %w", cfg.Socket, err)
 	}
 
+	engine, err := syncer.New(cfg, logger)
+	if err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("sync engine: %w", err)
+	}
+
 	s := &Server{
 		cfg:       cfg,
 		logger:    logger,
 		startedAt: time.Now(),
 		listener:  ln,
 		transport: transport.New(cfg, logger),
+		engine:    engine,
 	}
+	s.transport.SetHandler(engine)
 	s.http = &http.Server{Handler: s.handler()}
 	return s, nil
 }
@@ -123,12 +134,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Groups:        s.cfg.GroupList(),
 		Folders:       s.cfg.Folders(),
 		Connections:   s.transport.Snapshot(),
+		Sync:          s.engine.Snapshot(),
 	})
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully. The socket
 // file itself is removed by Close.
 func (s *Server) Run(ctx context.Context) error {
+	go s.engine.Run(ctx)
 	s.transport.Run(ctx)
 
 	errCh := make(chan error, 1)
@@ -156,6 +169,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 // Close stops the server and removes the socket file.
 func (s *Server) Close() error {
+	s.engine.Close()
 	s.transport.Close()
 	s.http.Close()
 	if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {

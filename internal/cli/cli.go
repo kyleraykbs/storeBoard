@@ -293,6 +293,18 @@ func renderStatus(w io.Writer, st *api.Status) {
 		}
 		fmt.Fprintf(w, "  %s\n    %s\n", c.Peer, detail)
 	}
+
+	fmt.Fprintf(w, "\nsync (%d):\n", len(st.Sync))
+	if len(st.Sync) == 0 {
+		fmt.Fprintln(w, "  (none)")
+	}
+	for _, s := range st.Sync {
+		detail := fmt.Sprintf("%s, %d entries", s.State, s.Entries)
+		if s.Conflicts > 0 {
+			detail += fmt.Sprintf(", %d conflicts", s.Conflicts)
+		}
+		fmt.Fprintf(w, "  %s\n    %s\n", s.Folder, detail)
+	}
 }
 
 func writeJSON(w io.Writer, v any) error {
