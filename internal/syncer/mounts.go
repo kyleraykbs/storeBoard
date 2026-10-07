@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
@@ -78,6 +79,11 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 			if err := os.Remove(fs.mount); err != nil {
 				fs.state = stateBusy
 				fs.root = detached
+				if fstype := mountFSType(fs.mount); fstype != "" {
+					e.logger.Warn("mount path is still a mount point; something must unmount it first",
+						"folder", fs.name, "path", fs.mount, "fstype", fstype)
+					return
+				}
 				e.logger.Warn("mount path is an empty dir that cannot be removed; leaving it alone", "folder", fs.name, "path", fs.mount, "error", err)
 				return
 			}
@@ -245,6 +251,49 @@ func symlinkSwap(path, target string) error {
 		return fmt.Errorf("swap %s: %w", path, err)
 	}
 	return nil
+}
+
+// mountFSType reports the filesystem type mounted exactly at path, or "".
+// It reads /proc/self/mountinfo so a "busy" diagnosis names the offender
+// (a leftover cifs mount, the samba placeholder tmpfs, anything else).
+func mountFSType(path string) string {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ""
+	}
+	want := filepath.Clean(path)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		sep := -1
+		for i, f := range fields {
+			if f == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 || sep+1 >= len(fields) {
+			continue
+		}
+		point := unescapeMount(fields[4])
+		if filepath.Clean(point) == want {
+			return fields[sep+1]
+		}
+	}
+	return ""
+}
+
+// unescapeMount decodes the octal escapes mountinfo uses for spaces and the
+// like in paths.
+func unescapeMount(s string) string {
+	return strings.NewReplacer(
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+		`\134`, `\`,
+	).Replace(s)
 }
 
 // chownPath best-efforts ownership of a created entry to the folder's owner
