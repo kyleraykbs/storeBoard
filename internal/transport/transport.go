@@ -127,6 +127,22 @@ type Manager struct {
 	peers   map[string]*peerState
 	listen  []net.Listener
 	handler Handler
+
+	// wg counts every goroutine that can still be inside a frame handler.
+	// Close waits on it: a link being torn down may be mid-apply, writing a
+	// blob into the store or a file into a folder, and returning from Close
+	// while that write is in flight races whatever removes those paths next
+	// (tests do exactly that, and a restart does it for real).
+	wg sync.WaitGroup
+}
+
+// spawn runs fn on a goroutine Close will wait for.
+func (m *Manager) spawn(fn func()) {
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		fn()
+	}()
 }
 
 // SetHandler installs the frame consumer. Call before Run.
@@ -204,7 +220,7 @@ func (m *Manager) Run(ctx context.Context) {
 		if p.state == stateUnaddressed {
 			continue
 		}
-		go m.dialLoop(ctx, p)
+		m.spawn(func() { m.dialLoop(ctx, p) })
 	}
 }
 
@@ -223,7 +239,7 @@ func (m *Manager) sortedPeers() []*peerState {
 // the nebula address is not assigned yet; it retries instead of dying.
 func (m *Manager) runListeners(ctx context.Context) {
 	for _, ep := range m.selfEndpoints() {
-		go m.listenLoop(ctx, ep)
+		m.spawn(func() { m.listenLoop(ctx, ep) })
 	}
 }
 
@@ -259,7 +275,7 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
 				acceptErr <- err
 				return
 			}
-			go m.accept(ctx, c)
+			m.spawn(func() { m.accept(ctx, c) })
 		}
 	}()
 	select {
@@ -439,7 +455,7 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 
 	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
 
-	go m.serveLink(ctx, p, c, reader, key, direction)
+	m.spawn(func() { m.serveLink(ctx, p, c, reader, key, direction) })
 }
 
 // serveLink consumes one live connection: it answers pings and detects the
@@ -543,7 +559,9 @@ func (m *Manager) Snapshot() []api.Connection {
 	return out
 }
 
-// Close tears the transport down.
+// Close tears the transport down and waits for every link goroutine: a
+// handler caught mid-apply must finish before the caller removes or reopens
+// the paths it writes to.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	ls := m.listen
@@ -561,6 +579,7 @@ func (m *Manager) Close() {
 			c.Close()
 		}
 	}
+	m.wg.Wait()
 }
 
 // isClosed reports errors that mean this side closed the connection: normal
