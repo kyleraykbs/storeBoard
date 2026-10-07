@@ -50,6 +50,53 @@ type Peer struct {
 type Group struct {
 	Peers   []string               `json:"peers"`
 	Folders map[string]GroupFolder `json:"folders"`
+	// Permissions is the group's default ownership and mode for its
+	// folders; a per-folder entry on a machine overrides it field by field.
+	Permissions *Permissions `json:"permissions,omitempty"`
+}
+
+// Permissions is the ownership and mode the daemon gives the entries it
+// creates for a folder. Every field is optional: an empty field falls
+// through to the next level — machine-local entry, then group default, then
+// the directory the mount lives in (its owner, its group, its mode). So a
+// folder with nothing declared is permissioned exactly like the directory
+// containing it, and inherits any change that directory sees.
+type Permissions struct {
+	User  string `json:"user,omitempty"`  // user name or numeric uid
+	Group string `json:"group,omitempty"` // group name or numeric gid
+	Mode  string `json:"mode,omitempty"`  // octal directory mode, e.g. "0755"
+}
+
+// Validate checks a Permissions block's syntax. User and group names are
+// resolved at run time, not here: the build-time config check runs in a
+// sandbox with no passwd database.
+func (p *Permissions) Validate(where string) error {
+	if p == nil {
+		return nil
+	}
+	for _, f := range []struct{ label, v string }{{"user", p.User}, {"group", p.Group}} {
+		if f.v == "" {
+			continue
+		}
+		if strings.ContainsAny(f.v, ":,\n \t") {
+			return fmt.Errorf("%s %s %q: a name or numeric id, not a colon list", where, f.label, f.v)
+		}
+	}
+	if p.Mode != "" {
+		if _, err := ParseMode(p.Mode); err != nil {
+			return fmt.Errorf("%s mode: %w", where, err)
+		}
+	}
+	return nil
+}
+
+// ParseMode parses an octal directory mode ("755", "0755").
+func ParseMode(s string) (os.FileMode, error) {
+	m, err := strconv.ParseUint(s, 8, 32)
+	if err != nil || m > 0o777 {
+		return 0, fmt.Errorf("%q: want octal 0000-0777", s)
+	}
+	return os.FileMode(m), nil
 }
 
 // GroupFolder is a folder's declaration inside a group. Mount is the
@@ -84,6 +131,13 @@ type Config struct {
 
 	// Mounts overrides a group folder's default mount on THIS machine.
 	Mounts map[string]string `json:"mounts"`
+
+	// Permissions overrides, per folder on THIS machine, the ownership and
+	// mode the daemon gives the folder's entries. Fields left empty fall
+	// back to the group's Permissions and then to the directory the mount
+	// lives in, so a folder with nothing declared is permissioned exactly
+	// like the directory containing it.
+	Permissions map[string]Permissions `json:"permissions,omitempty"`
 
 	// KeepOffline, per folder, decides what THIS machine does with a group
 	// folder: true (the default for anything undeclared) keeps a full local
@@ -231,6 +285,9 @@ func Load(path string) (*Config, error) {
 	if cfg.KeepOffline == nil {
 		cfg.KeepOffline = map[string]bool{}
 	}
+	if cfg.Permissions == nil {
+		cfg.Permissions = map[string]Permissions{}
+	}
 	for name, g := range cfg.Groups {
 		if g.Folders == nil {
 			g.Folders = map[string]GroupFolder{}
@@ -345,7 +402,64 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	for folder, p := range c.Permissions {
+		if _, ok := folderGroup[folder]; !ok {
+			return fmt.Errorf("permissions: unknown folder %q", folder)
+		}
+		if err := p.Validate(fmt.Sprintf("permissions %s", folder)); err != nil {
+			return err
+		}
+	}
+
+	for name, g := range c.Groups {
+		if err := g.Permissions.Validate(fmt.Sprintf("group %s permissions", name)); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// PermissionsFor is the declared permissions for a folder: this machine's
+// per-folder entry wins field by field over the group's default. Nil when
+// neither declares anything — the daemon then inherits from the directory
+// the mount lives in.
+func (c *Config) PermissionsFor(folder, group string) *Permissions {
+	var local *Permissions
+	if p, ok := c.Permissions[folder]; ok {
+		local = &p
+	}
+	def := c.Groups[group].Permissions
+	if local == nil && def == nil {
+		return nil
+	}
+	out := &Permissions{}
+	lu, lg, lm := "", "", ""
+	if local != nil {
+		lu, lg, lm = local.User, local.Group, local.Mode
+	}
+	du, dg, dm := "", "", ""
+	if def != nil {
+		du, dg, dm = def.User, def.Group, def.Mode
+	}
+	for _, f := range []struct {
+		dst        *string
+		local, def string
+	}{
+		{&out.User, lu, du},
+		{&out.Group, lg, dg},
+		{&out.Mode, lm, dm},
+	} {
+		if f.local != "" {
+			*f.dst = f.local
+		} else {
+			*f.dst = f.def
+		}
+	}
+	if out.User == "" && out.Group == "" && out.Mode == "" {
+		return nil
+	}
+	return out
 }
 
 // PeerList lists the declared peers, sorted by name, endpoints intact.

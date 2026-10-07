@@ -92,6 +92,21 @@ rec {
             };
             description = "Folders shared by the group; names are global across groups.";
           };
+
+          permissions = lib.mkOption {
+            type = lib.types.nullOr permSubmodule;
+            default = null;
+            example = {
+              user = "kyle";
+              mode = "0755";
+            };
+            description = ''
+              Default ownership and mode for this group's folders on every
+              peer; each machine's `permissions` overrides it field by
+              field, and what neither declares is inherited from the
+              directory the mount lives in.
+            '';
+          };
         };
       }
     );
@@ -134,6 +149,47 @@ rec {
     '';
   };
 
+  # One Permissions block, shared by the group default and the per-folder
+  # override, so the two can never drift apart.
+  permSubmodule = lib.types.submodule {
+    options = {
+      user = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "kyle";
+        description = "Owner of the entries the daemon creates: a user name or numeric uid.";
+      };
+      group = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "kyle";
+        description = "Group of the entries the daemon creates: a group name or numeric gid.";
+      };
+      mode = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0755";
+        description = "Octal directory mode for the directories the daemon creates.";
+      };
+    };
+  };
+
+  permissions = lib.mkOption {
+    type = lib.types.attrsOf permSubmodule;
+    default = { };
+    example = {
+      photos.user = "kyle";
+    };
+    description = ''
+      Per-folder ownership and mode for the entries the daemon creates on
+      THIS machine; a set field beats the group's `permissions`, and
+      anything neither declares is inherited from the directory the mount
+      lives in — so by default a folder is permissioned exactly like the
+      directory containing it. Directory modes only: files keep the mode
+      they were synced with.
+    '';
+  };
+
   # The configuration file both binaries read: strict JSON, configVersion 1,
   # unknown keys an error. Sections appear only when the calling scope has
   # the options — a CLI file carries the socket, the daemon file the model.
@@ -149,13 +205,22 @@ rec {
       peers = lib.mapAttrs (_: p: { endpoints = p.endpoints; }) cfg.peers;
     }
     // lib.optionalAttrs (cfg ? groups) {
-      groups = lib.mapAttrs (_: g: {
-        peers = g.peers;
-        folders = lib.mapAttrs (_: f: lib.optionalAttrs (f.mount != null) { mount = f.mount; }) g.folders;
-      }) cfg.groups;
+      groups = lib.mapAttrs (
+        _: g:
+        {
+          peers = g.peers;
+          folders = lib.mapAttrs (_: f: lib.optionalAttrs (f.mount != null) { mount = f.mount; }) g.folders;
+        }
+        // lib.optionalAttrs (g.permissions != null) {
+          permissions = lib.filterAttrs (_: v: v != null) g.permissions;
+        }
+      ) cfg.groups;
     }
     // lib.optionalAttrs (cfg ? mounts) { mounts = cfg.mounts; }
-    // lib.optionalAttrs (cfg ? keepOffline) { keepOffline = cfg.keepOffline; };
+    // lib.optionalAttrs (cfg ? keepOffline) { keepOffline = cfg.keepOffline; }
+    // lib.optionalAttrs (cfg ? permissions && cfg.permissions != { }) {
+      permissions = lib.mapAttrs (_: p: lib.filterAttrs (_: v: v != null) p) cfg.permissions;
+    };
 
   # The config file, validated by the real `storeboard config check` during
   # the build: nixos-rebuild fails with the validator's message, and the file

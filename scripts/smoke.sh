@@ -166,6 +166,16 @@ echo "holder content" >"$work/docs/from-laptop.txt"
 wait_for 10 "holder content visible through the mount" test -f "$work/remoteDocs/from-laptop.txt"
 grep -q "holder content" "$work/remoteDocs/from-laptop.txt"
 
+echo "== mount target inherits its parent's permissions"
+parent_mode=$(stat -c %a "$work")
+target_mode=$(stat -Lc %a "$work/remoteDocs")
+[ "$target_mode" = "$parent_mode" ] || {
+	echo "FAIL: mount mode $target_mode, parent $parent_mode" >&2
+	exit 1
+}
+"$CLI" --config "$config2" status --json |
+	jq -e --arg m "$parent_mode" '([.sync[] | select(.folder == "documents")][0].permissions.mode | ltrimstr("0")) == $m' >/dev/null
+
 echo "== streamed folder detaches when the holder is gone"
 kill "$pid"
 wait "$pid" 2>/dev/null || true

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -47,8 +46,8 @@ type FolderState struct {
 	conflicts int
 	lastScan  time.Time
 
-	ownerUID, ownerGID int
-	scanMu             sync.Mutex
+	perm   perms
+	scanMu sync.Mutex
 }
 
 // Engine ties folders, journals and the peer wire together.
@@ -111,8 +110,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			mount:    f.Mount,
 			streamed: !f.KeepOffline,
 			db:       db,
-			ownerUID: -1,
-			ownerGID: -1,
+			perm:     noPerms(),
 		}
 		e.folders = append(e.folders, fs)
 		e.byName[fs.name] = fs
@@ -122,41 +120,33 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 
 // Run prepares the mounts and drives scanning until ctx ends.
 func (e *Engine) Run(ctx context.Context) {
+	var wg sync.WaitGroup
 	for _, fs := range e.folders {
 		e.prepare(fs)
-		go e.scanLoop(ctx, fs)
+		wg.Add(1)
+		go func(fs *FolderState) {
+			defer wg.Done()
+			e.scanLoop(ctx, fs)
+		}(fs)
 	}
 	<-ctx.Done()
+	// Scanners must be down before the caller tears anything down: an
+	// in-flight scan that writes a journal entry or a scratch file after
+	// Run returned races whatever comes next (in tests, removing the data
+	// directory; in production, a restarted daemon claiming the same paths).
+	wg.Wait()
 }
 
 func (e *Engine) prepare(fs *FolderState) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
+	fs.perm = e.resolvePerms(fs)
 	if !fs.streamed {
-		if err := os.MkdirAll(fs.mount, 0o755); err != nil {
+		if err := os.MkdirAll(fs.mount, fs.perm.dirMode); err != nil {
 			e.logger.Error("create folder root", "folder", fs.name, "error", err)
 		}
 	}
 	e.ensureMounts(fs)
-	fs.ownerUID, fs.ownerGID = e.folderOwner(fs)
-}
-
-// folderOwner is the uid/gid created entries are given: the owner of the
-// user-facing root (the mount's parent for streamed folders, the folder
-// itself for replicas).
-func (e *Engine) folderOwner(fs *FolderState) (int, int) {
-	probe := fs.mount
-	if fs.streamed {
-		probe = filepath.Dir(fs.mount)
-	}
-	info, err := os.Stat(probe)
-	if err != nil {
-		return -1, -1
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return int(st.Uid), int(st.Gid)
-	}
-	return -1, -1
 }
 
 func (e *Engine) scanLoop(ctx context.Context, fs *FolderState) {
@@ -174,6 +164,19 @@ func (e *Engine) scanLoop(ctx context.Context, fs *FolderState) {
 }
 
 func (e *Engine) scanOnce(fs *FolderState) {
+	// Re-resolve every pass: an inherited permission follows the directory
+	// it came from, so a chown or chmod of the mount's parent is honoured on
+	// the next scan rather than at the next restart.
+	fs.scanMu.Lock()
+	fs.perm = e.resolvePerms(fs)
+	if fs.streamed {
+		// The mount target is the one directory the daemon owns on behalf
+		// of the folder: keep it matching its parent ("permissioned every
+		// time"). Replicas are the user's directories and are never chmod'ed.
+		e.applyDir(fs, fs.root)
+	}
+	fs.scanMu.Unlock()
+
 	changed, err := e.scan(fs)
 	if err != nil {
 		e.logger.Warn("scan", "folder", fs.name, "error", err)
@@ -302,13 +305,17 @@ func (e *Engine) participantConnected(fs *FolderState) bool {
 func (e *Engine) Snapshot() []api.FolderSync {
 	out := make([]api.FolderSync, 0, len(e.folders))
 	for _, fs := range e.folders {
+		fs.scanMu.Lock()
+		p, root, state := fs.perm, fs.root, fs.state
+		fs.scanMu.Unlock()
 		out = append(out, api.FolderSync{
-			Folder:    fs.name,
-			Root:      fs.root,
-			State:     fs.state,
-			Entries:   fs.db.Count(),
-			Conflicts: fs.conflicts,
-			LastScan:  fs.lastScan,
+			Folder:      fs.name,
+			Root:        root,
+			State:       state,
+			Entries:     fs.db.Count(),
+			Conflicts:   fs.conflicts,
+			LastScan:    fs.lastScan,
+			Permissions: p.apiPerms(),
 		})
 	}
 	return out

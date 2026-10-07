@@ -5,12 +5,16 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 )
 
@@ -50,7 +54,7 @@ func startNode(t *testing.T, n *node) {
 	n.cancel = cancel
 	var logger *slog.Logger
 	if os.Getenv("STOREBOARD_TEST_LOG") != "" {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	n.mgr = transport.New(n.cfg, logger)
 	n.mgr.SetHandler(n.eng)
@@ -94,7 +98,7 @@ func mkNode(t *testing.T, name, other, epSelf, epOther, mount string, docsKeep b
 	}
 	var logger *slog.Logger
 	if os.Getenv("STOREBOARD_TEST_LOG") != "" {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	eng, err := New(cfg, logger)
 	if err != nil {
@@ -389,5 +393,208 @@ func TestValidRelRejectsEscapes(t *testing.T) {
 	}
 	if !strings.Contains(conflictPath("x/y.txt", "abcdef123456"), "abcdef12") {
 		t.Error("conflictPath should carry the content prefix")
+	}
+}
+
+// currentIDs is the running user's ids and names: tests chown to a
+// resolvable target without needing root.
+func currentIDs(t *testing.T) (uname, gname string) {
+	t.Helper()
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("no passwd entry for the test user: %v", err)
+	}
+	g, err := user.LookupGroupId(strconv.Itoa(os.Getgid()))
+	if err != nil {
+		t.Fatalf("no group name for gid %d: %v", os.Getgid(), err)
+	}
+	return u.Username, g.Name
+}
+
+// Nothing declared: the folder is permissioned exactly like the directory
+// the mount lives in, and every component of the storage chain is walkable.
+func TestMountInheritsParentPermissions(t *testing.T) {
+	mountParent := t.TempDir()
+	if err := os.Chmod(mountParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(mountParent, "remote-docs")
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	fs.scanMu.Lock()
+	p := fs.perm
+	fs.scanMu.Unlock()
+	if p.uid != os.Getuid() || p.gid != os.Getgid() {
+		t.Fatalf("owner = %d:%d, want the parent's %d:%d", p.uid, p.gid, os.Getuid(), os.Getgid())
+	}
+	if p.dirMode != 0o750 {
+		t.Fatalf("dirMode = %04o, want the parent's 0750", p.dirMode)
+	}
+
+	for _, d := range []string{n.eng.viewsDir(fs), n.eng.detachedDir(fs)} {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o750 {
+			t.Errorf("%s mode = %04o, want 0750", d, fi.Mode().Perm())
+		}
+	}
+	for _, d := range []string{
+		n.cfg.DataDir,
+		filepath.Join(n.cfg.DataDir, "views"),
+		filepath.Join(n.cfg.DataDir, "detached"),
+	} {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0o011 != 0o011 {
+			t.Errorf("%s = %04o: the chain to the mount target must be traversable", d, fi.Mode().Perm())
+		}
+	}
+}
+
+// Declared permissions merge field by field: the machine-local folder entry
+// beats the group's default, and whatever neither declares is inherited. An
+// unresolvable name is a warning, not a failure — the inherited value stays.
+func TestPermissionsOverrides(t *testing.T) {
+	uname, gname := currentIDs(t)
+
+	mountParent := t.TempDir()
+	if err := os.Chmod(mountParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(mountParent, "remote-docs")
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	g := n.cfg.Groups["g"]
+	g.Permissions = &config.Permissions{Group: gname, Mode: "0770"}
+	n.cfg.Groups["g"] = g
+	n.cfg.Permissions = map[string]config.Permissions{"docs": {User: uname}}
+	fs := n.eng.folders[0]
+
+	n.eng.prepare(fs)
+	fs.scanMu.Lock()
+	p := fs.perm
+	fs.scanMu.Unlock()
+	if p.uid != os.Getuid() || p.gid != os.Getgid() || p.dirMode != 0o770 {
+		t.Fatalf("perm = %d:%d %04o, want %d:%d 0770 (local user + group defaults)", p.uid, p.gid, p.dirMode, os.Getuid(), os.Getgid())
+	}
+
+	// The folder entry's mode wins over the group's.
+	n.cfg.Permissions["docs"] = config.Permissions{User: uname, Mode: "0700"}
+	n.eng.prepare(fs)
+	fs.scanMu.Lock()
+	p = fs.perm
+	fs.scanMu.Unlock()
+	if p.dirMode != 0o700 {
+		t.Fatalf("dirMode = %04o, want the folder entry's 0700", p.dirMode)
+	}
+
+	// An unknown user falls back to the inherited owner.
+	n.cfg.Permissions["docs"] = config.Permissions{User: "definitely-not-a-user-xyz"}
+	n.eng.prepare(fs)
+	fs.scanMu.Lock()
+	p = fs.perm
+	fs.scanMu.Unlock()
+	if p.uid != os.Getuid() {
+		t.Fatalf("uid = %d, want the parent's %d when the name does not resolve", p.uid, os.Getuid())
+	}
+}
+
+// Permissions are re-applied "every time": a manual chmod of the target is
+// corrected on the next scan and on the next mount transition.
+func TestMountPermissionsReapplied(t *testing.T) {
+	mountParent := t.TempDir()
+	if err := os.Chmod(mountParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(mountParent, "remote-docs")
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	view, detached := n.eng.viewsDir(fs), n.eng.detachedDir(fs)
+	for _, d := range []string{view, detached} {
+		if err := os.Chmod(d, 0o777); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n.eng.scanOnce(fs) // root (the detached dir) is restored by the scan
+	if fi, err := os.Stat(detached); err != nil || fi.Mode().Perm() != 0o750 {
+		t.Fatalf("detached after scan = %v %v, want 0750", fi.Mode().Perm(), err)
+	}
+
+	n.eng.ensureMounts(fs) // a transition re-applies to both targets
+	for _, d := range []string{view, detached} {
+		fi, err := os.Stat(d)
+		if err != nil || fi.Mode().Perm() != 0o750 {
+			t.Fatalf("%s after transition = %v %v, want 0750", d, fi.Mode().Perm(), err)
+		}
+	}
+}
+
+// Materialised files take the folder's owner and their own synced mode;
+// every directory created on the way takes the folder's directory mode.
+func TestMaterialisedEntriesTakeFolderPermissions(t *testing.T) {
+	mountParent := t.TempDir()
+	if err := os.Chmod(mountParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(mountParent, "remote-docs")
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	content := []byte("hello from the mesh")
+	f, err := n.eng.store.Temp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.SumFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.eng.store.Adopt(f.Name(), sum); err != nil {
+		t.Fatal(err)
+	}
+
+	ent := &Entry{Path: "sub/dir/a.txt", Blob: sum, Size: int64(len(content)), MTime: time.Now().UnixNano(), Mode: 0o600}
+	if err := n.eng.applyEntry(fs, ent); err != nil {
+		t.Fatal(err)
+	}
+
+	file := filepath.Join(fs.root, "sub", "dir", "a.txt")
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("file mode = %04o, want the entry's 0600", fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() || int(st.Gid) != os.Getgid() {
+		t.Errorf("file owner = %v, want the resolved %d:%d", fi.Sys(), os.Getuid(), os.Getgid())
+	}
+	for _, d := range []string{filepath.Join(fs.root, "sub"), filepath.Join(fs.root, "sub", "dir")} {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o750 {
+			t.Errorf("%s mode = %04o, want the folder's 0750", d, fi.Mode().Perm())
+		}
 	}
 }

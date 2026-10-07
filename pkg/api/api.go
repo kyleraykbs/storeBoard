@@ -54,18 +54,31 @@ type Connection struct {
 	Error    string    `json:"error,omitempty"`
 }
 
+// Permissions is a folder's resolved ownership and mode: what the daemon
+// gives the directories and files it creates for the folder. The values are
+// declared per folder and per group, field by field, and whatever is not
+// declared is inherited from the directory the mount lives in — so they are
+// only known to the daemon, never fully to the config. User and group are
+// names where they resolve, numeric ids where they do not; Mode is octal.
+type Permissions struct {
+	User  string `json:"user"`
+	Group string `json:"group"`
+	Mode  string `json:"mode"`
+}
+
 // FolderSync is one folder's engine state on this machine. State is one of:
 // replica (a full local copy that syncs), attached (a streamed folder
 // mounted live), detached (a streamed folder replaced by an empty dir while
 // no holder is reachable), busy (something else owns the mount path, e.g. a
 // samba mount, and the engine leaves it alone).
 type FolderSync struct {
-	Folder    string    `json:"folder"`
-	Root      string    `json:"root"`
-	State     string    `json:"state"`
-	Entries   int       `json:"entries"`
-	Conflicts int       `json:"conflicts"`
-	LastScan  time.Time `json:"lastScan"`
+	Folder      string      `json:"folder"`
+	Root        string      `json:"root"`
+	State       string      `json:"state"`
+	Entries     int         `json:"entries"`
+	Conflicts   int         `json:"conflicts"`
+	LastScan    time.Time   `json:"lastScan"`
+	Permissions Permissions `json:"permissions"`
 }
 
 // Status is the daemon's status document, served at GET /v1/status.

@@ -39,7 +39,14 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			e.logger.Error("view dir", "folder", fs.name, "error", err)
 		}
-		e.chownPath(fs, d)
+		// The mount symlink points into the storage directory: every
+		// component on the way must be walkable, or the permissions on the
+		// target are moot.
+		ensureTraversable(e.dataDir, d)
+		// The target itself takes the folder's resolved permissions — by
+		// default the same as the directory the mount lives in. Applied on
+		// every transition, not just at creation.
+		e.applyDir(fs, d)
 	}
 
 	switch target, err := os.Readlink(fs.mount); {
@@ -120,10 +127,12 @@ func (e *Engine) attach(fs *FolderState) {
 	if !fs.streamed || fs.state == stateAttached || fs.state == stateBusy {
 		return
 	}
+	fs.perm = e.resolvePerms(fs)
 	view, detached := e.viewsDir(fs), e.detachedDir(fs)
 	if err := e.mergeDetached(fs, detached, view); err != nil {
 		e.logger.Error("remerge", "folder", fs.name, "error", err)
 	}
+	e.applyDir(fs, view)
 	if err := symlinkSwap(fs.mount, view); err != nil {
 		e.logger.Error("attach", "folder", fs.name, "error", err)
 		return
@@ -143,12 +152,14 @@ func (e *Engine) detach(fs *FolderState) {
 	if !fs.streamed || fs.state != stateAttached {
 		return
 	}
+	fs.perm = e.resolvePerms(fs)
 	detached := e.detachedDir(fs)
 	if err := os.MkdirAll(detached, 0o700); err != nil {
 		e.logger.Error("detach", "folder", fs.name, "error", err)
 		return
 	}
-	e.chownPath(fs, detached)
+	ensureTraversable(e.dataDir, detached)
+	e.applyDir(fs, detached)
 	if err := symlinkSwap(fs.mount, detached); err != nil {
 		e.logger.Error("detach", "folder", fs.name, "error", err)
 		return
@@ -176,7 +187,7 @@ func (e *Engine) mergeDetached(fs *FolderState, detached, view string) error {
 		st, serr := os.Stat(target)
 		switch {
 		case serr != nil && os.IsNotExist(serr):
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			if err := e.ensureDir(fs, filepath.Dir(target)); err != nil {
 				return err
 			}
 			if err := os.Rename(path, target); err != nil {
@@ -193,12 +204,13 @@ func (e *Engine) mergeDetached(fs *FolderState, detached, view string) error {
 				return nil
 			}
 			dst := conflictPath(target, sum)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 				return err
 			}
 			if err := os.Rename(path, dst); err != nil {
 				return nil
 			}
+			e.chownPath(fs, dst)
 		}
 		e.chownPath(fs, target)
 		moved++
@@ -296,19 +308,19 @@ func unescapeMount(s string) string {
 	).Replace(s)
 }
 
-// chownPath best-efforts ownership of a created entry to the folder's owner
-// (the user whose home holds the mount), so the human can actually use it.
+// chownPath best-efforts ownership of a created entry to the folder's
+// resolved owner, so the human can actually use it.
 func (e *Engine) chownPath(fs *FolderState, path string) {
-	if fs.ownerUID < 0 {
+	if fs.perm.uid < 0 {
 		return
 	}
-	_ = os.Chown(path, fs.ownerUID, fs.ownerGID)
+	_ = os.Chown(path, fs.perm.uid, fs.perm.gid)
 }
 
 // chownLink is chownPath for a symlink itself.
 func (e *Engine) chownLink(fs *FolderState, path string) {
-	if fs.ownerUID < 0 {
+	if fs.perm.uid < 0 {
 		return
 	}
-	_ = os.Lchown(path, fs.ownerUID, fs.ownerGID)
+	_ = os.Lchown(path, fs.perm.uid, fs.perm.gid)
 }

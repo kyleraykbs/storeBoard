@@ -391,3 +391,87 @@ func TestResolvePathUserFileBeatsEnvironment(t *testing.T) {
 		t.Errorf("ResolvePath = %q, want the user file %q to beat the environment", got, userFile)
 	}
 }
+
+func TestPermissionsPrecedenceAndValidation(t *testing.T) {
+	path := writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {
+    "family": {
+      "peers": ["laptop"],
+      "folders": {"photos": {}, "documents": {}},
+      "permissions": {"group": "users", "mode": "2770"}
+    }
+  },
+  "permissions": {"photos": {"user": "kyle", "mode": "0755"}}
+}`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("mode 2770: setgid is not a directory mode this config accepts")
+	}
+
+	path = writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {
+    "family": {
+      "peers": ["laptop"],
+      "folders": {"photos": {}, "documents": {}},
+      "permissions": {"group": "users", "mode": "0770"}
+    }
+  },
+  "permissions": {"photos": {"user": "kyle"}}
+}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.PermissionsFor("photos", "family")
+	if got == nil || got.User != "kyle" || got.Group != "users" || got.Mode != "0770" {
+		t.Fatalf("photos permissions = %+v, want kyle/users/0770 (local field over group default)", got)
+	}
+	if got := cfg.PermissionsFor("documents", "family"); got == nil || got.User != "" || got.Mode != "0770" {
+		t.Fatalf("documents permissions = %+v, want the group's default alone", got)
+	}
+
+	cases := []struct {
+		name, body, want string
+	}{
+		{"unknown folder", `"nope": {"user": "kyle"}`, "unknown folder"},
+		{"bad mode", `"photos": {"mode": "99"}`, "mode"},
+		{"colon list", `"photos": {"user": "kyle:root"}`, "colon list"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"photos": {}}}},
+  "permissions": {`+c.body+`}
+}`)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want it to mention %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestParseMode(t *testing.T) {
+	for in, want := range map[string]os.FileMode{"755": 0o755, "0755": 0o755, "0700": 0o700, "777": 0o777} {
+		got, err := ParseMode(in)
+		if err != nil || got != want {
+			t.Errorf("ParseMode(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "0o755", "8", "1755", "7777", "-755"} {
+		if _, err := ParseMode(in); err == nil {
+			t.Errorf("ParseMode(%q): want an error", in)
+		}
+	}
+}

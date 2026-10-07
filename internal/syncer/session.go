@@ -176,9 +176,11 @@ func (e *Engine) saveLocalConflict(fs *FolderState, loc *Entry) *Entry {
 		return nil
 	}
 	if !e.store.Has(sum) {
-		if err := e.adoptFile(src, sum); err != nil {
+		stored, aerr := e.adoptFile(src, sum)
+		if aerr != nil {
 			return nil
 		}
+		sum = stored
 	}
 	name := conflictPath(loc.Path, sum)
 	dst := filepath.Join(fs.root, name)
@@ -387,7 +389,9 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 			sum, herr := store.SumFile(dst)
 			if herr == nil && sum != ent.Blob {
 				if !e.store.Has(sum) {
-					_ = e.adoptFile(dst, sum)
+					if stored, aerr := e.adoptFile(dst, sum); aerr == nil {
+						sum = stored
+					}
 				}
 				name := conflictPath(ent.Path, sum)
 				parked := filepath.Join(fs.root, name)
@@ -426,7 +430,7 @@ func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32) erro
 	}
 	defer blob.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 		return err
 	}
 	// Unique scratch name: two applies for the same path (a repeated want,

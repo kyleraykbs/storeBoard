@@ -36,6 +36,14 @@ Strict JSON; unknown keys are an error. The model, in full in
   default `mount`; folder names are unique across all groups.
 - `mounts` — this machine's local override of a group folder's mount.
   Effective mount: local override → group default → `<dataDir>/mounts/<name>`.
+- `permissions` — ownership and directory mode for what the daemon creates,
+  declared per folder (this machine) and per group (the default). Resolution
+  is field by field: folder entry → group default → **the directory the
+  mount lives in** (its owner, its group, its mode), re-read on every mount
+  transition and scan. So with nothing declared, a folder is permissioned
+  exactly like the directory containing it; `{"user": "kyle"}` on a folder
+  whose parent is root-owned is the common override. Modes are directories
+  only — files keep the mode they were synced with.
 - everything the daemon stores (store, journal, index) lives under the one
   `dataDir`.
 
@@ -60,6 +68,11 @@ bad option value fails nixos-rebuild instead of failing at startup.
   is merged back into the view on reconnect and synced onwards. A path
   owned by something else (a samba mount, a real directory) is left alone
   and reported as `busy`.
+- Every path the daemon creates — the view, the detached dir, the
+  directories under them — is chowned and chmod'ed to the folder's resolved
+  permissions on every transition, and the storage chain to the mount target
+  is made traversable, so the symlink is usable by the folder's owner.
+  Resolved values show up in `status` (`sync[].permissions`).
 - Concurrent edits to one file resolve deterministically on every replica
   (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
   conflicts are visible in `status --json` (`.sync[]`).

@@ -117,6 +117,7 @@ in
       groups
       mounts
       keepOffline
+      permissions
       ;
   };
 

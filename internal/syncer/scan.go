@@ -1,6 +1,9 @@
 package syncer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,19 +66,34 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 		if herr != nil {
 			return nil
 		}
+		// The dirent snapshot WalkDir handed us can be stale — a file
+		// truncated and rewritten while the walk passed it reads as size 0
+		// with a fresh mtime — so size, mtime and mode are re-read AFTER
+		// the hash, and the hash itself comes from a copy of those same
+		// bytes. An entry whose size contradicts its blob poisons every
+		// later apply (each one parks the "unsynced local change" as a
+		// false conflict).
+		if fi, serr := os.Stat(path); serr == nil {
+			info = fi
+		}
+
 		if cur != nil && !cur.Deleted && cur.Blob == sum {
-			// Content identical, only the timestamp moved: fold it in
-			// without a version bump so a touch does not churn the mesh.
+			// Content identical, only the timestamp moved (or a stale size
+			// is being repaired): fold it in without a version bump so a
+			// touch does not churn the mesh.
 			upd := cur.clone()
+			upd.Size = info.Size()
 			upd.MTime = info.ModTime().UnixNano()
 			upd.Mode = uint32(info.Mode().Perm())
 			return fs.db.Put(upd)
 		}
 
 		if !e.store.Has(sum) {
-			if err := e.adoptFile(path, sum); err != nil {
-				return err
+			stored, aerr := e.adoptFile(path, sum)
+			if aerr != nil {
+				return aerr
 			}
+			sum = stored
 		}
 		// A local change builds on what this replica already knew: the new
 		// version vector inherits the old one and bumps our own counter.
@@ -131,30 +149,42 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 	return changed, nil
 }
 
-// adoptFile copies a file into the content store under its known sum.
-func (e *Engine) adoptFile(path, sum string) error {
+// adoptFile copies a file into the content store, hashing WHILE it copies,
+// and returns the hash of the bytes actually stored. Hashing first and
+// copying after would let a mid-write file land in the store under a sum
+// that does not describe its content — a poisoned blob every peer then
+// fails to verify.
+func (e *Engine) adoptFile(path, sum string) (string, error) {
 	src, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer src.Close()
 
 	tmp, err := e.store.Temp()
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer os.Remove(tmp.Name())
 
-	if _, err := tmp.ReadFrom(src); err != nil {
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, h), src); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", err
 	}
-	return e.store.Adopt(tmp.Name(), sum)
+	stored := hex.EncodeToString(h.Sum(nil))
+	if err := e.store.Adopt(tmp.Name(), stored); err != nil {
+		return "", err
+	}
+	if stored != sum {
+		e.logger.Debug("file changed while being scanned", "path", path, "hashed", sum, "stored", stored)
+	}
+	return stored, nil
 }

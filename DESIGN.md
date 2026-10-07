@@ -64,6 +64,16 @@ one, it changes here first, deliberately, with a decision log entry.
     the wire too). Unknown frames are tolerated and noted. The wire carries
     status-grade data only (names, versions, keepalives); TLS with device
     certificates, built on the threat model, precedes anything sensitive.
+15. Mounts are usable by the human, not by the daemon. Every directory the
+    daemon creates for a folder — the view, the detached dir, the tree
+    under them — is owned and permissioned to the folder's resolved
+    permissions: declared per folder on this machine, else the group's
+    default, else the directory the mount lives in (its owner, group and
+    mode, re-read on every transition and scan). Nothing declared therefore
+    means inherited, and an inherited permission tracks its parent. The
+    storage chain down to the mount target is traversable so the symlink
+    resolves for the owner, and a path that belongs to something else is
+    never touched — reported `busy` instead.
 
 ## Sync engine (2026-10-07)
 
@@ -74,6 +84,12 @@ one, it changes here first, deliberately, with a decision log entry.
   version vector.
 - A scan (default every 15 s, `STOREBOARD_SCAN_INTERVAL` overrides) hashes
   only files whose size or mtime moved; vanished files become tombstones.
+  Size, mtime and mode are re-read after the hash, because the directory
+  snapshot WalkDir saw can be stale (a file truncated and rewritten mid-walk
+  reads as size 0) — and an entry whose size contradicts its blob makes
+  every later apply park a false conflict. The blob copied into the store is
+  hashed while it is copied, so a store entry can never be described by a
+  sum its bytes do not have.
 - Peers exchange index deltas; a side that lacks or is behind a version
   asks for the blob (`want` → `blob` chunks → `blobEnd`); a side that is
   ahead pushes its index entry. Concurrent edits resolve deterministically
@@ -103,5 +119,11 @@ one, it changes here first, deliberately, with a decision log entry.
   on-demand fetch are later work.
 - 14: hello/version/NDJSON framing in the transport; `index`/`want`/`blob`/
   `blobEnd` extend it additively.
+- 15: implemented (2026-10-07) — per-folder and per-group `permissions`,
+  parent-directory inheritance, re-application on every transition and scan,
+  traversable storage chain. The scanner's size/mtime re-read after hashing
+  and hash-while-copying store writes came out of the same pass: a stale
+  dirent snapshot used to poison an entry's size and turn every later apply
+  into a false conflict.
 - 4, 8, 9: forward-looking — policies/hooks and min/max protocol
   negotiation do not exist yet.

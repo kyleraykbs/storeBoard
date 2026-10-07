@@ -15,9 +15,13 @@
         "photos": { "mount": "/home/alice/Pictures" },
         "documents": {},
         "archive": {}
-      }
+      },
+      "permissions": { "group": "users" }
     }
   },
   "mounts": { "documents": "/mnt/docs", "archive": "/mnt/archive" },
-  "keepOffline": { "archive": false }
+  "keepOffline": { "archive": false },
+  "permissions": {
+    "documents": { "user": "alice", "mode": "0755" }
+  }
 }

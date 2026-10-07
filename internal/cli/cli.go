@@ -303,6 +303,9 @@ func renderStatus(w io.Writer, st *api.Status) {
 		if s.Conflicts > 0 {
 			detail += fmt.Sprintf(", %d conflicts", s.Conflicts)
 		}
+		if s.Permissions.Mode != "" {
+			detail += fmt.Sprintf(", %s:%s %s", s.Permissions.User, s.Permissions.Group, s.Permissions.Mode)
+		}
 		fmt.Fprintf(w, "  %s\n    %s\n", s.Folder, detail)
 	}
 }
