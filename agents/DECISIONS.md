@@ -120,3 +120,17 @@
   into a supported migration that keeps every byte.
 - **Reversible:** yes (a new verb and an additive status field; no config or
   wire change).
+
+## 2026-10-07 — Identical bytes are never a conflict, in the merge too
+
+- **Decision:** when the merge finds the same path on both sides, it compares
+  content before calling it a conflict. Byte-identical files collapse into
+  one (the newer timestamp survives, the same rule the mesh uses to pick a
+  winner), and only genuinely different bytes produce a `.conflict-*` copy.
+- **Why:** the merge compared size and mtime first and stopped there, so
+  identical screenshots whose mtimes had moved (copied files, materialised
+  files, clocks) each produced a conflict copy — observed live as
+  `Screenshot from ….png.conflict-<blob8>` next to the original it matched
+  byte for byte. Every other park site in the engine (incoming blob, index
+  merge) was already content-based; this one was the outlier.
+- **Reversible:** yes — strictly fewer copies, nothing else changes.

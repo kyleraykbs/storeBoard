@@ -852,3 +852,60 @@ func TestTakeoverOfflineThenMergesOnReconnect(t *testing.T) {
 		t.Fatalf("holder mine.txt = %q", got)
 	}
 }
+
+// The same bytes arriving from both sides are one file: a merge must not
+// manufacture a conflict copy just because the timestamps moved. This is the
+// screenshot case — identical files, mtimes from different machines.
+func TestMergeDetachedIdenticalContentIsNotAConflict(t *testing.T) {
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	view, detached := n.eng.viewsDir(fs), n.eng.detachedDir(fs)
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now()
+	const shot = "PNG-ish bytes, byte identical"
+	writeFile(t, filepath.Join(view, "shot.png"), shot, older)
+	writeFile(t, filepath.Join(detached, "shot.png"), shot, newer)
+
+	n.eng.attach(fs)
+
+	names, _ := filepath.Glob(filepath.Join(view, "shot.png*"))
+	if len(names) != 1 {
+		t.Fatalf("view holds %d entries for shot.png, want exactly 1 (no conflict copy): %v", len(names), names)
+	}
+	if got := readFile(t, filepath.Join(view, "shot.png")); got != shot {
+		t.Fatalf("content = %q, want the identical bytes kept", got)
+	}
+	fi, err := os.Stat(filepath.Join(view, "shot.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().After(older) {
+		t.Errorf("mtime = %v, want the newer timestamp %v to survive", fi.ModTime(), newer)
+	}
+	if _, err := os.Stat(detached); !os.IsNotExist(err) {
+		t.Errorf("detached dir still there: %v", err)
+	}
+}
+
+// The other direction: genuinely different bytes at the same path still keep
+// both versions — the fix must not turn a real conflict into a silent loss.
+func TestMergeDetachedDifferentContentStillConflicts(t *testing.T) {
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	view, detached := n.eng.viewsDir(fs), n.eng.detachedDir(fs)
+	writeFile(t, filepath.Join(view, "note.txt"), "the mesh's version", time.Now().Add(-2*time.Hour))
+	writeFile(t, filepath.Join(detached, "note.txt"), "the offline version", time.Now())
+
+	n.eng.attach(fs)
+
+	names, _ := filepath.Glob(filepath.Join(view, "note.txt*"))
+	if len(names) != 2 {
+		t.Fatalf("view holds %d entries for note.txt, want the winner and a conflict copy: %v", len(names), names)
+	}
+}

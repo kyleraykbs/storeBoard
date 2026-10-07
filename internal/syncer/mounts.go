@@ -214,6 +214,21 @@ func (e *Engine) mergeDetached(fs *FolderState, detached, view string) error {
 			if herr != nil {
 				return nil
 			}
+			// Byte-identical is not a conflict, whatever the timestamps say:
+			// the same file arriving from both sides is one file. Keep the
+			// newer timestamp and drop the duplicate — the same rule the
+			// mesh uses to pick a conflict winner, applied before inventing
+			// one.
+			if existing, eerr := store.SumFile(target); eerr == nil && existing == sum {
+				if ierr == nil && srcInfo.ModTime().After(st.ModTime()) {
+					when := srcInfo.ModTime()
+					if cerr := os.Chtimes(target, when, when); cerr != nil {
+						e.logger.Warn("keep newer mtime", "folder", fs.name, "path", target, "error", cerr)
+					}
+				}
+				os.Remove(path)
+				return nil
+			}
 			dst := conflictPath(target, sum)
 			if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 				return err
