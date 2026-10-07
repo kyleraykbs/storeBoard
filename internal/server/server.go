@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -96,8 +98,29 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		engine:    engine,
 	}
 	s.transport.SetHandler(engine)
-	s.http = &http.Server{Handler: s.handler()}
+	s.http = &http.Server{
+		Handler: s.handler(),
+		// Every request carries the uid of the process on the other end of
+		// the socket: the acting verb (takeover) authorizes per caller, so a
+		// world-writable socket cannot be used to move somebody else's files
+		// (DESIGN invariant 10).
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if uid, ok := peerUID(c); ok {
+				return context.WithValue(ctx, peerUIDKey{}, uid)
+			}
+			return ctx
+		},
+	}
 	return s, nil
+}
+
+// peerUIDKey carries the socket peer's uid through the request context.
+type peerUIDKey struct{}
+
+// requestUID is the uid that made a request, and whether it could be read.
+func requestUID(r *http.Request) (int, bool) {
+	uid, ok := r.Context().Value(peerUIDKey{}).(int)
+	return uid, ok
 }
 
 // handler is the whole API surface. Both errors answer as JSON, so a
@@ -105,10 +128,43 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
+	mux.HandleFunc("/v1/folders/", s.handleFolder)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
 	})
 	return mux
+}
+
+// handleFolder serves the folder verbs: POST /v1/folders/<name>/takeover.
+func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/folders/")
+	name, verb, ok := strings.Cut(rest, "/")
+	if !ok || name == "" || strings.Contains(verb, "/") {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint; want /v1/folders/<name>/takeover"})
+		return
+	}
+	if verb != "takeover" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such folder verb %q", verb)})
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	uid, ok := requestUID(r)
+	if !ok {
+		// No peer credentials (a transport that cannot say): refuse rather
+		// than assume root.
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
+		return
+	}
+	res, err := s.engine.Takeover(name, uid)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -182,4 +238,34 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
+}
+
+// peerUID reads the uid of the process on the other end of a unix socket
+// connection (Linux SO_PEERCRED). It reports false when the connection
+// cannot say — the caller then refuses the request rather than guessing.
+func peerUID(c net.Conn) (int, bool) {
+	sc, ok := c.(syscall.Conn)
+	if !ok {
+		return -1, false
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return -1, false
+	}
+	uid := -1
+	var readErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, cerr := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		if cerr != nil {
+			readErr = cerr
+			return
+		}
+		uid = int(cred.Uid)
+	}); err != nil {
+		return -1, false
+	}
+	if readErr != nil || uid < 0 {
+		return -1, false
+	}
+	return uid, true
 }

@@ -249,3 +249,109 @@ func TestRunServesUntilCancelledAndCleansUp(t *testing.T) {
 		t.Fatalf("socket file still present after close")
 	}
 }
+
+// The takeover verb acts on the user's files, so it is authorized per
+// caller: over the real unix socket the daemon knows who is asking, and the
+// folder's owner (here: the test process) is allowed through.
+func TestTakeoverOverUnixSocket(t *testing.T) {
+	cfg := testConfig(t)
+	busy := filepath.Join(t.TempDir(), "remote-docs")
+	if err := os.MkdirAll(busy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(busy, "mine.txt"), []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := cfg.Groups["family"]
+	g.Folders["docs"] = config.GroupFolder{}
+	cfg.Groups["family"] = g
+	cfg.Mounts = map[string]string{"docs": busy}
+	cfg.KeepOffline = map[string]bool{"docs": false}
+
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", cfg.Socket)
+			},
+		},
+	}
+
+	// Wait for the engine to prepare the folders (it reports busy once it has).
+	waitBusy := func() bool {
+		resp, err := client.Get("http://storeboard/v1/status")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		var st api.Status
+		if json.NewDecoder(resp.Body).Decode(&st) != nil {
+			return false
+		}
+		for _, f := range st.Sync {
+			if f.Folder == "docs" {
+				return f.State == "busy" && f.Busy == api.BusyContent
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !waitBusy() {
+		if time.Now().After(deadline) {
+			t.Fatal("folder never reported busy")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	resp, err := client.Post("http://storeboard/v1/folders/docs/takeover", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST takeover = %s", resp.Status)
+	}
+	var res api.TakeoverResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Moved != 1 || res.State != "detached" {
+		t.Fatalf("takeover = %+v, want one entry moved and a detached mount", res)
+	}
+	if fi, err := os.Lstat(busy); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("mount path is not a symlink after takeover: %v %v", fi, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(busy, "mine.txt")); err != nil || string(b) != "local" {
+		t.Fatalf("content not readable through the offline mount: %q %v", b, err)
+	}
+}
+
+// Without peer credentials the daemon refuses the acting verb outright: it
+// cannot tell root from a stranger, so it does not guess.
+func TestTakeoverNeedsPeerCreds(t *testing.T) {
+	cfg := testConfig(t)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/folders/photos/takeover", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("takeover without credentials = %s, want 403", resp.Status)
+	}
+}

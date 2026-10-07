@@ -76,6 +76,16 @@ bad option value fails nixos-rebuild instead of failing at startup.
 - Concurrent edits to one file resolve deterministically on every replica
   (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
   conflicts are visible in `status --json` (`.sync[]`).
+- A streamed folder whose path belongs to something else is reported
+  `busy` with the reason (`sync[].busy`): content of its own, a foreign
+  symlink, a live mount, or a file in the way. `storeboard folder takeover
+  <name>` resolves the first case: the content moves into the folder's
+  offline mount, the path becomes the mount, and the ordinary merge hands
+  the files to the mesh — immediately when a holder answers, otherwise on
+  the next reconnect. Nothing is replaced: a name that collides lands under
+  the same deterministic conflict name the merge uses. Root or the folder's
+  owner may run it; the daemon reads that from the socket's peer
+  credentials, so the world-writable socket is not a way in.
 - Scans run every 15 s; `STOREBOARD_SCAN_INTERVAL` (a duration, e.g.
   `200ms`) overrides that for tests and tight loops.
 

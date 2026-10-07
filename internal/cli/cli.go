@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -28,6 +29,9 @@ const usage = `usage: storeboard [--config FILE] <command> [arguments]
 
 Commands:
   config check    validate the configuration file
+  folder takeover <name>
+                  mount a folder over a path that already holds files,
+                  keeping that content and syncing it
   status          show the daemon's status document
   version         print version information
   help            show this help
@@ -59,6 +63,8 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return configCheck(configPath, rest[1:], stdout, stderr)
 	case "status":
 		return status(ctx, configPath, rest, stdout, stderr)
+	case "folder":
+		return folderCmd(ctx, configPath, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "storeboard: unknown command %q\n\n%s", cmd, usage)
 		return ErrHandled
@@ -210,8 +216,9 @@ func status(ctx context.Context, configPath string, args []string, stdout, stder
 	return nil
 }
 
-// fetch GETs one path from the daemon over its unix socket.
-func fetch(ctx context.Context, socket, path string) ([]byte, error) {
+// call sends one request to the daemon over its unix socket and returns the
+// body, with the daemon's own error message when it refuses.
+func call(ctx context.Context, socket, method, path string) ([]byte, error) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -220,7 +227,7 @@ func fetch(ctx context.Context, socket, path string) ([]byte, error) {
 			},
 		},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://storeboard"+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, "http://storeboard"+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -234,9 +241,92 @@ func fetch(ctx context.Context, socket, path string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &e) == nil && e.Error != "" {
+			return nil, errors.New(e.Error)
+		}
 		return nil, fmt.Errorf("daemon answered %s", resp.Status)
 	}
 	return body, nil
+}
+
+func fetch(ctx context.Context, socket, path string) ([]byte, error) {
+	return call(ctx, socket, http.MethodGet, path)
+}
+
+// folderCmd is the folder verb group: `folder takeover <name>` converts a
+// mount path that is busy because it holds the user's own content into a
+// storeboard mount, moving that content into the folder's offline mount and
+// letting the normal merge take it from there.
+func folderCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, "storeboard: usage: storeboard folder takeover <name> [--json]\n")
+		return ErrHandled
+	}
+	verb, rest := args[0], args[1:]
+	switch verb {
+	case "takeover":
+		return folderTakeover(ctx, configPath, rest, stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "storeboard: unknown folder command %q\n\nusage: storeboard folder takeover <name> [--json]\n", verb)
+		return ErrHandled
+	}
+}
+
+func folderTakeover(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	// Split the positional name from the shared flags: jsonFlag rejects
+	// anything that is not a flag, so it sees only the flags.
+	var name string
+	var flags []string
+	for _, arg := range args {
+		switch arg {
+		case "--json", "-h", "--help":
+			flags = append(flags, arg)
+		default:
+			if name != "" {
+				fmt.Fprintf(stderr, "storeboard: folder takeover: unexpected argument %q\n", arg)
+				return ErrHandled
+			}
+			name = arg
+		}
+	}
+	jsonOut, err := jsonFlag(flags, "folder takeover <name>", stderr)
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard folder takeover <name> [--json]")
+		return ErrHandled
+	}
+
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(name)+"/takeover")
+	if err != nil {
+		return fmt.Errorf("takeover %s: %w", name, err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var res api.TakeoverResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		return fmt.Errorf("parse takeover result: %w", err)
+	}
+	switch {
+	case res.State == "attached":
+		fmt.Fprintf(stdout, "%s: moved %d entries into the view; the mesh gets them on the next scan\n", res.Folder, res.Moved)
+	case res.Moved == 0:
+		fmt.Fprintf(stdout, "%s: already mounted (%s), nothing to take over\n", res.Folder, res.State)
+	default:
+		fmt.Fprintf(stdout, "%s: moved %d entries into the offline mount (no holder reachable)\n", res.Folder, res.Moved)
+		fmt.Fprintf(stdout, "the merge happens by itself when a holder answers; run `storeboard folder takeover %s` again to retry now\n", res.Folder)
+	}
+	return nil
 }
 
 func renderStatus(w io.Writer, st *api.Status) {
@@ -307,6 +397,17 @@ func renderStatus(w io.Writer, st *api.Status) {
 			detail += fmt.Sprintf(", %s:%s %s", s.Permissions.User, s.Permissions.Group, s.Permissions.Mode)
 		}
 		fmt.Fprintf(w, "  %s\n    %s\n", s.Folder, detail)
+		if s.State != "busy" || s.Busy == "" {
+			continue
+		}
+		// Busy says the path belongs to something else — the one thing the
+		// user needs next is which something, and how to hand it over when
+		// it is their own content.
+		fmt.Fprintf(w, "    not managed: %s", s.Busy)
+		if s.Busy == api.BusyContent {
+			fmt.Fprintf(w, " — storeboard folder takeover %s", s.Folder)
+		}
+		fmt.Fprintln(w)
 	}
 }
 

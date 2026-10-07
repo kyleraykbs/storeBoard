@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
+	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
 // Mount states, mirrored in api.FolderSync docs.
@@ -52,13 +53,16 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 	switch target, err := os.Readlink(fs.mount); {
 	case err == nil && target == view:
 		fs.state = stateAttached
+		fs.busy = ""
 		fs.root = view
 	case err == nil && target == detached:
 		fs.state = stateDetached
+		fs.busy = ""
 		fs.root = detached
 	case err == nil:
 		// A symlink we did not make: leave it alone.
 		fs.state = stateBusy
+		fs.busy = api.BusySymlink
 		fs.root = detached
 		e.logger.Warn("mount path is a foreign symlink; leaving it alone", "folder", fs.name, "path", fs.mount, "target", target)
 	default:
@@ -68,6 +72,7 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 			// A fresh machine: the path simply is not there yet.
 		case serr != nil:
 			fs.state = stateBusy
+			fs.busy = api.BusyNotDir
 			fs.root = detached
 			e.logger.Error("inspect mount path", "folder", fs.name, "path", fs.mount, "error", serr)
 			return
@@ -79,6 +84,7 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 			entries, derr := os.ReadDir(fs.mount)
 			if derr != nil || len(entries) != 0 {
 				fs.state = stateBusy
+				fs.busy = api.BusyContent
 				fs.root = detached
 				e.logger.Warn("mount path has content; leaving it alone", "folder", fs.name, "path", fs.mount)
 				return
@@ -87,16 +93,19 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 				fs.state = stateBusy
 				fs.root = detached
 				if fstype := mountFSType(fs.mount); fstype != "" {
+					fs.busy = api.BusyMount
 					e.logger.Warn("mount path is still a mount point; something must unmount it first",
 						"folder", fs.name, "path", fs.mount, "fstype", fstype)
 					return
 				}
+				fs.busy = api.BusyNoRemove
 				e.logger.Warn("mount path is an empty dir that cannot be removed; leaving it alone", "folder", fs.name, "path", fs.mount, "error", err)
 				return
 			}
 			e.logger.Info("adopted empty mount path", "folder", fs.name, "path", fs.mount)
 		default:
 			fs.state = stateBusy
+			fs.busy = api.BusyNotDir
 			fs.root = detached
 			e.logger.Warn("mount path is occupied; leaving it alone", "folder", fs.name, "path", fs.mount)
 			return
@@ -139,6 +148,7 @@ func (e *Engine) attach(fs *FolderState) {
 	}
 	e.chownLink(fs, fs.mount)
 	fs.state = stateAttached
+	fs.busy = ""
 	fs.root = view
 	e.logger.Info("folder attached", "folder", fs.name, "mount", fs.mount)
 }
@@ -166,6 +176,7 @@ func (e *Engine) detach(fs *FolderState) {
 	}
 	e.chownLink(fs, fs.mount)
 	fs.state = stateDetached
+	fs.busy = ""
 	fs.root = detached
 	e.logger.Info("folder detached (no holder reachable)", "folder", fs.name, "mount", fs.mount)
 }

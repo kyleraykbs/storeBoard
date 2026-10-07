@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,5 +237,51 @@ func waitForSocket(t *testing.T, socket string) {
 			t.Fatalf("daemon socket never appeared: %s", socket)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestFolderTakeoverUsage(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"folder"}, "usage: storeboard folder takeover <name>"},
+		{[]string{"folder", "takeover"}, "usage: storeboard folder takeover <name>"},
+		{[]string{"folder", "surrender", "docs"}, "unknown folder command"},
+	}
+	for _, c := range cases {
+		var out, errOut bytes.Buffer
+		err := Run(context.Background(), c.args, "", &out, &errOut)
+		if err != ErrHandled {
+			t.Errorf("%v: err = %v, want ErrHandled", c.args, err)
+		}
+		if !strings.Contains(errOut.String(), c.want) {
+			t.Errorf("%v: stderr = %q, want it to mention %q", c.args, errOut.String(), c.want)
+		}
+	}
+}
+
+// The daemon's own refusal is what the user reads: a takeover that cannot
+// happen must report why, not "daemon answered 409".
+func TestFolderTakeoverReportsTheDaemonError(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "s.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"folder \"docs\" belongs to uid 1000: run this as that user, or as root"}`))
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	path := writeConfig(t, `{"configVersion": 1, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
+	var out, errOut bytes.Buffer
+	err = Run(context.Background(), []string{"folder", "takeover", "docs"}, path, &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "belongs to uid 1000") {
+		t.Fatalf("err = %v, want the daemon's own reason", err)
 	}
 }

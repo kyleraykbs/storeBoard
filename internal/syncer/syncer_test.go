@@ -16,6 +16,7 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
+	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
 // testWait bounds every waitFor in this file. It is deliberately far larger
@@ -699,5 +700,155 @@ func TestDetachedFolderDoesNotTombstoneItsContent(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(rootA, "hello.txt")); got != "from-holder" {
 		t.Fatalf("holder content = %q", got)
+	}
+}
+
+// Busy can say exactly one thing at a time, and the reason follows the path:
+// content, a foreign symlink, a mount point, a file in the way.
+func TestBusyReasonsAreReported(t *testing.T) {
+	uname, _ := currentIDs(t)
+	mountParent := t.TempDir()
+	mount := filepath.Join(mountParent, "remote-docs")
+	if err := os.MkdirAll(mount, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mount, "mine.txt"), "local", time.Now())
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	n.eng.prepare(n.eng.folders[0])
+	snap := n.eng.Snapshot()
+	if snap[0].State != stateBusy || snap[0].Busy != api.BusyContent {
+		t.Fatalf("state/busy = %q/%q, want busy/%q", snap[0].State, snap[0].Busy, api.BusyContent)
+	}
+
+	// A symlink somebody else made is not content, and takeover refuses it.
+	other := filepath.Join(mountParent, "elsewhere")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mount2 := filepath.Join(mountParent, "linked")
+	if err := os.Symlink(other, mount2); err != nil {
+		t.Fatal(err)
+	}
+	n2 := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount2, false)
+	n2.eng.prepare(n2.eng.folders[0])
+	if s := n2.eng.Snapshot()[0]; s.State != stateBusy || s.Busy != api.BusySymlink {
+		t.Fatalf("symlink case = %q/%q, want busy/%q", s.State, s.Busy, api.BusySymlink)
+	}
+	if _, err := n2.eng.Takeover("docs", os.Getuid()); err == nil {
+		t.Fatal("takeover accepted a foreign symlink")
+	}
+
+	// Root or the folder's owner may take over; nobody else.
+	if _, err := n.eng.Takeover("docs", os.Getuid()+1); err == nil {
+		t.Fatal("takeover accepted a stranger's uid")
+	}
+	_ = uname
+}
+
+// The whole point: a path full of the user's files becomes a storeboard
+// mount, the files move into the offline dir, and the normal merge hands
+// them to the mesh — first to the view, then to the holder.
+func TestTakeoverMountsContentAndMergesIt(t *testing.T) {
+	epA, epB := twoEndpoints(t)
+	rootA := filepath.Join(t.TempDir(), "docs") // holder
+	mountB := filepath.Join(t.TempDir(), "remote-docs")
+	if err := os.MkdirAll(filepath.Join(mountB, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mountB, "mine.txt"), "my own file", time.Now())
+	writeFile(t, filepath.Join(mountB, "sub", "deep.txt"), "deeper", time.Now())
+
+	holder := mkNode(t, "a", "b", epA, epB, rootA, true)
+	client := mkNode(t, "b", "a", epB, epA, mountB, false)
+	writeFile(t, filepath.Join(rootA, "theirs.txt"), "from holder", time.Now())
+
+	startNode(t, holder)
+	startNode(t, client)
+
+	waitFor(t, testWait, "busy before takeover", func() bool {
+		return client.eng.Snapshot()[0].State == stateBusy
+	})
+
+	res, err := client.eng.Takeover("docs", os.Getuid())
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	if res.Moved != 2 {
+		t.Fatalf("moved = %d, want 2 top-level entries", res.Moved)
+	}
+	waitFor(t, testWait, "attached after takeover", func() bool {
+		return client.eng.Snapshot()[0].State == stateAttached
+	})
+
+	// The user's files are at the same path — now through the mount — and
+	// the holder's file is there too.
+	for _, want := range []string{"mine.txt", "sub/deep.txt", "theirs.txt"} {
+		waitFor(t, testWait, "visible through the mount: "+want, func() bool {
+			return exists(filepath.Join(mountB, want))
+		})
+	}
+	if got := readFile(t, filepath.Join(mountB, "mine.txt")); got != "my own file" {
+		t.Fatalf("mine.txt = %q", got)
+	}
+	if fi, err := os.Lstat(mountB); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("mount path is not a symlink after takeover: %v %v", fi, err)
+	}
+
+	// And the mesh has them: the holder ends up with the content the user
+	// had on the client, byte for byte.
+	waitFor(t, testWait, "holder received the taken-over files", func() bool {
+		return exists(filepath.Join(rootA, "mine.txt")) && exists(filepath.Join(rootA, "sub", "deep.txt"))
+	})
+	if got := readFile(t, filepath.Join(rootA, "mine.txt")); got != "my own file" {
+		t.Fatalf("holder mine.txt = %q", got)
+	}
+
+	// Idempotent: a second takeover on a mounted folder changes nothing.
+	res2, err := client.eng.Takeover("docs", os.Getuid())
+	if err != nil || res2.Moved != 0 || res2.State != stateAttached {
+		t.Fatalf("second takeover = %+v, %v; want a no-op on an attached folder", res2, err)
+	}
+}
+
+// A takeover without a holder parks the content in the offline mount and
+// lets the normal reconnect merge it: the path stays usable immediately.
+func TestTakeoverOfflineThenMergesOnReconnect(t *testing.T) {
+	epA, epB := twoEndpoints(t)
+	rootA := filepath.Join(t.TempDir(), "docs")
+	mountB := filepath.Join(t.TempDir(), "remote-docs")
+	if err := os.MkdirAll(mountB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mountB, "mine.txt"), "offline content", time.Now())
+
+	holder := mkNode(t, "a", "b", epA, epB, rootA, true)
+	client := mkNode(t, "b", "a", epB, epA, mountB, false)
+	writeFile(t, filepath.Join(rootA, "theirs.txt"), "from holder", time.Now())
+
+	// Only the client runs: no holder, so nothing can attach.
+	startNode(t, client)
+	waitFor(t, testWait, "busy before takeover", func() bool {
+		return client.eng.Snapshot()[0].State == stateBusy
+	})
+	res, err := client.eng.Takeover("docs", os.Getuid())
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	if res.State != stateDetached || res.Moved != 1 {
+		t.Fatalf("takeover = %+v, want detached with 1 entry moved", res)
+	}
+	if got := readFile(t, filepath.Join(mountB, "mine.txt")); got != "offline content" {
+		t.Fatalf("content not readable through the offline mount: %q", got)
+	}
+
+	// The holder appears: the ordinary attach merges the offline content in,
+	// and the mesh receives it.
+	startNode(t, holder)
+	waitFor(t, testWait, "merged and attached on reconnect", func() bool {
+		return client.eng.Snapshot()[0].State == stateAttached && exists(filepath.Join(rootA, "mine.txt"))
+	})
+	if got := readFile(t, filepath.Join(rootA, "mine.txt")); got != "offline content" {
+		t.Fatalf("holder mine.txt = %q", got)
 	}
 }

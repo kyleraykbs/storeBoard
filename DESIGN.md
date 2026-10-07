@@ -39,10 +39,13 @@ one, it changes here first, deliberately, with a decision log entry.
    — no environment, no file access, hard timeout and output limit.
 9. Peers advertise min/max protocol versions and pick the highest common
    one; unknown fields are tolerated on the wire, matching invariant 6.
-10. No privileged verb ships while the daemon socket is world-accessible
-    (mode 0666, internal/server). Tightening the socket — and the threat
-    model that decides who may talk to it — precedes `send`, `receive`, or
-    anything else that acts.
+10. Verbs that act on the user's data are authorized per caller, never by
+    socket access alone. The daemon socket is world-writable so any user's
+    CLI can read status; an acting verb (today: `folder takeover`) checks
+    the requesting uid through the socket's peer credentials and allows only
+    root or the folder's owner — a refusal, not a guess, when the uid cannot
+    be read. This is the sequence the earlier version of this invariant
+    demanded: the authorization exists before the verb ships.
 11. Peers are declared, never invented: the config (Nix-generated) is the
     authoritative peer list, and the daemon learns a peer only from it.
     Address discovery (DNS, NAT traversal) may layer on top later;

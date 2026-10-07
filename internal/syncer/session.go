@@ -522,6 +522,18 @@ func moveOrCopy(src, dst string, mode os.FileMode) error {
 	} else if !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
+	if mode&os.ModeSymlink != 0 {
+		// A copy that followed the link would turn it into its target's
+		// contents; recreate the link itself.
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(target, dst); err != nil {
+			return err
+		}
+		return os.Remove(src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err

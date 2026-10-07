@@ -94,3 +94,29 @@
   and a status socket too starved to answer.
 - **Reversible:** yes — the only scanning the change removes is one that
   could only produce false tombstones.
+
+## 2026-10-07 — `storeboard folder takeover`, and what busy now says
+
+- **Decision:** `status` reports *why* a folder is busy (`sync[].busy`, one of
+  `path has content` / `foreign symlink` / `mount point` / `empty dir cannot
+  be removed` / `not a directory`), and the CLI prints the reason with the
+  way out where one exists — `storeboard folder takeover <name>`.
+  Takeover handles the one case the user can resolve themselves: a real
+  directory holding their files. It moves every entry into the folder's
+  offline mount (the same landing zone offline writes use), replaces the
+  path with the mount symlink, and, when a holder answers, runs the ordinary
+  attach so the merge and the push to the mesh happen with no special path.
+  Without a holder the mount simply stays offline and the reconnect merges.
+  Collisions are parked under the deterministic conflict name, never
+  overwritten; a crash mid-way leaves the path busy and the same command
+  resumes. Refused for foreign symlinks and live mounts (unmount first).
+- **Authorization:** the verb acts on the user's files, so the daemon
+  authorizes per caller through unix peer credentials (SO_PEERCRED): root or
+  the folder's owner, and a refusal when the uid cannot be read. This
+  satisfies DESIGN invariant 10, which is amended to state the rule as
+  per-caller authorization rather than "no acting verb at all".
+- **Why:** user request — the busy reason was opaque, and telling someone to
+  delete a directory is a data-loss instruction. Takeover turns the refusal
+  into a supported migration that keeps every byte.
+- **Reversible:** yes (a new verb and an additive status field; no config or
+  wire change).

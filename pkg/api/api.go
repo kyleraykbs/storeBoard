@@ -66,19 +66,51 @@ type Permissions struct {
 	Mode  string `json:"mode"`
 }
 
+// Busy reasons, FolderSync.Busy. The daemon reports which one applies so a
+// user (and the CLI) can tell an actionable path from one that belongs to
+// something else entirely.
+const (
+	// BusyContent is a real directory holding the user's files. It is the
+	// one busy reason a takeover can resolve: `storeboard folder takeover`
+	// moves the content into the folder's offline mount and mounts over it.
+	BusyContent = "path has content"
+	// BusySymlink is a symlink the daemon did not make.
+	BusySymlink = "foreign symlink"
+	// BusyMount is a live mount point (a samba mount, a tmpfs placeholder).
+	BusyMount = "mount point"
+	// BusyNoRemove is a directory that is empty but cannot be removed.
+	BusyNoRemove = "empty dir cannot be removed"
+	// BusyNotDir is a regular file or something else in the way.
+	BusyNotDir = "not a directory"
+)
+
 // FolderSync is one folder's engine state on this machine. State is one of:
 // replica (a full local copy that syncs), attached (a streamed folder
 // mounted live), detached (a streamed folder replaced by an empty dir while
 // no holder is reachable), busy (something else owns the mount path, e.g. a
-// samba mount, and the engine leaves it alone).
+// samba mount, and the engine leaves it alone). Busy carries the reason when
+// state is busy; empty otherwise.
 type FolderSync struct {
 	Folder      string      `json:"folder"`
 	Root        string      `json:"root"`
 	State       string      `json:"state"`
+	Busy        string      `json:"busy,omitempty"`
 	Entries     int         `json:"entries"`
 	Conflicts   int         `json:"conflicts"`
 	LastScan    time.Time   `json:"lastScan"`
 	Permissions Permissions `json:"permissions"`
+}
+
+// TakeoverResult reports what `storeboard folder takeover` did with a mount
+// path that had content of its own: how many entries moved into the folder's
+// offline mount and where the folder stands now (attached when a holder was
+// reachable and the merge went through, detached otherwise — the merge then
+// happens on reconnect without further help).
+type TakeoverResult struct {
+	Folder string `json:"folder"`
+	State  string `json:"state"`
+	Root   string `json:"root"`
+	Moved  int    `json:"moved"`
 }
 
 // Status is the daemon's status document, served at GET /v1/status.

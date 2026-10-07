@@ -78,11 +78,12 @@ cat >"$config" <<EOF
       "peers": ["laptop", "desktop"],
       "folders": {
         "photos": { "mount": "$work/Pictures" },
-        "documents": { "mount": "$work/docs" }
+        "documents": { "mount": "$work/docs" },
+        "archive": { "mount": "$work/archive" }
       }
     }
   },
-  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs" }
+  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive" }
 }
 EOF
 
@@ -100,7 +101,7 @@ echo "== status, both modes"
 "$CLI" --config "$config" status --json |
 	jq -e --arg s "$socket" --arg w "$work" '
 		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
-		(.groups | length == 1) and (.folders | length == 2) and
+		(.groups | length == 1) and (.folders | length == 3) and
 		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs")) and
 		([.folders[].keepOffline] | all) and
 		([.sync[].state] | all(. == "replica"))' >/dev/null
@@ -113,6 +114,8 @@ fi
 
 echo "== two daemons connect over the wire"
 mkdir -p "$work/PicturesB"
+mkdir -p "$work/remoteArchive"
+echo "local file, kept by takeover" >"$work/remoteArchive/local.txt"
 cat >"$config2" <<EOF
 {
   "configVersion": 1,
@@ -128,12 +131,13 @@ cat >"$config2" <<EOF
       "peers": ["laptop", "desktop"],
       "folders": {
         "photos": { "mount": "$work/PicturesB" },
-        "documents": { "mount": "$work/remoteDocs" }
+        "documents": { "mount": "$work/remoteDocs" },
+        "archive": { "mount": "$work/remoteArchive" }
       }
     }
   },
-  "mounts": { "photos": "$work/PicturesB", "documents": "$work/remoteDocs" },
-  "keepOffline": { "documents": false }
+  "mounts": { "photos": "$work/PicturesB", "documents": "$work/remoteDocs", "archive": "$work/remoteArchive" },
+  "keepOffline": { "documents": false, "archive": false }
 }
 EOF
 
@@ -162,6 +166,21 @@ echo "== streamed folder attaches"
 wait_for 10 "desktop mount attached" bash -c "[ -L '$work/remoteDocs' ]"
 "$CLI" --config "$config2" status --json |
 	jq -e '[.sync[] | select(.folder == "documents")][0].state == "attached"' >/dev/null
+
+echo "== a path with content says why, and takeover mounts it without losing anything"
+"$CLI" --config "$config2" status |
+	grep -q "not managed: path has content"
+"$CLI" --config "$config2" status --json |
+	jq -e '[.sync[] | select(.folder == "archive")][0].state == "busy"' >/dev/null
+"$CLI" --config "$config2" folder takeover archive --json |
+	jq -e '.state == "attached" and .moved == 1' >/dev/null
+[ -L "$work/remoteArchive" ] || {
+	echo "FAIL: archive is not a mount after takeover" >&2
+	exit 1
+}
+grep -q "local file, kept by takeover" "$work/remoteArchive/local.txt"
+wait_for 10 "taken-over content reached the holder" test -f "$work/archive/local.txt"
+grep -q "local file, kept by takeover" "$work/archive/local.txt"
 echo "holder content" >"$work/docs/from-laptop.txt"
 wait_for 10 "holder content visible through the mount" test -f "$work/remoteDocs/from-laptop.txt"
 grep -q "holder content" "$work/remoteDocs/from-laptop.txt"

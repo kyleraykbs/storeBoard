@@ -42,6 +42,7 @@ type FolderState struct {
 	streamed  bool
 	root      string // the root the scanner follows: mount, view, or detached dir
 	state     string
+	busy      string // why state is busy, one of the api.Busy* reasons
 	db        *FileDB
 	conflicts int
 	lastScan  time.Time
@@ -317,12 +318,13 @@ func (e *Engine) Snapshot() []api.FolderSync {
 	out := make([]api.FolderSync, 0, len(e.folders))
 	for _, fs := range e.folders {
 		fs.scanMu.Lock()
-		p, root, state := fs.perm, fs.root, fs.state
+		p, root, state, busy := fs.perm, fs.root, fs.state, fs.busy
 		fs.scanMu.Unlock()
 		out = append(out, api.FolderSync{
 			Folder:      fs.name,
 			Root:        root,
 			State:       state,
+			Busy:        busy,
 			Entries:     fs.db.Count(),
 			Conflicts:   fs.conflicts,
 			LastScan:    fs.lastScan,
