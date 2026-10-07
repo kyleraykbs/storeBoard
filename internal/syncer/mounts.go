@@ -54,7 +54,35 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 		fs.root = detached
 		e.logger.Warn("mount path is a foreign symlink; leaving it alone", "folder", fs.name, "path", fs.mount, "target", target)
 	default:
-		if _, serr := os.Lstat(fs.mount); serr == nil {
+		info, serr := os.Lstat(fs.mount)
+		switch {
+		case os.IsNotExist(serr):
+			// A fresh machine: the path simply is not there yet.
+		case serr != nil:
+			fs.state = stateBusy
+			fs.root = detached
+			e.logger.Error("inspect mount path", "folder", fs.name, "path", fs.mount, "error", serr)
+			return
+		case info.IsDir():
+			// An EMPTY directory is a spent mount point (the samba mounts
+			// sat on exactly these, and a retired cifs mount leaves one
+			// behind): nothing to protect, adopt it. Anything with content
+			// is somebody's data — never touch.
+			entries, derr := os.ReadDir(fs.mount)
+			if derr != nil || len(entries) != 0 {
+				fs.state = stateBusy
+				fs.root = detached
+				e.logger.Warn("mount path has content; leaving it alone", "folder", fs.name, "path", fs.mount)
+				return
+			}
+			if err := os.Remove(fs.mount); err != nil {
+				fs.state = stateBusy
+				fs.root = detached
+				e.logger.Warn("mount path is an empty dir that cannot be removed; leaving it alone", "folder", fs.name, "path", fs.mount, "error", err)
+				return
+			}
+			e.logger.Info("adopted empty mount path", "folder", fs.name, "path", fs.mount)
+		default:
 			fs.state = stateBusy
 			fs.root = detached
 			e.logger.Warn("mount path is occupied; leaving it alone", "folder", fs.name, "path", fs.mount)

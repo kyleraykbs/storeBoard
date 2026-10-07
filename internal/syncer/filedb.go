@@ -199,6 +199,9 @@ func (d *FileDB) Count() int {
 func (d *FileDB) Sync() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
 	return d.f.Sync()
 }
 

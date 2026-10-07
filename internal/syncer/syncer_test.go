@@ -350,6 +350,30 @@ func TestForeignMountPathIsLeftAlone(t *testing.T) {
 	}
 }
 
+// An empty directory at a streamed mount path is what a retired cifs mount
+// leaves behind: nothing to protect, so it is adopted.
+func TestEmptyMountPathIsAdopted(t *testing.T) {
+	mountParent := t.TempDir()
+	mount := filepath.Join(mountParent, "remote-docs")
+	if err := os.MkdirAll(mount, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, false)
+	n.eng.prepare(n.eng.folders[0])
+
+	if state := n.eng.Snapshot()[0].State; state != stateDetached {
+		t.Fatalf("state = %q, want detached (adopted)", state)
+	}
+	fi, err := os.Lstat(mount)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("mount path was not replaced by a symlink: %v %v", fi, err)
+	}
+	if target, _ := os.Readlink(mount); target != n.eng.detachedDir(n.eng.folders[0]) {
+		t.Fatalf("symlink target = %q, want the detached dir", target)
+	}
+}
+
 func TestValidRelRejectsEscapes(t *testing.T) {
 	bad := []string{"", "/etc/passwd", "../x", "a/../../b", "a\x00b"}
 	for _, p := range bad {
