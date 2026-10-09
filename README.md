@@ -92,7 +92,12 @@ bad option value fails nixos-rebuild instead of failing at startup.
   conflicts are visible in `status --json` (`.sync[]`).
 - A streamed folder whose path belongs to something else is reported
   `busy` with the reason (`sync[].busy`): content of its own, a foreign
-  symlink, a live mount, or a file in the way. `storeboard folder takeover
+  symlink, a live mount, or a file in the way.
+- A streamed folder backed by a storage directory keeps its mount on the
+  view at all times: without a holder it reports `detached` (not live) but
+  the content stays visible and writes land in the folder, syncing when a
+  holder returns. Without a storage directory the path is replaced by an
+  empty dummy dir instead and what is written there merges back on attach. `storeboard folder takeover
   <name>` resolves the first case: the content moves into the folder's
   offline mount, the path becomes the mount, and the ordinary merge hands
   the files to the mesh — immediately when a holder answers, otherwise on

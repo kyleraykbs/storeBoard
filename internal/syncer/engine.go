@@ -186,13 +186,14 @@ func (e *Engine) scanOnce(fs *FolderState) {
 		// time"). Replicas are the user's directories and are never chmod'ed.
 		e.applyDir(fs, fs.root)
 	}
-	// A streamed folder is only scanned while it is attached. The detached
-	// dir is a scratchpad for offline writes (merged back in on attach),
-	// not the folder's content: scanning it sees every known file as
-	// vanished and tombstones it — and the next attach then resurrects the
-	// whole folder with fresh versions, so every reconnect churned the
-	// entire mesh (GB-sized reads and rewrites on both sides).
-	scan := !fs.streamed || fs.state == stateAttached
+	// A streamed folder is only scanned while it is attached — except when it
+	// is storage-backed, where the root never flips and offline writes land
+	// in the folder directly. The detached dir is a scratchpad for offline
+	// writes (merged back in on attach), not the folder's content: scanning
+	// it sees every known file as vanished and tombstones it — and the next
+	// attach then resurrects the whole folder with fresh versions, so every
+	// reconnect churned the entire mesh.
+	scan := !fs.streamed || fs.storage != "" || fs.state == stateAttached
 	fs.scanMu.Unlock()
 	if !scan {
 		return

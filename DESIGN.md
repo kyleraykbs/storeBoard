@@ -66,12 +66,15 @@ one, it changes here first, deliberately, with a decision log entry.
     startup, so the cost is chosen rather than discovered. A folder only
     some devices should carry is restricted with the tag's
     `folders.<f>.devices`.
-13. Remote (streamed) folders never dangle. While a holder is reachable the
-    folder mounts live; when none is, the mount point is replaced by an
-    empty dummy dir — nothing in the mount table ever points at nothing
-    (the sambaMounts lesson). On reconnect the view returns and the delta
-    remerges. Which folders stream is each machine's own `keepOffline`
-    declaration (default true: hold a replica that works offline).
+13. Remote (streamed) folders never dangle. A streamed folder is mounted
+    live while a holder is reachable; losing the holder is reported
+    (state detached) but never leaves the path pointing at nothing (the
+    sambaMounts lesson) — the mount either stays on the view (storage-
+    backed folders, whose content lives locally and where offline writes
+    land in the folder directly) or is replaced by an empty dummy dir whose
+    content is merged back on reconnect (the original layout). Which
+    folders stream is each machine's own `keepOffline` declaration
+    (default true: hold a replica that works offline).
 14. The peer wire is newline-delimited JSON over TCP. Both sides open with
     a hello (protocol, name, version); a disagreement on the protocol
     version ends the connection, and a name that is not declared in config

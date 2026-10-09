@@ -24,7 +24,7 @@ import (
 // deploy builds run these tests on machines that are also syncing large
 // folders, and a starved 50 ms scan tick can take seconds. The waits are
 // assertions that a thing eventually happens, not that it happens fast.
-const testWait = 45 * time.Second
+const testWait = 90 * time.Second
 
 // node is one daemon's engine + wire in a test.
 type node struct {
@@ -1114,10 +1114,46 @@ func TestLegacyViewMigratesIntoStorage(t *testing.T) {
 	if target, err := os.Readlink(mount); err != nil || target != want {
 		t.Fatalf("mount = %q (%v), want a symlink to the storage root %q", target, err, want)
 	}
-	if s := n.eng.Snapshot()[0]; s.State != stateAttached || s.Root != want {
-		t.Fatalf("state/root = %q/%q, want attached/%q", s.State, s.Root, want)
+	// No holder is connected, so the folder reports detached — but the
+	// storage-backed mount stays on the view either way, which is what the
+	// symlink and content assertions above pin.
+	if s := n.eng.Snapshot()[0]; s.State != stateDetached || s.Root != want {
+		t.Fatalf("state/root = %q/%q, want detached/%q", s.State, s.Root, want)
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Errorf("legacy view still present: %v", err)
+	}
+}
+
+// The streamed case with content already at the mount path — exactly the
+// shape a client has when a folder was declared before storage directories
+// existed (the local copy of a streamed folder): content migrates into the
+// storage directory and the folder ends up live over it.
+func TestStorageBackedStreamedMigratesMountContent(t *testing.T) {
+	storage := t.TempDir()
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+	if err := os.MkdirAll(filepath.Join(mount, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mount, "mine.txt"), "local before storage", time.Now())
+	writeFile(t, filepath.Join(mount, "sub", "deep.txt"), "deeper", time.Now())
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	want := filepath.Join(storage, "docs")
+	if got := readFile(t, filepath.Join(want, "mine.txt")); got != "local before storage" {
+		t.Fatalf("migrated content = %q", got)
+	}
+	if got := readFile(t, filepath.Join(want, "sub", "deep.txt")); got != "deeper" {
+		t.Fatalf("migrated nested content = %q", got)
+	}
+	if target, err := os.Readlink(mount); err != nil || target != want {
+		t.Fatalf("mount = %q (%v), want a symlink to %q", target, err, want)
+	}
+	// The content is still available at the same path, now through the mount.
+	if got := readFile(t, filepath.Join(mount, "mine.txt")); got != "local before storage" {
+		t.Fatalf("content through the mount = %q", got)
 	}
 }

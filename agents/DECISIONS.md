@@ -206,3 +206,23 @@
   copy), and the mount path becomes a symlink. Documented in README/DESIGN.
 - **Reversible:** yes — the option is additive; moving content back is a
   move, and the mount can be pointed anywhere.
+
+## 2026-10-07 — Storage-backed folders keep their mount on the view
+
+- **Decision:** a streamed folder with a storage directory never swaps its
+  mount path: the view (the storage root) is where the content already lives,
+  so the path shows it whether or not a holder is reachable, offline writes
+  land in the folder directly, and the folder is scanned at all times. State
+  still reports `attached`/`detached` (is a holder reachable), but the mount
+  no longer changes with it. Folders *without* a storage directory keep the
+  original dummy-dir-and-merge behaviour.
+- **Why:** found while testing the default-storage migration — after a
+  migration the mount pointed at the empty scratchpad while the content sat
+  in storage, which is exactly the "my files vanished" surprise, and it kept
+  the whole root-flip class (scratchpad tombstones, merge-back) alive for no
+  reason. With the mount fixed on the view there is no root flip to get wrong.
+- **Invariant 13 amended** accordingly: never dangle still holds; "replaced by
+  an empty dummy dir" is now the behaviour of the layout without a storage
+  directory, not the universal rule.
+- **Reversible:** yes (the old path is one branch); it changes only what a
+  folder shows while no holder answers, never what is stored.

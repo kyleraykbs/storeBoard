@@ -63,6 +63,27 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 	}
 
 	view, detached := e.viewsDir(fs), e.detachedDir(fs)
+	if fs.storage != "" {
+		// Storage-backed streamed folders never point the mount elsewhere:
+		// the view is where the content already lives, so the path shows it
+		// whether or not a holder is reachable, offline writes land in it
+		// directly, and the root never flips (which is what used to make
+		// detaches tombstone a folder).
+		if err := symlinkSwap(fs.mount, view); err != nil {
+			fs.state = stateBusy
+			fs.root = view
+			e.logger.Error("mount storage-backed folder", "folder", fs.name, "error", err)
+			return
+		}
+		e.chownLink(fs, fs.mount)
+		if fs.state != stateAttached {
+			fs.state = stateDetached
+		}
+		fs.busy = ""
+		fs.root = view
+		e.logger.Info("folder mounted", "folder", fs.name, "state", fs.state, "mount", fs.mount, "storage", fs.storage)
+		return
+	}
 	for _, d := range []string{view, detached} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			e.logger.Error("view dir", "folder", fs.name, "error", err)
@@ -274,15 +295,20 @@ func (e *Engine) attach(fs *FolderState) {
 	}
 	fs.perm = e.resolvePerms(fs)
 	view, detached := e.viewsDir(fs), e.detachedDir(fs)
+	// Anything an older layout left in the scratchpad merges into the view
+	// before the folder goes live, storage-backed or not.
 	if err := e.mergeDetached(fs, detached, view); err != nil {
 		e.logger.Error("remerge", "folder", fs.name, "error", err)
 	}
 	e.applyDir(fs, view)
-	if err := symlinkSwap(fs.mount, view); err != nil {
-		e.logger.Error("attach", "folder", fs.name, "error", err)
-		return
+	if fs.storage == "" {
+		// The mount has to be flipped onto the live view.
+		if err := symlinkSwap(fs.mount, view); err != nil {
+			e.logger.Error("attach", "folder", fs.name, "error", err)
+			return
+		}
+		e.chownLink(fs, fs.mount)
 	}
-	e.chownLink(fs, fs.mount)
 	fs.state = stateAttached
 	fs.busy = ""
 	fs.root = view
@@ -299,6 +325,17 @@ func (e *Engine) detach(fs *FolderState) {
 		return
 	}
 	fs.perm = e.resolvePerms(fs)
+	view := e.viewsDir(fs)
+	if fs.storage != "" {
+		// The view stays mounted: losing the holder means "not live", not
+		// "content disappears". Writes keep landing in the folder and sync
+		// when a holder returns.
+		fs.state = stateDetached
+		fs.busy = ""
+		fs.root = view
+		e.logger.Info("folder detached (no holder reachable)", "folder", fs.name, "mount", fs.mount)
+		return
+	}
 	detached := e.detachedDir(fs)
 	if err := os.MkdirAll(detached, 0o700); err != nil {
 		e.logger.Error("detach", "folder", fs.name, "error", err)
