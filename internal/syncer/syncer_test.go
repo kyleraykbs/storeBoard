@@ -1157,3 +1157,63 @@ func TestStorageBackedStreamedMigratesMountContent(t *testing.T) {
 		t.Fatalf("content through the mount = %q", got)
 	}
 }
+
+// A storage directory under the data directory has to be reachable from the
+// mount: the daemon's own levels are traverse-only (0711) and the storage
+// root carries the folder's resolved permissions — otherwise the owner gets
+// "Permission denied" on ls through the mount, because the module's data dir
+// is 0750.
+func TestStorageChainIsTraversable(t *testing.T) {
+	// Default storage (under the node's data dir) rather than an explicit one.
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", filepath.Join(t.TempDir(), "docs"), true)
+	fs := n.eng.folders[0]
+	fs.storage = filepath.Join(n.cfg.DataDir, "storage", "docs")
+	n.eng.prepare(fs)
+
+	base := filepath.Dir(filepath.Dir(fs.storage)) // the data dir
+	for _, dir := range []string{base, filepath.Dir(fs.storage)} {
+		fi, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm()&0o011 != 0o011 {
+			t.Errorf("%s mode = %04o, want it traversable for others", dir, fi.Mode().Perm())
+		}
+	}
+	fi, err := os.Stat(fs.storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o400 == 0 {
+		t.Errorf("storage root mode = %04o, want the resolved permissions (owner-readable)", fi.Mode().Perm())
+	}
+	// And the mount resolves for the owner.
+	if _, err := os.Stat(fs.mount); err != nil {
+		t.Fatalf("mount does not resolve: %v", err)
+	}
+}
+
+// A foreign symlink at a storage-backed folder's mount is refused, not
+// replaced: the no-clobber rule holds for the new layout too.
+func TestStorageMountRefusesForeignSymlink(t *testing.T) {
+	storage := t.TempDir()
+	mountParent := t.TempDir()
+	mount := filepath.Join(mountParent, "docs")
+	elsewhere := filepath.Join(mountParent, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, mount); err != nil {
+		t.Fatal(err)
+	}
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, false)
+	n.eng.prepare(n.eng.folders[0])
+
+	if s := n.eng.Snapshot()[0]; s.State != stateBusy || s.Busy != api.BusySymlink {
+		t.Fatalf("state/busy = %q/%q, want busy/%q", s.State, s.Busy, api.BusySymlink)
+	}
+	if target, err := os.Readlink(mount); err != nil || target != elsewhere {
+		t.Fatalf("foreign symlink was replaced: %q (%v)", target, err)
+	}
+}

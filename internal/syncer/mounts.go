@@ -69,6 +69,18 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 		// whether or not a holder is reachable, offline writes land in it
 		// directly, and the root never flips (which is what used to make
 		// detaches tombstone a folder).
+		//
+		// A symlink we did not make is still not ours to replace — the same
+		// rule the original layout follows.
+		if target, err := os.Readlink(fs.mount); err == nil {
+			if target != fs.storage && target != detached && target != e.legacyViewDir(fs) {
+				fs.state = stateBusy
+				fs.busy = api.BusySymlink
+				fs.root = view
+				e.logger.Warn("mount path is a foreign symlink; leaving it alone", "folder", fs.name, "path", fs.mount, "target", target)
+				return
+			}
+		}
 		if err := symlinkSwap(fs.mount, view); err != nil {
 			fs.state = stateBusy
 			fs.root = view
@@ -190,9 +202,16 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 // never-overwrite one takeover uses, so an interrupted migration leaves both
 // sides intact and the next transition picks up where it stopped.
 func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
-	if err := os.MkdirAll(fs.storage, 0o700); err != nil {
+	// The chain up to the storage root is the daemon's layout, not the
+	// user's data: missing levels are created traverse-only (0711) so the
+	// mount symlink resolves for its owner, and the root itself gets the
+	// folder's resolved owner and mode. Without this a storage directory
+	// under the data directory is unreachable from the mount ("Permission
+	// denied" on ls) — the data dir is 0750 by default.
+	if err := e.mkdirChain(fs, fs.storage, 0o711, false); err != nil {
 		return 0, err
 	}
+	ensureTraversable(e.dataDir, fs.storage)
 	e.applyDir(fs, fs.storage)
 
 	// Nothing to migrate when the mount is already our symlink. The legacy
@@ -532,6 +551,33 @@ func (e *Engine) chownLink(fs *FolderState, path string) {
 	_ = os.Lchown(path, fs.perm.uid, fs.perm.gid)
 }
 
+// mkdirChain creates every missing component of dir, top down, giving each
+// new level mode — chmod'ed explicitly, since Mkdir respects the umask — and,
+// when apply is set, the folder's resolved owner and mode (user-facing paths:
+// a mount's parents). Returns the levels it created.
+func (e *Engine) mkdirChain(fs *FolderState, dir string, mode os.FileMode, apply bool) error {
+	var missing []string
+	for p := filepath.Clean(dir); p != "/" && p != "." && p != ""; p = filepath.Dir(p) {
+		if _, err := os.Stat(p); err == nil {
+			break
+		}
+		missing = append(missing, p)
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(missing[i], mode); err != nil {
+			return err
+		}
+		e.logger.Info("created path", "folder", fs.name, "path", missing[i])
+		if apply {
+			e.applyDir(fs, missing[i])
+		}
+	}
+	return nil
+}
+
 // ensureMountParent creates the directories between a streamed mount path
 // and the nearest existing ancestor, so a declared mount point works on a
 // machine that has never had one (the whole ~/remote style tree is the
@@ -540,22 +586,7 @@ func (e *Engine) chownLink(fs *FolderState, path string) {
 // the folder's own permissions are inherited from, exactly as if the user
 // had made them.
 func (e *Engine) ensureMountParent(fs *FolderState) error {
-	parent := filepath.Dir(fs.mount)
-	var missing []string
-	for p := parent; p != "/" && p != "." && p != ""; p = filepath.Dir(p) {
-		if _, err := os.Stat(p); err == nil {
-			break
-		}
-		missing = append(missing, p)
-	}
-	for i := len(missing) - 1; i >= 0; i-- {
-		if err := os.Mkdir(missing[i], 0o755); err != nil {
-			return err
-		}
-		e.logger.Info("created mount path parent", "folder", fs.name, "path", missing[i])
-		e.applyDir(fs, missing[i])
-	}
-	return nil
+	return e.mkdirChain(fs, filepath.Dir(fs.mount), 0o755, true)
 }
 
 // legacyViewDir is where a streamed folder's content lived before storage
