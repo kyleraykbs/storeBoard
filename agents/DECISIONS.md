@@ -134,3 +134,25 @@
   byte for byte. Every other park site in the engine (incoming blob, index
   merge) was already content-based; this one was the outlier.
 - **Reversible:** yes — strictly fewer copies, nothing else changes.
+
+## 2026-10-07 — Overlapping mounts are a config error; folders can be device-scoped
+
+- **Decision:** `config check` (and therefore every build) rejects two
+  folders whose effective mounts are equal or nested. Folders stay a group
+  property, and the tag gains `storeboard.groups.<g>.folders.<f>.devices`
+  (null = every member) so a folder can be carried by specific devices only
+  — the folder then simply does not exist elsewhere, which the wire already
+  tolerates (a peer without a folder ignores its index).
+- **Why:** the user asked whether a `mainpool` folder at `/mainpool`
+  alongside folders at `/mainpool/kyle/...` works. It "works" — it
+  converges — but on the holder every file is indexed by two folders (two
+  journals, two scans, two broadcasts, two writers per path), the replica
+  scan copies the outer tree into the content store, and on a streaming
+  peer the inner trees are materialised twice. None of that is visible
+  until the disk or the conflict copies show up, so it is a validation
+  error with the two ways out in the message, not a runtime surprise.
+- **Not solved by this:** a *browsable whole-pool view* on a client — every
+  folder a device carries is still a full replica or a full streamed
+  mirror. That needs on-demand fetch (FUSE work on the DESIGN list), or a
+  network mount in the meantime.
+- **Reversible:** the guard, yes; the `devices` option is additive.

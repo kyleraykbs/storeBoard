@@ -417,7 +417,36 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Effective mounts must not overlap: a folder whose mount contains
+	// another's makes the same bytes two folders' business on the machine
+	// that holds both — double scans and broadcasts, two writers for one
+	// path, and a replica scan that copies the whole outer tree into the
+	// content store. Ambiguity about what syncs where is exactly what this
+	// config model exists to prevent (DESIGN invariant 12).
+	folders := c.Folders()
+	for i, a := range folders {
+		for _, b := range folders[i+1:] {
+			switch {
+			case a.Mount == b.Mount:
+				return fmt.Errorf("folders %q and %q both mount %s: one path cannot be two folders", a.Name, b.Name, a.Mount)
+			case contains(a.Mount, b.Mount):
+				return fmt.Errorf("folder %q mounts %s, which contains %s (folder %q): nested mounts double every file — give one of them its own group, or drop the outer folder", a.Name, a.Mount, b.Mount, b.Name)
+			case contains(b.Mount, a.Mount):
+				return fmt.Errorf("folder %q mounts %s, which contains %s (folder %q): nested mounts double every file — give one of them its own group, or drop the outer folder", b.Name, b.Mount, a.Mount, a.Name)
+			}
+		}
+	}
+
 	return nil
+}
+
+// contains reports whether outer is a proper ancestor directory of inner.
+// Path-boundary aware: /srv/photos does not contain /srv/photos-old.
+func contains(outer, inner string) bool {
+	if !strings.HasPrefix(inner, outer) {
+		return false
+	}
+	return strings.HasPrefix(inner[len(outer):], "/")
 }
 
 // PermissionsFor is the declared permissions for a folder: this machine's

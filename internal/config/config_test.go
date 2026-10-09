@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -473,5 +474,33 @@ func TestParseMode(t *testing.T) {
 		if _, err := ParseMode(in); err == nil {
 			t.Errorf("ParseMode(%q): want an error", in)
 		}
+	}
+}
+
+func TestNestedMountsAreRejected(t *testing.T) {
+	base := `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "pool": {}, "other": {}}}},
+  "mounts": %s
+}`
+	path := writeConfig(t, fmt.Sprintf(base, `{"docs": "/mainpool/kyle/docs", "pool": "/mainpool", "other": "/srv/other"}`))
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "nested mounts") {
+		t.Fatalf("err = %v, want nested mounts rejected", err)
+	}
+
+	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs", "other": "/srv/other"}`))
+	_, err = Load(path)
+	if err == nil || !strings.Contains(err.Error(), "both mount") {
+		t.Fatalf("err = %v, want two folders on one path rejected", err)
+	}
+
+	// Siblings that merely share a prefix are not nesting.
+	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs-archive", "other": "/srv/other"}`))
+	if _, err := Load(path); err != nil {
+		t.Fatalf("sibling mounts rejected: %v", err)
 	}
 }
