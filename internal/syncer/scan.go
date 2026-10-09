@@ -27,6 +27,7 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 	root := fs.root
 	seen := make(map[string]bool)
 	var changed []*Entry
+	var unmaterialised int
 
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -134,6 +135,7 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 		// amanita was exactly this, an empty storage root scanned against a
 		// journal full of entries.
 		if ent.Blob != "" && !e.store.Has(ent.Blob) {
+			unmaterialised++
 			continue
 		}
 		tomb := ent.clone()
@@ -150,6 +152,10 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 		changed = append(changed, tomb)
 	}
 
+	if unmaterialised > 0 {
+		e.logger.Info("skipped entries this machine never materialised; their absence is not a deletion",
+			"folder", fs.name, "skipped", unmaterialised)
+	}
 	if len(changed) > 0 {
 		if err := fs.db.Sync(); err != nil {
 			return changed, err
