@@ -183,3 +183,26 @@
 - **Reversible:** yes — the option is additive and null restores the old
   layout; migration is a move, so pointing the config back moves nothing
   (the content stays where it was put).
+
+## 2026-10-07 — storageDir defaults to <dataDir>/storage; "" is the old layout
+
+- **Decision:** an absent `storageDir` no longer means "content at the mount
+  path" — it means the default, `<dataDir>/storage` (group override still
+  wins). The original layout is reachable by setting `storageDir` to the
+  empty string explicitly, which is how the pre-storage tests pin their
+  behaviour and how anyone keeps a replica's content at the mount. The
+  NixOS module computes the same default, so the sandbox grants exactly the
+  path the daemon writes.
+- **Why:** user direction — "the storageDir path has a sane default". With
+  roots of the form `<storageDir>/<folder>`, nesting stops mattering by
+  default, and content lands where the config says; the explicit "" keeps a
+  supported escape hatch instead of a silent behaviour switch.
+- **Also fixed:** `Load` decoded into `Default()`, so a config that declared
+  its own `dataDir` still got the XDG-based storage default. Defaults are now
+  computed after decoding, from what the file actually says.
+- **Migration note:** with the default in place, every existing folder whose
+  content sits at its mount path migrates into `<dataDir>/storage/<folder>`
+  on the next transition (rename when the filesystems match, otherwise a
+  copy), and the mount path becomes a symlink. Documented in README/DESIGN.
+- **Reversible:** yes — the option is additive; moving content back is a
+  move, and the mount can be pointed anywhere.

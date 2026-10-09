@@ -68,6 +68,7 @@ cat >"$config" <<EOF
   "configVersion": 1,
   "dataDir": "$work/data",
   "socket": "$socket",
+  "storageDir": "",
   "peer": "laptop",
   "peers": {
     "laptop": { "endpoints": ["127.0.0.1:42421"] },
@@ -129,6 +130,7 @@ cat >"$config2" <<EOF
   "configVersion": 1,
   "dataDir": "$work/data2",
   "socket": "$socket2",
+  "storageDir": "",
   "peer": "desktop",
   "peers": {
     "laptop": { "endpoints": ["127.0.0.1:42421"] },

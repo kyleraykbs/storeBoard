@@ -47,10 +47,11 @@ Strict JSON; unknown keys are an error. The model, in full in
 - `storageDir` — where folder *content* lives (this machine, overridable per
   group): each folder's root becomes `<storageDir>/<folder>` and its mount
   path is a symlink to it, so the mount may sit anywhere and no two folders
-  can index the same bytes. Files already at a mount path are migrated in on
-  the next transition (nothing is overwritten; an interrupted migration
-  resumes). Absent (the default) keeps the original layout, where a
-  replica's content is the mount directory itself.
+  can index the same bytes. The default is `<dataDir>/storage`; an explicit
+  empty string restores the original layout, where a replica's content is
+  the mount directory itself. Files already at a mount path are migrated in
+  on the next transition (nothing is overwritten; an interrupted migration
+  resumes).
 - everything the daemon stores (store, journal, index) lives under the one
   `dataDir`.
 - Two folders on one identical mount are rejected; *nested* mounts (a pool

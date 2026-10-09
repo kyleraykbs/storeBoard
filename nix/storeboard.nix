@@ -57,18 +57,24 @@ let
     ) g.folders
   ) cfg.groups;
 
-  # Folder name → storage directory, when one is configured: the group's
-  # override, else the machine's. Empty means the original layout.
+  # Folder name → storage directory: the group's override, else the
+  # machine's, else the default under dataDir — the same resolution the
+  # daemon applies, so the sandbox grants exactly what it writes. An
+  # explicit empty string is the original layout (content at the mount).
   storageDirs = lib.concatMapAttrs (
     _: g:
     lib.mapAttrs (
       fname: _:
-      if g.storageDir != null then
-        "${g.storageDir}/${fname}"
-      else if cfg.storageDir != null then
-        "${cfg.storageDir}/${fname}"
+      let
+        group = g.storageDir;
+        machine = cfg.storageDir;
+      in
+      if group != null then
+        (if group == "" then "" else "${group}/${fname}")
+      else if machine != null then
+        (if machine == "" then "" else "${machine}/${fname}")
       else
-        ""
+        "${cfg.dataDir}/storage/${fname}"
     ) g.folders
   ) cfg.groups;
 

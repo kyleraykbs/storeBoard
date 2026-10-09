@@ -21,11 +21,15 @@ import (
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
+	// Old layout (content at the mount path): most tests predate the storage
+	// directory and assert exactly that; storage-backed tests set their own.
+	noStorage := ""
 	return &config.Config{
 		ConfigVersion: config.ConfigVersion,
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "storeboard.sock"),
 		Peer:          "laptop",
+		StorageDir:    &noStorage,
 		Peers: map[string]config.Peer{
 			"laptop":  {Endpoints: []string{"192.168.1.10:4242"}},
 			"desktop": {Endpoints: []string{"192.168.1.11:4242"}},

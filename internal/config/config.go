@@ -139,11 +139,12 @@ type Config struct {
 	// each folder's root becomes <storageDir>/<folder> and the mount path is
 	// a symlink to it, so content and mount point are independent — the
 	// mount can sit anywhere, and no two folders can index the same bytes.
-	// Empty (the default) keeps the original layout: a replica's content at
-	// the mount path itself, a streamed folder's under the data directory.
-	// A group may override it per group; a folder with content at its mount
-	// path is migrated into the storage directory on the next transition.
-	StorageDir string `json:"storageDir,omitempty"`
+	// Absent or null takes the default, <dataDir>/storage; an explicit empty
+	// string restores the original layout (a replica's content at the mount
+	// path itself, a streamed folder's under the data directory). A group
+	// may override it per group; a folder with content at its mount path is
+	// migrated into the storage directory on the next transition.
+	StorageDir *string `json:"storageDir,omitempty"`
 
 	// Permissions overrides, per folder on THIS machine, the ownership and
 	// mode the daemon gives the folder's entries. Fields left empty fall
@@ -162,11 +163,16 @@ type Config struct {
 
 // Default returns the built-in configuration with the XDG defaults filled in.
 func Default() *Config {
-	return &Config{
+	cfg := &Config{
 		ConfigVersion: ConfigVersion,
 		DataDir:       DefaultDataDir(),
 		Socket:        DefaultSocketPath(),
 	}
+	if cfg.DataDir != "" {
+		def := DefaultStorageDir(cfg.DataDir)
+		cfg.StorageDir = &def
+	}
+	return cfg
 }
 
 // DefaultPath is $XDG_CONFIG_HOME/storeboard/config.json. It is empty when no
@@ -265,7 +271,10 @@ func Load(path string) (*Config, error) {
 	}
 	defer f.Close()
 
-	cfg := Default()
+	// Decode into an empty config, not Default(): every default that depends
+	// on another field (storageDir under dataDir, above all) has to be
+	// computed from what the file actually says, not from the XDG guess.
+	cfg := &Config{ConfigVersion: ConfigVersion}
 	dec := json.NewDecoder(f)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
@@ -282,6 +291,13 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Socket == "" {
 		cfg.Socket = DefaultSocketPath()
+	}
+	// storageDir is a pointer so a file can distinguish three cases: absent
+	// (the default under dataDir), empty (content at the mount path), and a
+	// path.
+	if cfg.StorageDir == nil && cfg.DataDir != "" {
+		def := DefaultStorageDir(cfg.DataDir)
+		cfg.StorageDir = &def
 	}
 
 	// Maps decode into whatever the file leaves behind (or nil when absent);
@@ -432,8 +448,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("group %q storageDir %q must be absolute", name, *g.StorageDir)
 		}
 	}
-	if c.StorageDir != "" && !filepath.IsAbs(c.StorageDir) {
-		return fmt.Errorf("storageDir %q must be absolute", c.StorageDir)
+	if c.StorageDir != nil && *c.StorageDir != "" && !filepath.IsAbs(*c.StorageDir) {
+		return fmt.Errorf("storageDir %q must be absolute (or empty for content at the mount path)", *c.StorageDir)
 	}
 
 	// Two folders on one identical path stay an error: there is no reading
@@ -500,15 +516,27 @@ func contains(outer, inner string) bool {
 	return strings.HasPrefix(inner[len(outer):], "/")
 }
 
+// DefaultStorageDir is where folder content lives when nothing else says:
+// inside the one storage directory, so a fresh install keeps everything it
+// owns in one place. A config that wants the original layout (content at the
+// mount path) sets storageDir to the empty string explicitly.
+func DefaultStorageDir(dataDir string) string {
+	return filepath.Join(dataDir, "storage")
+}
+
 // StorageFor is a folder's content directory when the config puts content in
 // a storage directory: the group's storageDir if declared, else the
-// machine's. Empty means the original layout — content at the mount path
-// (replicas) or under the data directory (streamed).
+// machine's, else the default under the data directory. Empty means the
+// original layout — content at the mount path (replicas) or under the data
+// directory (streamed) — which is what an explicit empty storageDir asks for.
 func (c *Config) StorageFor(folder, group string) string {
 	if g, ok := c.Groups[group]; ok && g.StorageDir != nil {
 		return *g.StorageDir
 	}
-	return c.StorageDir
+	if c.StorageDir != nil {
+		return *c.StorageDir
+	}
+	return DefaultStorageDir(c.DataDir)
 }
 
 // FolderRoot is where a folder's content lives on this machine: under its

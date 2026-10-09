@@ -86,11 +86,15 @@ func (n *node) stop() {
 func mkNode(t *testing.T, name, other, epSelf, epOther, mount string, docsKeep bool) *node {
 	t.Helper()
 	dir := t.TempDir()
+	// Old layout: these tests pin content at the mount path, which an empty
+	// storageDir asks for; the default is a storage directory under dataDir.
+	noStorage := ""
 	cfg := &config.Config{
 		ConfigVersion: config.ConfigVersion,
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "s.sock"),
 		Peer:          name,
+		StorageDir:    &noStorage,
 		Peers: map[string]config.Peer{
 			name:  {Endpoints: []string{epSelf}},
 			other: {Endpoints: []string{epOther}},
@@ -949,7 +953,7 @@ func mkStorageNode(t *testing.T, name, other, epSelf, epOther, mount, storage st
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "s.sock"),
 		Peer:          name,
-		StorageDir:    storage,
+		StorageDir:    &storage,
 		Peers: map[string]config.Peer{
 			name:  {Endpoints: []string{epSelf}},
 			other: {Endpoints: []string{epOther}},

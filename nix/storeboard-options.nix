@@ -168,11 +168,12 @@ rec {
       Where folder content lives on this machine: each folder's root becomes
       `<storageDir>/<folder>` and its mount path is a symlink to it, so
       content and mount point are independent — the mount may sit anywhere
-      and no two folders can index the same bytes. Null (the default) keeps
-      the original layout: a replica's content at the mount path itself, a
-      streamed folder's under the data directory. Content already at a
-      mount path is migrated into the storage directory on the next
-      transition. A group may override it with `groups.<name>.storageDir`.
+      and no two folders can index the same bytes. Null (the default) means
+      `<dataDir>/storage`; the empty string restores the original layout
+      (a replica's content at the mount path itself, a streamed folder's
+      under the data directory). Content already at a mount path is migrated
+      into the storage directory on the next transition. A group may override
+      it with `groups.<name>.storageDir`.
     '';
   };
 

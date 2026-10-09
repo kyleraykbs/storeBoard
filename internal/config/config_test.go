@@ -478,11 +478,15 @@ func TestParseMode(t *testing.T) {
 }
 
 func TestNestedMountsWarnAndDuplicatesFail(t *testing.T) {
+	// An empty storageDir is the original layout: content at the mount path,
+	// roots can nest. The default (a storage directory) makes them disjoint,
+	// which the second half of this test pins.
 	base := `{
   "configVersion": 1,
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
   "socket": "/run/storeboard.sock",
+  "storageDir": "",
   "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "pool": {}, "other": {}}}},
   "mounts": %s
 }`
@@ -549,8 +553,10 @@ func TestStorageDirResolution(t *testing.T) {
 		}
 	}
 
-	// No storageDir anywhere: the original layout.
+	// An explicit empty storageDir is the original layout: content at
+	// the mount path.
 	path = writeConfig(t, `{
+  "storageDir": "",
   "configVersion": 1,
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
@@ -591,5 +597,28 @@ func TestStorageDirResolution(t *testing.T) {
 }`)
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "must be absolute") {
 		t.Fatalf("err = %v, want a relative storageDir rejected", err)
+	}
+}
+
+// The default is a storage directory: roots are then <storageDir>/<folder>,
+// disjoint by construction, so mounts may nest without costing anything.
+func TestDefaultStorageMakesRootsDisjoint(t *testing.T) {
+	path := writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "pool": {}}}},
+  "mounts": {"docs": "/mainpool/kyle/docs", "pool": "/mainpool"}
+}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.FolderRoot("docs", "family"), "/var/lib/storeboard/storage/docs"; got != want {
+		t.Errorf("docs root = %q, want the default storage %q", got, want)
+	}
+	if w := cfg.Warnings(); len(w) != 0 {
+		t.Errorf("storage-backed roots warned: %v", w)
 	}
 }
