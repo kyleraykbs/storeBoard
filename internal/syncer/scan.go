@@ -126,6 +126,16 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 		if ent.Deleted || seen[ent.Path] {
 			continue
 		}
+		// An entry whose blob this machine does not hold was never
+		// materialised here — it is known from the mesh (an index that
+		// arrived before its blobs, or a root that moved before its content
+		// did). Its absence from the walk says nothing, and tombstoning it
+		// would delete the content everywhere: the 448-file incident on
+		// amanita was exactly this, an empty storage root scanned against a
+		// journal full of entries.
+		if ent.Blob != "" && !e.store.Has(ent.Blob) {
+			continue
+		}
 		tomb := ent.clone()
 		tomb.Deleted = true
 		tomb.Blob = ""

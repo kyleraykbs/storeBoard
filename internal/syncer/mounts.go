@@ -215,6 +215,27 @@ func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
 	ensureTraversable(e.dataDir, fs.storage)
 	e.applyDir(fs, fs.storage)
 
+	// Content left in the legacy view directory (dataDir/views/<folder>,
+	// where streamed content lived before storage directories existed) moves
+	// into the storage directory whatever the mount points at: a folder that
+	// was detached at upgrade time would otherwise start with an empty
+	// storage root and a full journal.
+	if legacy := e.legacyViewDir(fs); legacy != fs.storage {
+		if _, err := os.Stat(legacy); err == nil {
+			moved, err := e.moveEntries(fs, legacy, fs.storage)
+			if err != nil {
+				return moved, err
+			}
+			if moved > 0 {
+				e.logger.Info("moved the legacy view into the storage directory",
+					"folder", fs.name, "from", legacy, "to", fs.storage, "moved", moved)
+			}
+			if rest, _ := os.ReadDir(legacy); len(rest) == 0 {
+				_ = os.Remove(legacy)
+			}
+		}
+	}
+
 	// Nothing to migrate when the mount is already our symlink. The legacy
 	// view directory (dataDir/views/<folder>, where streamed content lived
 	// before storage directories existed) counts as ours: its content moves
@@ -232,18 +253,15 @@ func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
 			return 0, nil
 		}
 		if target == e.legacyViewDir(fs) {
-			// moveEntries parks collisions, so this merges when the storage
-			// directory already holds content rather than replacing.
-			if err := e.moveLegacyView(fs, target); err != nil {
-				return 0, err
-			}
+			// The content already moved above; here the stale symlink gives
+			// way to the storage root.
 			_ = os.Remove(target)
 			if err := symlinkSwap(fs.mount, fs.storage); err != nil {
 				return 0, err
 			}
 			e.chownLink(fs, fs.mount)
-			e.logger.Info("moved the legacy view into the storage directory",
-				"folder", fs.name, "from", target, "to", fs.storage)
+			e.logger.Info("mount path now points at the storage root (was the legacy view)",
+				"folder", fs.name, "path", fs.mount, "storage", fs.storage)
 			return 0, nil
 		}
 		// A symlink we did not make: not ours to reorganize.
@@ -603,14 +621,4 @@ func (e *Engine) ensureMountParent(fs *FolderState) error {
 // onto it.
 func (e *Engine) legacyViewDir(fs *FolderState) string {
 	return filepath.Join(e.dataDir, "views", fs.name)
-}
-
-// moveLegacyView moves the legacy view's content into the storage directory
-// (entry by entry, never overwriting — same rules as any migration).
-func (e *Engine) moveLegacyView(fs *FolderState, legacy string) error {
-	if _, err := os.Stat(legacy); err != nil {
-		return nil
-	}
-	_, err := e.moveEntries(fs, legacy, fs.storage)
-	return err
 }

@@ -1217,3 +1217,92 @@ func TestStorageMountRefusesForeignSymlink(t *testing.T) {
 		t.Fatalf("foreign symlink was replaced: %q (%v)", target, err)
 	}
 }
+
+// The incident: an empty view scanned against a journal full of entries from
+// the mesh. An entry whose blob this machine never held must not be
+// tombstoned — its absence says nothing — while a real local deletion (blob
+// held, file gone) still tombstones.
+func TestScanNeverTombstonesUnmaterialisedEntries(t *testing.T) {
+	storage := t.TempDir()
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", filepath.Join(t.TempDir(), "remote-docs"), storage, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	// Known from the mesh, never fetched: the blob is not in the store.
+	unknown := &Entry{Path: "from-the-mesh.txt", Blob: strings.Repeat("ab", 32), Size: 10, MTime: time.Now().UnixNano(), VV: map[string]uint64{"a": 1}}
+	if err := fs.db.Put(unknown); err != nil {
+		t.Fatal(err)
+	}
+
+	// Materialised once (blob in the store), then deleted on disk.
+	f, err := n.eng.store.Temp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("was here")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.SumFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.eng.store.Adopt(f.Name(), sum); err != nil {
+		t.Fatal(err)
+	}
+	local := &Entry{Path: "was-here.txt", Blob: sum, Size: 8, MTime: time.Now().UnixNano(), VV: map[string]uint64{"b": 1}}
+	if err := fs.db.Put(local); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := n.eng.scan(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.db.Get("from-the-mesh.txt"); got == nil || got.Deleted {
+		t.Fatalf("unmaterialised entry tombstoned: %+v", got)
+	}
+	if got := fs.db.Get("was-here.txt"); got == nil || !got.Deleted {
+		t.Fatalf("real local deletion not tombstoned: %+v", got)
+	}
+	for _, e := range changed {
+		if e.Path == "from-the-mesh.txt" {
+			t.Fatalf("tombstone broadcast for an unmaterialised entry: %+v", e)
+		}
+	}
+}
+
+// Upgrade with the mount on the scratchpad (the folder was detached): the
+// legacy view's content still moves into the storage directory, so the new
+// root starts with the folder's content instead of empty.
+func TestLegacyViewMovesWhileDetached(t *testing.T) {
+	storage := t.TempDir()
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, false)
+	fs := n.eng.folders[0]
+
+	legacy := filepath.Join(n.cfg.DataDir, "views", "docs")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(legacy, "old.txt"), "materialised before storage", time.Now())
+	scratch := n.eng.detachedDir(fs)
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(scratch, mount); err != nil { // detached at upgrade time
+		t.Fatal(err)
+	}
+
+	n.eng.prepare(fs)
+
+	if got := readFile(t, filepath.Join(storage, "docs", "old.txt")); got != "materialised before storage" {
+		t.Fatalf("legacy content not moved while detached: %q", got)
+	}
+	if target, err := os.Readlink(mount); err != nil || target != filepath.Join(storage, "docs") {
+		t.Fatalf("mount = %q (%v), want the storage root", target, err)
+	}
+}
