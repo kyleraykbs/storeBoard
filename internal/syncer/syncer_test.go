@@ -1082,3 +1082,42 @@ func TestStorageBackedStreamedMergesOnReconnect(t *testing.T) {
 		t.Fatalf("client storage content = %q", got)
 	}
 }
+
+// The upgrade path: a streamed folder whose mount still points at the legacy
+// view directory (dataDir/views/<folder>) moves its content into the storage
+// directory and swaps the symlink, instead of going busy on a symlink it no
+// longer recognizes.
+func TestLegacyViewMigratesIntoStorage(t *testing.T) {
+	storage := t.TempDir()
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, false)
+	fs := n.eng.folders[0]
+
+	// Recreate the pre-storage layout by hand: content in dataDir/views/docs,
+	// the mount a symlink onto it.
+	legacy := filepath.Join(n.cfg.DataDir, "views", "docs")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(legacy, "old.txt"), "from the legacy view", time.Now())
+	if err := os.Symlink(legacy, mount); err != nil {
+		t.Fatal(err)
+	}
+
+	n.eng.prepare(fs)
+
+	want := filepath.Join(storage, "docs")
+	if got := readFile(t, filepath.Join(want, "old.txt")); got != "from the legacy view" {
+		t.Fatalf("legacy content not migrated: %q", got)
+	}
+	if target, err := os.Readlink(mount); err != nil || target != want {
+		t.Fatalf("mount = %q (%v), want a symlink to the storage root %q", target, err, want)
+	}
+	if s := n.eng.Snapshot()[0]; s.State != stateAttached || s.Root != want {
+		t.Fatalf("state/root = %q/%q, want attached/%q", s.State, s.Root, want)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("legacy view still present: %v", err)
+	}
+}
