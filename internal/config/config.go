@@ -417,27 +417,43 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Effective mounts must not overlap: a folder whose mount contains
-	// another's makes the same bytes two folders' business on the machine
-	// that holds both — double scans and broadcasts, two writers for one
-	// path, and a replica scan that copies the whole outer tree into the
-	// content store. Ambiguity about what syncs where is exactly what this
-	// config model exists to prevent (DESIGN invariant 12).
+	// Two folders on one identical path stay an error: there is no reading
+	// of that shape where the outcome is defined. Nested mounts, in
+	// contrast, are a deliberate tradeoff (a pool root plus the subtrees
+	// other machines stream) — those are warnings, see Warnings.
 	folders := c.Folders()
 	for i, a := range folders {
 		for _, b := range folders[i+1:] {
-			switch {
-			case a.Mount == b.Mount:
+			if a.Mount == b.Mount {
 				return fmt.Errorf("folders %q and %q both mount %s: one path cannot be two folders", a.Name, b.Name, a.Mount)
-			case contains(a.Mount, b.Mount):
-				return fmt.Errorf("folder %q mounts %s, which contains %s (folder %q): nested mounts double every file — give one of them its own group, or drop the outer folder", a.Name, a.Mount, b.Mount, b.Name)
-			case contains(b.Mount, a.Mount):
-				return fmt.Errorf("folder %q mounts %s, which contains %s (folder %q): nested mounts double every file — give one of them its own group, or drop the outer folder", b.Name, b.Mount, a.Mount, a.Name)
 			}
 		}
 	}
 
 	return nil
+}
+
+// Warnings reports shapes that are legal but cost something: today, mounts
+// that nest. A nested mount converges — the holder's filesystem mediates,
+// every write is temp-file-then-rename, content is content-addressed — but
+// the machine that holds both indexes the same files twice (two journals,
+// two scans, two broadcasts, two writers per path) and its content store
+// takes a copy of the outer tree. The daemon logs these at startup and
+// `config check` prints them, so the cost is chosen, not discovered.
+func (c *Config) Warnings() []string {
+	var out []string
+	folders := c.Folders()
+	for i, a := range folders {
+		for _, b := range folders[i+1:] {
+			switch {
+			case contains(a.Mount, b.Mount):
+				out = append(out, fmt.Sprintf("folder %q mounts %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", a.Name, a.Mount, b.Mount, b.Name))
+			case contains(b.Mount, a.Mount):
+				out = append(out, fmt.Sprintf("folder %q mounts %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", b.Name, b.Mount, a.Mount, a.Name))
+			}
+		}
+	}
+	return out
 }
 
 // contains reports whether outer is a proper ancestor directory of inner.

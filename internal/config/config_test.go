@@ -477,7 +477,7 @@ func TestParseMode(t *testing.T) {
 	}
 }
 
-func TestNestedMountsAreRejected(t *testing.T) {
+func TestNestedMountsWarnAndDuplicatesFail(t *testing.T) {
 	base := `{
   "configVersion": 1,
   "peer": "laptop",
@@ -487,9 +487,13 @@ func TestNestedMountsAreRejected(t *testing.T) {
   "mounts": %s
 }`
 	path := writeConfig(t, fmt.Sprintf(base, `{"docs": "/mainpool/kyle/docs", "pool": "/mainpool", "other": "/srv/other"}`))
-	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "nested mounts") {
-		t.Fatalf("err = %v, want nested mounts rejected", err)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("nested mounts are a deliberate tradeoff, not an error: %v", err)
+	}
+	warns := cfg.Warnings()
+	if len(warns) != 1 || !strings.Contains(warns[0], "nested") && !strings.Contains(warns[0], "contains") {
+		t.Fatalf("warnings = %v, want one about the nesting", warns)
 	}
 
 	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs", "other": "/srv/other"}`))
@@ -500,7 +504,11 @@ func TestNestedMountsAreRejected(t *testing.T) {
 
 	// Siblings that merely share a prefix are not nesting.
 	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs-archive", "other": "/srv/other"}`))
-	if _, err := Load(path); err != nil {
+	sib, err := Load(path)
+	if err != nil {
 		t.Fatalf("sibling mounts rejected: %v", err)
+	}
+	if w := sib.Warnings(); len(w) != 0 {
+		t.Fatalf("siblings warned: %v", w)
 	}
 }

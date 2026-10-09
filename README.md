@@ -44,8 +44,14 @@ Strict JSON; unknown keys are an error. The model, in full in
   exactly like the directory containing it; `{"user": "kyle"}` on a folder
   whose parent is root-owned is the common override. Modes are directories
   only — files keep the mode they were synced with.
-- everything the daemon stores (store, journal, index) lives under the one
+(- everything the daemon stores (store, journal, index) lives under the one
   `dataDir`.
+- Two folders on one identical mount are rejected; *nested* mounts (a pool
+  root plus subtrees other machines stream) are allowed but warned about by
+  `config check` and at daemon startup, because the machine holding both
+  indexes those files twice and keeps a copy of the outer tree in its store.
+  A folder only some devices should carry is scoped with the tag's
+  `folders.<f>.devices`.
 
 Validate any file with:
 

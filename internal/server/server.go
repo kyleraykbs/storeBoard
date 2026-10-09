@@ -88,6 +88,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		ln.Close()
 		return nil, fmt.Errorf("sync engine: %w", err)
 	}
+	for _, w := range cfg.Warnings() {
+		logger.Warn("config warning", "detail", w)
+	}
 
 	s := &Server{
 		cfg:       cfg,

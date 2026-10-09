@@ -110,14 +110,15 @@ func versionCmd(args []string, stdout, stderr io.Writer) error {
 // well-formed document — "valid": false plus the error — so the command is
 // scriptable in both directions.
 type checkReport struct {
-	Path    string        `json:"path"`
-	Valid   bool          `json:"valid"`
-	Error   string        `json:"error,omitempty"`
-	Socket  string        `json:"socket,omitempty"`
-	Peer    string        `json:"peer,omitempty"`
-	Peers   []string      `json:"peers,omitempty"`
-	Groups  []string      `json:"groups,omitempty"`
-	Folders []checkFolder `json:"folders,omitempty"`
+	Path     string        `json:"path"`
+	Valid    bool          `json:"valid"`
+	Error    string        `json:"error,omitempty"`
+	Warnings []string      `json:"warnings,omitempty"`
+	Socket   string        `json:"socket,omitempty"`
+	Peer     string        `json:"peer,omitempty"`
+	Peers    []string      `json:"peers,omitempty"`
+	Groups   []string      `json:"groups,omitempty"`
+	Folders  []checkFolder `json:"folders,omitempty"`
 }
 
 type checkFolder struct {
@@ -169,6 +170,7 @@ func configCheck(configPath string, args []string, stdout, stderr io.Writer) err
 	report.Valid = true
 	report.Socket = cfg.Socket
 	report.Peer = cfg.Peer
+	report.Warnings = cfg.Warnings()
 	for _, p := range cfg.PeerList() {
 		report.Peers = append(report.Peers, p.Name)
 	}
@@ -184,6 +186,9 @@ func configCheck(configPath string, args []string, stdout, stderr io.Writer) err
 		return writeJSON(stdout, report)
 	}
 	fmt.Fprintf(stdout, "config OK: %s (%d folders)\n", path, len(folders))
+	for _, w := range report.Warnings {
+		fmt.Fprintf(stdout, "warning: %s\n", w)
+	}
 	return nil
 }
 

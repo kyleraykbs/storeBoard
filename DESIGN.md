@@ -53,13 +53,14 @@ one, it changes here first, deliberately, with a decision log entry.
 12. Every folder resolves to exactly one local mount point through a fixed
     precedence — local override, group default, then inside the one
     storage directory — and the config names its owner group, so no path
-    is ever ambiguous about what syncs there. No folder's mount may contain
-    another's (or equal it): a nested mount makes the same bytes two
-    folders' business on the machine that holds both — duplicate scans and
-    broadcasts, two writers for one path, and a replica scan that copies
-    the outer tree into the content store. `config check` rejects both
-    shapes. A folder that only its holder should carry is restricted to
-    that device in the tag's `folders.<f>.devices`.
+    is ever ambiguous about what syncs there. Two folders on one identical
+    mount are an error; nested mounts (a pool root plus the subtrees other
+    machines stream) are allowed but warned about, because the machine
+    holding both indexes those files twice and keeps a copy of the outer
+    tree in its content store — `config check` prints the warning, the
+    daemon logs it at startup, and the cost is therefore chosen rather than
+    discovered. A folder that only some devices should carry is restricted
+    with the tag's `folders.<f>.devices`.
 13. Remote (streamed) folders never dangle. While a holder is reachable the
     folder mounts live; when none is, the mount point is replaced by an
     empty dummy dir — nothing in the mount table ever points at nothing
