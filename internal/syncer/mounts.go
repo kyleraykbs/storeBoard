@@ -129,6 +129,7 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 		info, serr := os.Lstat(fs.mount)
 		switch {
 		case os.IsNotExist(serr):
+			e.logger.Info("mount path is not present yet; creating the view link", "folder", fs.name, "path", fs.mount)
 			// A fresh machine: the path simply is not there yet — and
 			// neither, quite possibly, is the directory it belongs in (a
 			// declaration like ~/remote/Videos on a machine that never had
@@ -220,7 +221,14 @@ func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
 	// into the storage directory and the symlink is replaced.
 	if target, err := os.Readlink(fs.mount); err == nil {
 		switch target {
-		case fs.storage, e.detachedDir(fs):
+		case fs.storage:
+			// The steady state. Logged once per start so the journal says
+			// what was found, not only what was changed — the question
+			// "where did that content go" deserves an answer from the log.
+			e.logger.Info("mount path already points at the storage root", "folder", fs.name, "path", fs.mount, "storage", fs.storage)
+			return 0, nil
+		case e.detachedDir(fs):
+			e.logger.Info("mount path points at the offline scratchpad", "folder", fs.name, "path", fs.mount, "scratchpad", target)
 			return 0, nil
 		}
 		if target == e.legacyViewDir(fs) {
@@ -247,6 +255,7 @@ func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
 	info, err := os.Lstat(fs.mount)
 	if err != nil {
 		if os.IsNotExist(err) {
+			e.logger.Info("mount path is not present yet", "folder", fs.name, "path", fs.mount, "storage", fs.storage)
 			return 0, nil // nothing there: the symlink is the only thing to add
 		}
 		return 0, err
