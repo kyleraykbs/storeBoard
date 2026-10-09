@@ -35,9 +35,13 @@ func (e *Engine) resolvePerms(fs *FolderState) perms {
 	// The directory the mount lives in is the reference: for a streamed
 	// folder that is the parent of the symlink (the user-facing directory
 	// full of siblings); for a replica it is the folder itself, because
-	// that directory IS the user's.
+	// that directory IS the user's — and for a storage-backed folder it is
+	// the storage directory, since the content lives there.
 	probe := fs.mount
-	if fs.streamed {
+	switch {
+	case fs.storage != "":
+		probe = filepath.Dir(fs.storage)
+	case fs.streamed:
 		probe = filepath.Dir(fs.mount)
 	}
 	p := noPerms()

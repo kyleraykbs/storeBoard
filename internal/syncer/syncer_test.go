@@ -938,3 +938,143 @@ func TestStreamedMountCreatesItsPath(t *testing.T) {
 		t.Fatalf("content through the mount = %q", got)
 	}
 }
+
+// mkStorageNode is mkNode with a storage directory: the folder's content
+// lives in <storage>/docs and its mount path is a view onto that.
+func mkStorageNode(t *testing.T, name, other, epSelf, epOther, mount, storage string, docsKeep bool) *node {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &config.Config{
+		ConfigVersion: config.ConfigVersion,
+		DataDir:       filepath.Join(dir, "data"),
+		Socket:        filepath.Join(dir, "s.sock"),
+		Peer:          name,
+		StorageDir:    storage,
+		Peers: map[string]config.Peer{
+			name:  {Endpoints: []string{epSelf}},
+			other: {Endpoints: []string{epOther}},
+		},
+		Groups: map[string]config.Group{
+			"g": {
+				Peers:   []string{name, other},
+				Folders: map[string]config.GroupFolder{"docs": {Mount: mount}},
+			},
+		},
+		Mounts:      map[string]string{"docs": mount},
+		KeepOffline: map[string]bool{"docs": docsKeep},
+	}
+	eng, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &node{t: t, name: name, dir: dir, cfg: cfg, eng: eng}
+}
+
+// A replica with a storage directory keeps its content there and shows it
+// through the mount: content and mount point are independent.
+func TestStorageBackedReplica(t *testing.T) {
+	storage := t.TempDir()
+	mount := filepath.Join(t.TempDir(), "docs")
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	snap := n.eng.Snapshot()[0]
+	want := filepath.Join(storage, "docs")
+	if snap.State != stateReplica || snap.Root != want {
+		t.Fatalf("state/root = %q/%q, want replica/%q", snap.State, snap.Root, want)
+	}
+	target, err := os.Readlink(mount)
+	if err != nil || target != want {
+		t.Fatalf("mount = %q (%v), want a symlink to %q", target, err, want)
+	}
+
+	writeFile(t, filepath.Join(mount, "note.txt"), "through the mount", time.Now())
+	if got := readFile(t, filepath.Join(want, "note.txt")); got != "through the mount" {
+		t.Fatalf("content in storage = %q", got)
+	}
+	// The scanner indexes the storage root, not the mount.
+	changed, err := n.eng.scan(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0].Path != "note.txt" {
+		t.Fatalf("scan changed = %+v, want note.txt from the storage root", changed)
+	}
+}
+
+// Declaring a storage directory over a folder whose files are still at the
+// mount path migrates them: entry by entry, never overwriting, and running
+// again is a no-op.
+func TestStorageMigrationFromMountPath(t *testing.T) {
+	storage := t.TempDir()
+	mount := filepath.Join(t.TempDir(), "docs")
+	if err := os.MkdirAll(filepath.Join(mount, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(mount, "keep.txt"), "keep me", time.Now())
+	writeFile(t, filepath.Join(mount, "sub", "deep.txt"), "deeper", time.Now())
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	want := filepath.Join(storage, "docs")
+	if got := readFile(t, filepath.Join(want, "keep.txt")); got != "keep me" {
+		t.Fatalf("migrated content = %q", got)
+	}
+	if got := readFile(t, filepath.Join(want, "sub", "deep.txt")); got != "deeper" {
+		t.Fatalf("migrated nested content = %q", got)
+	}
+	if target, err := os.Readlink(mount); err != nil || target != want {
+		t.Fatalf("mount after migration = %q (%v), want a symlink to %q", target, err, want)
+	}
+	if fi, err := os.Stat(filepath.Join(want, "keep.txt")); err != nil || fi.IsDir() {
+		t.Fatalf("migrated file is gone: %v %v", fi, err)
+	}
+
+	// Idempotent: the next transition sees the symlink and does nothing.
+	n.eng.prepare(fs)
+	if got := readFile(t, filepath.Join(want, "keep.txt")); got != "keep me" {
+		t.Fatalf("content after a second prepare = %q", got)
+	}
+	names, _ := filepath.Glob(filepath.Join(want, "*"))
+	if len(names) != 2 {
+		t.Fatalf("storage root holds %v, want exactly the two migrated entries", names)
+	}
+}
+
+// A storage-backed streamed folder works like any other: detached it is an
+// offline scratchpad, and the reconnect merges into the storage directory
+// and out to the holder.
+func TestStorageBackedStreamedMergesOnReconnect(t *testing.T) {
+	epA, epB := twoEndpoints(t)
+	holderStorage, clientStorage := t.TempDir(), t.TempDir()
+	holderMount := filepath.Join(t.TempDir(), "docs") // a view onto the storage
+	rootA := filepath.Join(holderStorage, "docs")
+	mountB := filepath.Join(t.TempDir(), "remote-docs")
+
+	holder := mkStorageNode(t, "a", "b", epA, epB, holderMount, holderStorage, true)
+	client := mkStorageNode(t, "b", "a", epB, epA, mountB, clientStorage, false)
+	writeFile(t, filepath.Join(rootA, "theirs.txt"), "from holder", time.Now())
+
+	startNode(t, client)
+	waitFor(t, testWait, "detached", func() bool {
+		return client.eng.Snapshot()[0].State == stateDetached
+	})
+	writeFile(t, filepath.Join(mountB, "mine.txt"), "offline content", time.Now())
+
+	startNode(t, holder)
+	waitFor(t, testWait, "attached and merged", func() bool {
+		return exists(filepath.Join(clientStorage, "docs", "mine.txt")) &&
+			exists(filepath.Join(clientStorage, "docs", "theirs.txt")) &&
+			exists(filepath.Join(rootA, "mine.txt"))
+	})
+	if got := readFile(t, filepath.Join(rootA, "mine.txt")); got != "offline content" {
+		t.Fatalf("holder content = %q", got)
+	}
+	if got := readFile(t, filepath.Join(clientStorage, "docs", "theirs.txt")); got != "from holder" {
+		t.Fatalf("client storage content = %q", got)
+	}
+}

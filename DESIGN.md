@@ -54,13 +54,18 @@ one, it changes here first, deliberately, with a decision log entry.
     precedence — local override, group default, then inside the one
     storage directory — and the config names its owner group, so no path
     is ever ambiguous about what syncs there. Two folders on one identical
-    mount are an error; nested mounts (a pool root plus the subtrees other
-    machines stream) are allowed but warned about, because the machine
-    holding both indexes those files twice and keeps a copy of the outer
-    tree in its content store — `config check` prints the warning, the
-    daemon logs it at startup, and the cost is therefore chosen rather than
-    discovered. A folder that only some devices should carry is restricted
-    with the tag's `folders.<f>.devices`.
+    mount are an error; a mount that equals its own storage root is an
+    error. Where content lives is independent of where it is mounted: with
+    a `storageDir` (per machine, overridable per group) a folder's root is
+    `<storageDir>/<folder>` and the mount is a symlink to it, so roots are
+    disjoint by construction and content already at a mount path is
+    migrated in on the next transition. Without one, a folder's root is its
+    mount — and folders whose roots then nest are allowed but warned about
+    (double indexing on the machine holding both, and a content-store copy
+    of the outer tree): `config check` prints it, the daemon logs it at
+    startup, so the cost is chosen rather than discovered. A folder only
+    some devices should carry is restricted with the tag's
+    `folders.<f>.devices`.
 13. Remote (streamed) folders never dangle. While a holder is reachable the
     folder mounts live; when none is, the mount point is replaced by an
     empty dummy dir — nothing in the mount table ever points at nothing

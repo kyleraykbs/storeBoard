@@ -36,10 +36,13 @@ type Group struct {
 // machine holds a full local replica that works offline; false means the
 // folder is streamed from a holder — mounted live while one is reachable,
 // replaced by an empty dummy dir when none is, and remerged on reconnect.
+// Storage, when set, is where the content actually lives: the mount is then
+// a symlink to it, and content and mount point are independent.
 type Folder struct {
 	Name        string `json:"name"`
 	Group       string `json:"group"`
 	Mount       string `json:"mount"`
+	Storage     string `json:"storage,omitempty"`
 	KeepOffline bool   `json:"keepOffline"`
 }
 

@@ -53,6 +53,9 @@ type Group struct {
 	// Permissions is the group's default ownership and mode for its
 	// folders; a per-folder entry on a machine overrides it field by field.
 	Permissions *Permissions `json:"permissions,omitempty"`
+	// StorageDir overrides the machine's storageDir for this group's
+	// folders. Absent falls back to the top-level one.
+	StorageDir *string `json:"storageDir,omitempty"`
 }
 
 // Permissions is the ownership and mode the daemon gives the entries it
@@ -131,6 +134,16 @@ type Config struct {
 
 	// Mounts overrides a group folder's default mount on THIS machine.
 	Mounts map[string]string `json:"mounts"`
+
+	// StorageDir, when set, is where folder content lives on this machine:
+	// each folder's root becomes <storageDir>/<folder> and the mount path is
+	// a symlink to it, so content and mount point are independent — the
+	// mount can sit anywhere, and no two folders can index the same bytes.
+	// Empty (the default) keeps the original layout: a replica's content at
+	// the mount path itself, a streamed folder's under the data directory.
+	// A group may override it per group; a folder with content at its mount
+	// path is migrated into the storage directory on the next transition.
+	StorageDir string `json:"storageDir,omitempty"`
 
 	// Permissions overrides, per folder on THIS machine, the ownership and
 	// mode the daemon gives the folder's entries. Fields left empty fall
@@ -415,6 +428,12 @@ func (c *Config) Validate() error {
 		if err := g.Permissions.Validate(fmt.Sprintf("group %s permissions", name)); err != nil {
 			return err
 		}
+		if g.StorageDir != nil && !filepath.IsAbs(*g.StorageDir) {
+			return fmt.Errorf("group %q storageDir %q must be absolute", name, *g.StorageDir)
+		}
+	}
+	if c.StorageDir != "" && !filepath.IsAbs(c.StorageDir) {
+		return fmt.Errorf("storageDir %q must be absolute", c.StorageDir)
 	}
 
 	// Two folders on one identical path stay an error: there is no reading
@@ -429,27 +448,43 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// A folder whose mount is its own storage root would ask for a symlink
+	// pointing at itself.
+	for _, f := range folders {
+		if f.Storage != "" && f.Storage == f.Mount {
+			return fmt.Errorf("folder %q: mount and storage are both %s; the mount is the storage directory's view and has to be a different path", f.Name, f.Mount)
+		}
+	}
 
 	return nil
 }
 
-// Warnings reports shapes that are legal but cost something: today, mounts
-// that nest. A nested mount converges — the holder's filesystem mediates,
-// every write is temp-file-then-rename, content is content-addressed — but
-// the machine that holds both indexes the same files twice (two journals,
-// two scans, two broadcasts, two writers per path) and its content store
-// takes a copy of the outer tree. The daemon logs these at startup and
-// `config check` prints them, so the cost is chosen, not discovered.
+// Warnings reports shapes that are legal but cost something: today, folders
+// whose scan roots nest. A nested mount converges — the holder's filesystem
+// mediates, every write is temp-file-then-rename, content is
+// content-addressed — but the machine that holds both indexes the same files
+// twice (two journals, two scans, two broadcasts, two writers per path) and
+// its content store takes a copy of the outer tree. Folders backed by a
+// storage directory never warn: their roots are <storageDir>/<folder>,
+// disjoint by construction.
 func (c *Config) Warnings() []string {
+	type root struct{ name, path string }
+	var roots []root
+	for groupName, g := range c.Groups {
+		for folder := range g.Folders {
+			roots = append(roots, root{folder, c.FolderRoot(folder, groupName)})
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].name < roots[j].name })
+
 	var out []string
-	folders := c.Folders()
-	for i, a := range folders {
-		for _, b := range folders[i+1:] {
+	for i, a := range roots {
+		for _, b := range roots[i+1:] {
 			switch {
-			case contains(a.Mount, b.Mount):
-				out = append(out, fmt.Sprintf("folder %q mounts %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", a.Name, a.Mount, b.Mount, b.Name))
-			case contains(b.Mount, a.Mount):
-				out = append(out, fmt.Sprintf("folder %q mounts %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", b.Name, b.Mount, a.Mount, a.Name))
+			case contains(a.path, b.path):
+				out = append(out, fmt.Sprintf("folder %q is rooted at %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", a.name, a.path, b.path, b.name))
+			case contains(b.path, a.path):
+				out = append(out, fmt.Sprintf("folder %q is rooted at %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", b.name, b.path, a.path, a.name))
 			}
 		}
 	}
@@ -463,6 +498,39 @@ func contains(outer, inner string) bool {
 		return false
 	}
 	return strings.HasPrefix(inner[len(outer):], "/")
+}
+
+// StorageFor is a folder's content directory when the config puts content in
+// a storage directory: the group's storageDir if declared, else the
+// machine's. Empty means the original layout — content at the mount path
+// (replicas) or under the data directory (streamed).
+func (c *Config) StorageFor(folder, group string) string {
+	if g, ok := c.Groups[group]; ok && g.StorageDir != nil {
+		return *g.StorageDir
+	}
+	return c.StorageDir
+}
+
+// FolderRoot is where a folder's content lives on this machine: under its
+// storage directory when one is configured, else at its effective mount.
+func (c *Config) FolderRoot(folder, group string) string {
+	if s := c.StorageFor(folder, group); s != "" {
+		return filepath.Join(s, folder)
+	}
+	return c.FolderMount(folder, group)
+}
+
+// FolderMount is a folder's effective mount: this machine's override, else
+// the group's default, else inside the data directory.
+func (c *Config) FolderMount(folder, group string) string {
+	mount := c.Mounts[folder]
+	if mount == "" {
+		mount = c.Groups[group].Folders[folder].Mount
+	}
+	if mount == "" {
+		mount = c.DefaultMountDir(folder)
+	}
+	return mount
 }
 
 // PermissionsFor is the declared permissions for a folder: this machine's
@@ -544,26 +612,23 @@ func (c *Config) GroupList() []api.Group {
 func (c *Config) Folders() []api.Folder {
 	out := make([]api.Folder, 0, len(c.Mounts)+len(c.KeepOffline))
 	for groupName, g := range c.Groups {
-		for folder, gf := range g.Folders {
-			mount := c.Mounts[folder]
-			if mount == "" {
-				mount = gf.Mount
-			}
-			if mount == "" {
-				mount = c.DefaultMountDir(folder)
-			}
+		for folder := range g.Folders {
 			// Absent from the map means keep: a replica is the conservative
 			// default, and streaming is the opt-out.
 			keepOffline := true
 			if v, ok := c.KeepOffline[folder]; ok {
 				keepOffline = v
 			}
-			out = append(out, api.Folder{
+			f := api.Folder{
 				Name:        folder,
 				Group:       groupName,
-				Mount:       mount,
+				Mount:       c.FolderMount(folder, groupName),
 				KeepOffline: keepOffline,
-			})
+			}
+			if s := c.StorageFor(folder, groupName); s != "" {
+				f.Storage = filepath.Join(s, folder)
+			}
+			out = append(out, f)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

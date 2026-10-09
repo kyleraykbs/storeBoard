@@ -512,3 +512,84 @@ func TestNestedMountsWarnAndDuplicatesFail(t *testing.T) {
 		t.Fatalf("siblings warned: %v", w)
 	}
 }
+
+func TestStorageDirResolution(t *testing.T) {
+	base := `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "storageDir": "/srv/store",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "media": {}}, %s}},
+  "mounts": {"docs": "/mnt/docs", "media": "/mnt/media"}
+}`
+
+	// Machine storage applies to every folder; the group's override wins for
+	// its own folders only.
+	path := writeConfig(t, fmt.Sprintf(base, `"storageDir": "/pool"`))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.FolderRoot("docs", "family"), "/pool/docs"; got != want {
+		t.Errorf("docs root = %q, want the group's storage %q", got, want)
+	}
+	if got, want := cfg.FolderMount("docs", "family"), "/mnt/docs"; got != want {
+		t.Errorf("docs mount = %q, want %q", got, want)
+	}
+	// Storage roots are disjoint by construction, so nesting mounts do not
+	// warn any more.
+	if w := cfg.Warnings(); len(w) != 0 {
+		t.Errorf("storage-backed folders warned: %v", w)
+	}
+	folders := cfg.Folders()
+	for _, f := range folders {
+		if f.Storage == "" {
+			t.Errorf("folder %q has no storage in the view: %+v", f.Name, f)
+		}
+	}
+
+	// No storageDir anywhere: the original layout.
+	path = writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}},
+  "mounts": {"docs": "/mnt/docs"}
+}`)
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.FolderRoot("docs", "family"), "/mnt/docs"; got != want {
+		t.Errorf("docs root = %q, want the mount %q when no storage is declared", got, want)
+	}
+
+	// A mount that is its own storage root is a self-symlink: rejected.
+	path = writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "storageDir": "/srv/store",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}},
+  "mounts": {"docs": "/srv/store/docs"}
+}`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "mount and storage") {
+		t.Fatalf("err = %v, want a self-symlink mount rejected", err)
+	}
+
+	// Relative storage is not a path the daemon can use.
+	path = writeConfig(t, `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "storageDir": "store",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}}
+}`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "must be absolute") {
+		t.Fatalf("err = %v, want a relative storageDir rejected", err)
+	}
+}

@@ -45,18 +45,58 @@ let
   # Folder name → effective mount, resolved exactly like the engine does:
   # local override, else the group's default, else inside dataDir.
   folderMounts = lib.concatMapAttrs (
-    _: g: lib.mapAttrs (fname: f: if cfg.mounts ? ${fname} then cfg.mounts.${fname} else if f.mount != null then f.mount else "${cfg.dataDir}/mounts/${fname}") g.folders
+    _: g:
+    lib.mapAttrs (
+      fname: f:
+      if cfg.mounts ? ${fname} then
+        cfg.mounts.${fname}
+      else if f.mount != null then
+        f.mount
+      else
+        "${cfg.dataDir}/mounts/${fname}"
+    ) g.folders
   ) cfg.groups;
 
-  # What the engine may write: replica roots directly, streamed mounts plus
-  # their parent (the symlink swap). "-" tolerates a path that does not
+  # Folder name → storage directory, when one is configured: the group's
+  # override, else the machine's. Empty means the original layout.
+  storageDirs = lib.concatMapAttrs (
+    _: g:
+    lib.mapAttrs (
+      fname: _:
+      if g.storageDir != null then
+        "${g.storageDir}/${fname}"
+      else if cfg.storageDir != null then
+        "${cfg.storageDir}/${fname}"
+      else
+        ""
+    ) g.folders
+  ) cfg.groups;
+
+  # What the engine may write: content roots and the paths it swaps, mount
+  # points included — a storage-backed folder writes into its storage
+  # directory and creates the symlink at the mount, so both, and the
+  # mount's parent, have to be writable. "-" tolerates a path that does not
   # exist yet rather than failing the unit.
   folderReadWrite = lib.concatMap (
     fname:
     let
       m = folderMounts.${fname};
+      s = storageDirs.${fname};
     in
-    if cfg.keepOffline.${fname} or true then [ "-${m}" ] else [ "-${m}" "-${builtins.dirOf m}" ]
+    if s != "" then
+      [
+        "-${s}"
+        "-${builtins.dirOf s}"
+        "-${m}"
+        "-${builtins.dirOf m}"
+      ]
+    else if cfg.keepOffline.${fname} or true then
+      [ "-${m}" ]
+    else
+      [
+        "-${m}"
+        "-${builtins.dirOf m}"
+      ]
   ) (lib.attrNames folderMounts);
 in
 {
@@ -118,6 +158,7 @@ in
       mounts
       keepOffline
       permissions
+      storageDir
       ;
   };
 

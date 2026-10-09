@@ -159,3 +159,27 @@
   mirror. That needs on-demand fetch (FUSE work on the DESIGN list), or a
   network mount in the meantime.
 - **Reversible:** the guard, yes; the `devices` option is additive.
+
+## 2026-10-07 — storageDir: content location decoupled from the mount point
+
+- **Decision:** `storageDir` (machine-level, overridable per group) puts every
+  folder's content at `<storageDir>/<folder>`, with the mount path a symlink
+  to it — for replicas and streamed folders alike. Absent (the default) keeps
+  the original layout: a replica's content is the mount directory itself, a
+  streamed folder's under the data directory. A folder with content still at
+  its mount path is migrated into the storage directory on the next
+  transition: entry by entry, recursive, never overwriting (a colliding name
+  is parked under the deterministic conflict name), so a crash mid-way
+  resumes and nothing is lost. Nix: `services.storeboard.storageDir` and
+  `groups.<g>.storageDir`; the tag adds a group declaration and a per-device
+  override (the device's value becomes that group's storageDir for its host).
+- **Why:** the user's ask — "we never have this nesting issue": with roots of
+  the form `<storageDir>/<folder>` no two folders can index the same bytes,
+  whatever the mounts look like, so the pool-root-plus-subtrees shape stops
+  costing double indexing. It also makes the mount a pure view: the mount
+  point can sit anywhere, and content lives where the config says.
+- **Rejected shapes:** mount == its own storage root (a self-symlink) is a
+  config error; storage dirs must be absolute.
+- **Reversible:** yes — the option is additive and null restores the old
+  layout; migration is a move, so pointing the config back moves nothing
+  (the content stays where it was put).

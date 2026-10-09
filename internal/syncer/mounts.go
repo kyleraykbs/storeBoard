@@ -29,9 +29,36 @@ const (
 //   - anything else (a real directory, a foreign symlink — a samba mount)
 //     → busy: never touched, exactly the sambaMounts lesson inverted.
 func (e *Engine) ensureMounts(fs *FolderState) {
+	if fs.storage != "" {
+		if _, err := e.ensureStorage(fs); err != nil {
+			fs.state = stateBusy
+			fs.busy = api.BusyContent
+			fs.root = fs.storage
+			e.logger.Error("storage directory", "folder", fs.name, "path", fs.storage, "error", err)
+			return
+		}
+	}
+
 	if !fs.streamed {
 		fs.state = stateReplica
-		fs.root = fs.mount
+		fs.busy = ""
+		if fs.storage == "" {
+			// Original layout: the mount path IS the content.
+			fs.root = fs.mount
+			return
+		}
+		// Storage-backed replica: content lives in the storage directory and
+		// the mount path is a view onto it, so the mount can sit anywhere
+		// without the daemon having to own it as data.
+		if err := symlinkSwap(fs.mount, fs.storage); err != nil {
+			fs.state = stateBusy
+			fs.root = fs.storage
+			e.logger.Error("mount storage-backed folder", "folder", fs.name, "error", err)
+			return
+		}
+		e.chownLink(fs, fs.mount)
+		fs.root = fs.storage
+		e.logger.Info("folder mounted", "folder", fs.name, "state", fs.state, "mount", fs.mount, "storage", fs.storage)
 		return
 	}
 
@@ -135,6 +162,84 @@ func (e *Engine) ensureMounts(fs *FolderState) {
 	if fs.state != stateBusy {
 		e.logger.Info("folder mounted", "folder", fs.name, "state", fs.state, "mount", fs.mount)
 	}
+}
+
+// ensureStorage prepares a folder's storage directory and migrates what is
+// still at the mount path into it. The move is the same entry-by-entry,
+// never-overwrite one takeover uses, so an interrupted migration leaves both
+// sides intact and the next transition picks up where it stopped.
+func (e *Engine) ensureStorage(fs *FolderState) (int, error) {
+	if err := os.MkdirAll(fs.storage, 0o700); err != nil {
+		return 0, err
+	}
+	e.applyDir(fs, fs.storage)
+
+	// Nothing to migrate when the mount is already our symlink.
+	if target, err := os.Readlink(fs.mount); err == nil {
+		if target == fs.storage {
+			return 0, nil
+		}
+		// A symlink we did not make: not ours to reorganize.
+		return 0, nil
+	}
+	if fstype := mountFSType(fs.mount); fstype != "" {
+		return 0, fmt.Errorf("%s is a %s mount: unmount it (or let the takeover unit) before its content can move to %s", fs.mount, fstype, fs.storage)
+	}
+	info, err := os.Lstat(fs.mount)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil // nothing there: the symlink is the only thing to add
+		}
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("%s is not a directory: move it aside before its content can move to %s", fs.mount, fs.storage)
+	}
+	entries, err := os.ReadDir(fs.mount)
+	if err != nil {
+		return 0, err
+	}
+	if len(entries) == 0 {
+		// A spent mount point: adopt the path.
+		if err := os.Remove(fs.mount); err != nil {
+			return 0, err
+		}
+		e.logger.Info("adopted empty mount path", "folder", fs.name, "path", fs.mount)
+		return 0, nil
+	}
+
+	moved, err := e.moveEntries(fs, fs.mount, fs.storage)
+	if err != nil {
+		return moved, err
+	}
+	if rest, rerr := os.ReadDir(fs.mount); rerr != nil || len(rest) != 0 {
+		return moved, fmt.Errorf("%s still has entries; nothing was lost, the migration continues on the next transition", fs.mount)
+	}
+	if err := os.Remove(fs.mount); err != nil {
+		return moved, fmt.Errorf("remove empty %s: %w", fs.mount, err)
+	}
+	e.logger.Info("migrated folder content into the storage directory",
+		"folder", fs.name, "from", fs.mount, "to", fs.storage, "moved", moved)
+	return moved, nil
+}
+
+// moveEntries moves every top-level entry of src into dst: recursively for
+// directories, never following symlinks and never replacing what is already
+// there (a collision is parked under the deterministic conflict name).
+func (e *Engine) moveEntries(fs *FolderState, src, dst string) (int, error) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return 0, err
+	}
+	moved := 0
+	for _, ent := range entries {
+		if err := e.takeoverMove(fs, filepath.Join(src, ent.Name()), filepath.Join(dst, ent.Name())); err != nil {
+			e.logger.Warn("entry left in place", "folder", fs.name, "entry", ent.Name(), "error", err)
+			continue
+		}
+		moved++
+	}
+	return moved, nil
 }
 
 // attach flips a detached streamed folder back to the live view: whatever
@@ -270,9 +375,17 @@ func (e *Engine) mergeDetached(fs *FolderState, detached, view string) error {
 	return err
 }
 
-// viewsDir / detachedDir are the daemon-owned halves of a streamed folder,
-// both under the one storage directory.
-func (e *Engine) viewsDir(fs *FolderState) string { return filepath.Join(e.dataDir, "views", fs.name) }
+// viewsDir / detachedDir are the daemon-owned halves of a folder: the live
+// content and the offline scratchpad. A folder with a storage directory
+// keeps its content there (the path the config names); everything else keeps
+// it under the one data directory.
+func (e *Engine) viewsDir(fs *FolderState) string {
+	if fs.storage != "" {
+		return fs.storage
+	}
+	return filepath.Join(e.dataDir, "views", fs.name)
+}
+
 func (e *Engine) detachedDir(fs *FolderState) string {
 	return filepath.Join(e.dataDir, "detached", fs.name)
 }

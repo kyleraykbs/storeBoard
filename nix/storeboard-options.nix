@@ -107,6 +107,17 @@ rec {
               directory the mount lives in.
             '';
           };
+
+          storageDir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "/mainpool";
+            description = ''
+              Storage directory for this group's folders, overriding the
+              top-level `storageDir`. Content lives in
+              `<storageDir>/<folder>` and the mount path is a symlink to it.
+            '';
+          };
         };
       }
     );
@@ -146,6 +157,22 @@ rec {
       undeclared) keeps a full local replica that works offline; false
       streams the folder from a holder — mounted live while a holder is
       reachable, an empty dummy dir when none is, remerged on reconnect.
+    '';
+  };
+
+  storageDir = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    example = "/srv/storeboard";
+    description = ''
+      Where folder content lives on this machine: each folder's root becomes
+      `<storageDir>/<folder>` and its mount path is a symlink to it, so
+      content and mount point are independent — the mount may sit anywhere
+      and no two folders can index the same bytes. Null (the default) keeps
+      the original layout: a replica's content at the mount path itself, a
+      streamed folder's under the data directory. Content already at a
+      mount path is migrated into the storage directory on the next
+      transition. A group may override it with `groups.<name>.storageDir`.
     '';
   };
 
@@ -214,12 +241,16 @@ rec {
         // lib.optionalAttrs (g.permissions != null) {
           permissions = lib.filterAttrs (_: v: v != null) g.permissions;
         }
+        // lib.optionalAttrs (g.storageDir != null) { storageDir = g.storageDir; }
       ) cfg.groups;
     }
     // lib.optionalAttrs (cfg ? mounts) { mounts = cfg.mounts; }
     // lib.optionalAttrs (cfg ? keepOffline) { keepOffline = cfg.keepOffline; }
     // lib.optionalAttrs (cfg ? permissions && cfg.permissions != { }) {
       permissions = lib.mapAttrs (_: p: lib.filterAttrs (_: v: v != null) p) cfg.permissions;
+    }
+    // lib.optionalAttrs (cfg ? storageDir && cfg.storageDir != null) {
+      storageDir = cfg.storageDir;
     };
 
   # The config file, validated by the real `storeboard config check` during

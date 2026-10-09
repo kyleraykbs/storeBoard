@@ -373,8 +373,11 @@ func renderStatus(w io.Writer, st *api.Status) {
 		if f.KeepOffline {
 			kept = "yes"
 		}
-		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n    keepOffline %s\n",
-			f.Name, f.Group, f.Mount, kept)
+		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n", f.Name, f.Group, f.Mount)
+		if f.Storage != "" {
+			fmt.Fprintf(w, "    storage %s\n", f.Storage)
+		}
+		fmt.Fprintf(w, "    keepOffline %s\n", kept)
 	}
 
 	fmt.Fprintf(w, "\nconnections (%d):\n", len(st.Connections))

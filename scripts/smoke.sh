@@ -81,9 +81,13 @@ cat >"$config" <<EOF
         "documents": { "mount": "$work/docs" },
         "archive": { "mount": "$work/archive" }
       }
+    },
+    "pool": {
+      "peers": ["laptop", "desktop"],
+      "folders": { "store": { "mount": "$work/storage-store-view" } }
     }
   },
-  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive" }
+  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive", "store": "$work/storage-store-view" }
 }
 EOF
 
@@ -101,7 +105,7 @@ echo "== status, both modes"
 "$CLI" --config "$config" status --json |
 	jq -e --arg s "$socket" --arg w "$work" '
 		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
-		(.groups | length == 1) and (.folders | length == 3) and
+		(.groups | length == 2) and (.folders | length == 4) and
 		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs")) and
 		([.folders[].keepOffline] | all) and
 		([.sync[].state] | all(. == "replica"))' >/dev/null
@@ -116,6 +120,10 @@ echo "== two daemons connect over the wire"
 mkdir -p "$work/PicturesB"
 mkdir -p "$work/remoteArchive"
 echo "local file, kept by takeover" >"$work/remoteArchive/local.txt"
+# A folder whose content still sits at the mount path: the daemon moves it
+# into the storage directory and mounts over the path.
+mkdir -p "$work/relocated"
+echo "content from before the storage directory" >"$work/relocated/pre-migration.txt"
 cat >"$config2" <<EOF
 {
   "configVersion": 1,
@@ -134,9 +142,14 @@ cat >"$config2" <<EOF
         "documents": { "mount": "$work/remoteDocs" },
         "archive": { "mount": "$work/remoteArchive" }
       }
+    },
+    "pool": {
+      "peers": ["laptop", "desktop"],
+      "storageDir": "$work/storage",
+      "folders": { "store": { "mount": "$work/relocated" } }
     }
   },
-  "mounts": { "photos": "$work/PicturesB", "documents": "$work/remoteDocs", "archive": "$work/remoteArchive" },
+  "mounts": { "photos": "$work/PicturesB", "documents": "$work/remoteDocs", "archive": "$work/remoteArchive", "store": "$work/relocated" },
   "keepOffline": { "documents": false, "archive": false }
 }
 EOF
@@ -181,6 +194,20 @@ echo "== a path with content says why, and takeover mounts it without losing any
 grep -q "local file, kept by takeover" "$work/remoteArchive/local.txt"
 wait_for 10 "taken-over content reached the holder" test -f "$work/archive/local.txt"
 grep -q "local file, kept by takeover" "$work/archive/local.txt"
+
+echo "== a storage directory moves content off the mount path and mounts over it"
+[ -L "$work/relocated" ] || {
+	echo "FAIL: the storage-backed mount is not a symlink" >&2
+	exit 1
+}
+[ "$(readlink "$work/relocated")" = "$work/storage/store" ] || {
+	echo "FAIL: mount points at $(readlink "$work/relocated"), want the storage dir" >&2
+	exit 1
+}
+grep -q "content from before the storage directory" "$work/storage/store/pre-migration.txt"
+grep -q "content from before the storage directory" "$work/relocated/pre-migration.txt"
+"$CLI" --config "$config2" status --json |
+	jq -e '[.sync[] | select(.folder == "store")][0].root == "'"$work"'/storage/store"' >/dev/null
 echo "holder content" >"$work/docs/from-laptop.txt"
 wait_for 10 "holder content visible through the mount" test -f "$work/remoteDocs/from-laptop.txt"
 grep -q "holder content" "$work/remoteDocs/from-laptop.txt"

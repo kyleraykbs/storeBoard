@@ -16,12 +16,14 @@
         "documents": {},
         "archive": {}
       },
-      "permissions": { "group": "users" }
+      "permissions": { "group": "users" },
+      "storageDir": "/srv/storeboard"
     }
   },
   "mounts": { "documents": "/mnt/docs", "archive": "/mnt/archive" },
   "keepOffline": { "archive": false },
   "permissions": {
     "documents": { "user": "alice", "mode": "0755" }
-  }
+  },
+  "storageDir": "/srv/storeboard"
 }

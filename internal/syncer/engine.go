@@ -39,6 +39,7 @@ type FolderState struct {
 	name      string
 	group     string
 	mount     string
+	storage   string // "" = content at the mount path (original layout)
 	streamed  bool
 	root      string // the root the scanner follows: mount, view, or detached dir
 	state     string
@@ -109,6 +110,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			name:     f.Name,
 			group:    f.Group,
 			mount:    f.Mount,
+			storage:  f.Storage,
 			streamed: !f.KeepOffline,
 			db:       db,
 			perm:     noPerms(),
@@ -142,7 +144,15 @@ func (e *Engine) prepare(fs *FolderState) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	fs.perm = e.resolvePerms(fs)
-	if !fs.streamed {
+	switch {
+	case fs.storage != "":
+		// Content lives in the storage directory; only the mount path's
+		// parents are the daemon's to create (the storage directory itself
+		// is made by ensureStorage).
+		if err := e.ensureMountParent(fs); err != nil {
+			e.logger.Error("create mount path parents", "folder", fs.name, "path", fs.mount, "error", err)
+		}
+	case !fs.streamed:
 		if err := os.MkdirAll(fs.mount, fs.perm.dirMode); err != nil {
 			e.logger.Error("create folder root", "folder", fs.name, "error", err)
 		}

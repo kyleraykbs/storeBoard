@@ -78,6 +78,18 @@ func (e *Engine) takeoverLocked(fs *FolderState, uid int) (int, error) {
 		return 0, fmt.Errorf("folder %q is not ready yet (%s)", fs.name, fs.state)
 	}
 
+	// A storage-backed folder needs no takeover: its content already belongs
+	// in the storage directory and the migration is the same operation, run
+	// automatically on every transition. Doing it here just runs it now.
+	if fs.storage != "" {
+		moved, err := e.ensureStorage(fs)
+		if err != nil {
+			return moved, err
+		}
+		e.ensureMounts(fs)
+		return moved, nil
+	}
+
 	// Only a plain directory can be taken over. A live mount belongs to the
 	// system and a symlink to whoever made it; neither is ours to reorganize,
 	// and the reasons match the ones the daemon reports as busy.
@@ -99,20 +111,14 @@ func (e *Engine) takeoverLocked(fs *FolderState, uid int) (int, error) {
 	ensureTraversable(e.dataDir, offline)
 	e.applyDir(fs, offline)
 
-	entries, err := os.ReadDir(fs.mount)
-	if err != nil {
+	if _, err := os.ReadDir(fs.mount); err != nil {
 		return 0, fmt.Errorf("read %s: %w", fs.mount, err)
 	}
-	moved := 0
-	for _, ent := range entries {
-		src := filepath.Join(fs.mount, ent.Name())
-		dst := filepath.Join(offline, ent.Name())
-		if err := e.takeoverMove(fs, src, dst); err != nil {
-			e.logger.Warn("takeover: entry left in place", "folder", fs.name, "entry", ent.Name(), "error", err)
-			continue
-		}
-		moved++
+	moved, merr := e.moveEntries(fs, fs.mount, offline)
+	if merr != nil {
+		return moved, merr
 	}
+
 	// The directory itself can only go when it is empty: a crash or a
 	// permission problem mid-way leaves the path busy, and running the same
 	// command again simply continues where it stopped.

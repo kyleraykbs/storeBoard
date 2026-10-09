@@ -44,7 +44,14 @@ Strict JSON; unknown keys are an error. The model, in full in
   exactly like the directory containing it; `{"user": "kyle"}` on a folder
   whose parent is root-owned is the common override. Modes are directories
   only — files keep the mode they were synced with.
-(- everything the daemon stores (store, journal, index) lives under the one
+- `storageDir` — where folder *content* lives (this machine, overridable per
+  group): each folder's root becomes `<storageDir>/<folder>` and its mount
+  path is a symlink to it, so the mount may sit anywhere and no two folders
+  can index the same bytes. Files already at a mount path are migrated in on
+  the next transition (nothing is overwritten; an interrupted migration
+  resumes). Absent (the default) keeps the original layout, where a
+  replica's content is the mount directory itself.
+- everything the daemon stores (store, journal, index) lives under the one
   `dataDir`.
 - Two folders on one identical mount are rejected; *nested* mounts (a pool
   root plus subtrees other machines stream) are allowed but warned about by
