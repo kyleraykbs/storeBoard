@@ -1465,3 +1465,50 @@ func TestScanRepairsAStaleSizeWithoutNewVersion(t *testing.T) {
 		t.Fatalf("repair tombstoned the file: %+v", got)
 	}
 }
+
+// The self-reference: a storage-backed folder's mount is a symlink into its
+// own storage directory, so taking the reference from the mount reads the
+// very directory being permissioned. It locked a root at 0700 root and kept
+// it there — the owner could not open their own Documents. The reference is
+// the directory the mount lives in, and re-applying heals a drifted root.
+func TestStoragePermissionsDoNotFeedOnThemselves(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(parent, "Documents")
+	storage := t.TempDir()
+
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	root := filepath.Join(storage, "docs")
+	fi, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o750 {
+		t.Fatalf("storage root mode = %04o, want the mount parent's 0750", fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
+		t.Fatalf("storage root owner = %v, want the mount parent's %d", fi.Sys(), os.Getuid())
+	}
+
+	// Drift it, the way the bug did, and let a scan re-apply.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	n.eng.scanOnce(fs)
+	if fi, err := os.Stat(root); err != nil || fi.Mode().Perm() != 0o750 {
+		t.Fatalf("mode after a scan = %v %v, want the parent's 0750 restored", fi.Mode().Perm(), err)
+	}
+
+	// And the resolution stays stable across repeats (no feedback loop).
+	for i := 0; i < 3; i++ {
+		n.eng.prepare(fs)
+		if fi, err := os.Stat(root); err != nil || fi.Mode().Perm() != 0o750 {
+			t.Fatalf("mode after prepare %d = %v %v, want 0750", i, fi.Mode().Perm(), err)
+		}
+	}
+}

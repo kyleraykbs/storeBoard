@@ -34,12 +34,14 @@ func noPerms() perms { return perms{uid: -1, gid: -1, dirMode: 0o755} }
 func (e *Engine) resolvePerms(fs *FolderState) perms {
 	// The directory the mount lives in is the reference: for a streamed
 	// folder that is the parent of the symlink (the user-facing directory
-	// full of siblings); for a replica it is the folder itself, because
-	// that directory IS the user's. A storage-backed folder still takes its
-	// permissions from the visible location, not from wherever the storage
-	// happens to sit: the mount is what the user chose.
+	// full of siblings), and for a storage-backed folder the same — its
+	// mount is a symlink into the storage directory, so reading the mount
+	// would resolve to the very directory this is about to chmod, locking
+	// in whatever mode it happens to have (a 0700 storage dir kept every
+	// later check at 0700 and locked its owner out). A replica without a
+	// storage directory is the user's own folder, so it is its own reference.
 	probe := fs.mount
-	if fs.streamed {
+	if fs.streamed || fs.storage != "" {
 		probe = filepath.Dir(fs.mount)
 	}
 	p := noPerms()

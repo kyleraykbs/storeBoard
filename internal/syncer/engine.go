@@ -257,10 +257,13 @@ func (e *Engine) scanOnce(fs *FolderState) {
 	// it came from, so a chown or chmod of the mount's parent is honoured on
 	// the next scan rather than at the next restart.
 	fs.perm = e.resolvePerms(fs)
-	if fs.streamed {
+	if fs.streamed || fs.storage != "" {
 		// The mount target is the one directory the daemon owns on behalf
-		// of the folder: keep it matching its parent ("permissioned every
-		// time"). Replicas are the user's directories and are never chmod'ed.
+		// of the folder: keep it matching its reference ("permissioned every
+		// time"). A plain replica root is the user's own directory and is
+		// never chmod'ed — but a storage-backed one is the daemon's, so it
+		// is re-applied here too, which is also what heals a root whose mode
+		// drifted.
 		e.applyDir(fs, fs.root)
 	}
 	// A streamed folder is only scanned while it is attached — except when it
