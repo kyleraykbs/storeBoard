@@ -999,7 +999,7 @@ func TestStorageBackedReplica(t *testing.T) {
 		t.Fatalf("content in storage = %q", got)
 	}
 	// The scanner indexes the storage root, not the mount.
-	changed, err := n.eng.scan(fs)
+	changed, err := n.eng.scan(fs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1257,7 +1257,7 @@ func TestScanNeverTombstonesUnmaterialisedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := n.eng.scan(fs)
+	changed, err := n.eng.scan(fs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1359,7 +1359,7 @@ func TestProgressIsVisibleWhileWorking(t *testing.T) {
 
 	// A scan reports what it found; afterwards the counts settle.
 	writeFile(t, filepath.Join(fs.root, "here.txt"), "present", time.Now())
-	if _, err := client.eng.scan(fs); err != nil {
+	if _, err := client.eng.scan(fs, true); err != nil {
 		t.Fatal(err)
 	}
 	s = client.eng.Snapshot()[0]
@@ -1367,4 +1367,101 @@ func TestProgressIsVisibleWhileWorking(t *testing.T) {
 		t.Fatalf("after a scan: local %d scanning %v, want 1/false", s.Local, s.Scanning)
 	}
 	_ = holder
+}
+
+// The incident's exact shape: a streamed folder whose mirror is empty while
+// the journal and the content store still remember the files (they were
+// materialised earlier). Not live, that absence must never be read as a
+// deletion — it cost 448 files on amanita once. Live, the same absence IS a
+// deletion and has to propagate, or the mesh would never let you delete
+// anything through a mount.
+func TestStreamedFolderTombstonesOnlyWhileLive(t *testing.T) {
+	storage := t.TempDir()
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", filepath.Join(t.TempDir(), "remote-docs"), storage, false)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	// Materialised once: the blob is in the store, the file is gone.
+	f, err := n.eng.store.Temp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("gone")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.SumFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.eng.store.Adopt(f.Name(), sum); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "gone.txt", Blob: sum, Size: 4, MTime: time.Now().UnixNano(), VV: map[string]uint64{"b": 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Detached (not live): report what is here, never what is missing.
+	if s := n.eng.Snapshot()[0]; s.State != stateDetached {
+		t.Fatalf("state = %q, want detached for this case", s.State)
+	}
+	n.eng.scanOnce(fs)
+	if got := fs.db.Get("gone.txt"); got == nil || got.Deleted {
+		t.Fatalf("a detached scan tombstoned a materialised entry: %+v", got)
+	}
+
+	// Live: the same absence is a deletion.
+	fs.scanMu.Lock()
+	fs.state = stateAttached
+	fs.scanMu.Unlock()
+	n.eng.mu.Lock()
+	n.eng.sends["a"] = func([]byte) error { return nil }
+	n.eng.mu.Unlock()
+
+	n.eng.scanOnce(fs)
+	if got := fs.db.Get("gone.txt"); got == nil || !got.Deleted {
+		t.Fatalf("a live scan did not propagate a real deletion: %+v", got)
+	}
+}
+
+// The stale-dirent repair: an entry whose recorded size contradicts the file
+// on disk (what a scan that hashed a file mid-write used to record) must be
+// corrected in place, without a version bump — the poisoned entry otherwise
+// made every later apply of that path look like an unsynced local change and
+// park a false conflict next to it.
+func TestScanRepairsAStaleSizeWithoutNewVersion(t *testing.T) {
+	storage := t.TempDir()
+	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", filepath.Join(t.TempDir(), "remote-docs"), storage, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	writeFile(t, filepath.Join(fs.root, "shot.png"), "content", time.Now())
+	sum, err := store.SumFile(filepath.Join(fs.root, "shot.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The poison: right blob, wrong size, correct mtime.
+	st, err := os.Stat(filepath.Join(fs.root, "shot.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "shot.png", Blob: sum, Size: 0, MTime: st.ModTime().UnixNano(), Mode: 0o644, VV: map[string]uint64{"b": 3}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	got := fs.db.Get("shot.png")
+	if got == nil || got.Size != int64(len("content")) {
+		t.Fatalf("size not repaired: %+v", got)
+	}
+	if got.VV["b"] != 3 {
+		t.Fatalf("repair bumped the version vector: %v", got.VV)
+	}
+	if got.Deleted {
+		t.Fatalf("repair tombstoned the file: %+v", got)
+	}
 }

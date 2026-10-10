@@ -276,7 +276,12 @@ func (e *Engine) scanOnce(fs *FolderState) {
 		return
 	}
 
-	changed, err := e.scan(fs)
+	// Replicas own their root; a live streamed folder can tell its peers
+	// about a real deletion. Everything else — detached, busy, still
+	// filling — may only report what it finds, never what is missing.
+	tombstones := !fs.streamed || (fs.state == stateAttached && e.participantConnected(fs))
+
+	changed, err := e.scan(fs, tombstones)
 	if err != nil {
 		e.logger.Warn("scan", "folder", fs.name, "error", err)
 	}

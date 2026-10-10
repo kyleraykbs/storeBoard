@@ -18,9 +18,15 @@ const tmpPrefix = ".storeboard-tmp"
 
 // scan walks the folder's active root and folds reality into the journal:
 // new and changed files become blobs with a fresh version, vanished files
-// become tombstones. It returns the entries that changed, in their newest
-// state, ready to hand to peers.
-func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
+// become tombstones — but only when tombstones is set. A streamed folder is
+// a mirror, and its root can be empty or partial for its own reasons (a
+// migration in flight, an index that arrived before its blobs, a folder that
+// is not live); absence there means "not here yet", and treating it as a
+// deletion deletes the content everywhere. The incident that cost 448 files
+// was exactly that. Replicas own their root, and a live streamed folder can
+// tell its peers about a real deletion, so both may tombstone. It returns
+// the entries that changed, in their newest state, ready to hand to peers.
+func (e *Engine) scan(fs *FolderState, tombstones bool) ([]*Entry, error) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 
@@ -128,6 +134,9 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 
 	for _, ent := range fs.db.All() {
 		if ent.Deleted || seen[ent.Path] {
+			continue
+		}
+		if !tombstones {
 			continue
 		}
 		// An entry whose blob this machine does not hold was never

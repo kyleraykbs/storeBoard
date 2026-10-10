@@ -116,6 +116,11 @@ one, it changes here first, deliberately, with a decision log entry.
   indexed like any other file, so conflict copies themselves replicate.
 - Deletes propagate as tombstones; the survivor's file is moved to
   `<dataDir>/trash/<folder>/`, never unlinked.
+- Deletions are asserted, never inferred. A replica owns its root, so absence
+  there is a deletion; a streamed folder may only tombstone while it is live
+  (attached with a holder answering) and never an entry whose blob this
+  machine does not hold. Absence in a mirror means "not here yet" — reading
+  it as a deletion emptied 448 files into a holder's trash on 2026-10-09.
 - A remote update that would land on top of an unscanned local change
   parks that change as a conflict copy first.
 

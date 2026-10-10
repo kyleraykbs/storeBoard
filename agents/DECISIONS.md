@@ -226,3 +226,35 @@
   directory, not the universal rule.
 - **Reversible:** yes (the old path is one branch); it changes only what a
   folder shows while no holder answers, never what is stored.
+
+## 2026-10-09 — Deletions are asserted, and the tests that pin every incident
+
+- **Decision:** a scan tombstones only where absence is evidence. Replicas own
+  their root. A streamed folder may tombstone only while it is live (state
+  attached with a holder answering) and never an entry whose blob this machine
+  does not hold; every skip is logged with a count. The first rule's absence
+  is what let an empty storage root delete 448 files across the mesh; the
+  second covers the fresh-client variant. Both are tested in both directions:
+  the detached/materialised case must survive, the live case must propagate.
+- **Tests added for the day's failures** (each verified to fail against the
+  old behaviour where a revert was practical):
+  - tombstone storm: `TestScanNeverTombstonesUnmaterialisedEntries`,
+    `TestStreamedFolderTombstonesOnlyWhileLive`;
+  - upgrade paths: `TestLegacyViewMigratesIntoStorage`,
+    `TestLegacyViewMovesWhileDetached`, `TestStorageMigrationFromMountPath`;
+  - layout: `TestStorageBackedReplica`, `TestStorageBackedStreamedMergesOnReconnect`,
+    `TestStorageBackedStreamedMigratesMountContent`, `TestStorageChainIsTraversable`,
+    `TestStorageMountRefusesForeignSymlink`;
+  - false conflicts: `TestMergeDetachedIdenticalContentIsNotAConflict`,
+    `TestMergeDetachedDifferentContentStillConflicts`,
+    `TestScanRepairsAStaleSizeWithoutNewVersion`;
+  - availability: `TestSnapshotNeverWaitsOnTheScanLock`,
+    `TestProgressIsVisibleWhileWorking`;
+  - mount lifecycle: `TestDetachedFolderDoesNotTombstoneItsContent`,
+    `TestTrashAcrossFilesystems`, `TestMountInheritsParentPermissions` and the
+    permission set, `TestEmptyMountPathIsAdopted`, `TestForeignMountPathIsLeftAlone`;
+  - end to end: the smoke's takeover, storage-migration and permission sections.
+- **Why:** user request — "add tests so what happened before never happens
+  again". Every incident of the day now has a test that describes it in its
+  name and fails on the code that caused it.
+- **Reversible:** tests only.
