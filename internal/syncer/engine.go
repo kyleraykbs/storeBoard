@@ -50,6 +50,55 @@ type FolderState struct {
 
 	perm   perms
 	scanMu sync.Mutex
+
+	// metaMu guards published, the status document's copy of this folder's
+	// state. Snapshot refreshes it whenever the scan lock happens to be
+	// free and otherwise serves the last values: a folder materialising
+	// tens of gigabytes holds that lock for minutes, and `storeboard status`
+	// has to answer regardless (an endpoint that waits is indistinguishable
+	// from a dead daemon).
+	metaMu    sync.Mutex
+	published api.FolderSync
+}
+
+// publish returns the folder's status, refreshing the fields that need the
+// scan lock when it is free and serving the last known values otherwise.
+// Entries, conflicts and the last scan time are always live: they never
+// needed that lock.
+func (fs *FolderState) publish() api.FolderSync {
+	fs.metaMu.Lock()
+	defer fs.metaMu.Unlock()
+	if fs.scanMu.TryLock() {
+		p, root, state, busy := fs.perm, fs.root, fs.state, fs.busy
+		fs.scanMu.Unlock()
+		fs.published = api.FolderSync{
+			Folder:      fs.name,
+			Root:        root,
+			State:       state,
+			Busy:        busy,
+			Permissions: p.apiPerms(),
+		}
+	}
+	out := fs.published
+	out.Folder = fs.name
+	out.Entries = fs.db.Count()
+	out.Conflicts = fs.conflicts
+	out.LastScan = fs.lastScan
+	return out
+}
+
+// addConflict and setLastScan record activity the status documents; both
+// under metaMu so publish sees them without taking the scan lock.
+func (fs *FolderState) addConflict() {
+	fs.metaMu.Lock()
+	fs.conflicts++
+	fs.metaMu.Unlock()
+}
+
+func (fs *FolderState) setLastScan(t time.Time) {
+	fs.metaMu.Lock()
+	fs.lastScan = t
+	fs.metaMu.Unlock()
 }
 
 // Engine ties folders, journals and the peer wire together.
@@ -114,6 +163,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			streamed: !f.KeepOffline,
 			db:       db,
 			perm:     noPerms(),
+			published: api.FolderSync{
+				Folder:      f.Name,
+				Root:        f.Mount,
+				Permissions: noPerms().apiPerms(),
+			},
 		}
 		e.folders = append(e.folders, fs)
 		e.byName[fs.name] = fs
@@ -324,23 +378,12 @@ func (e *Engine) participantConnected(fs *FolderState) bool {
 	return false
 }
 
-// Snapshot is the status document's sync section.
+// Snapshot is the status document's sync section. It never waits on the scan
+// or apply locks.
 func (e *Engine) Snapshot() []api.FolderSync {
 	out := make([]api.FolderSync, 0, len(e.folders))
 	for _, fs := range e.folders {
-		fs.scanMu.Lock()
-		p, root, state, busy := fs.perm, fs.root, fs.state, fs.busy
-		fs.scanMu.Unlock()
-		out = append(out, api.FolderSync{
-			Folder:      fs.name,
-			Root:        root,
-			State:       state,
-			Busy:        busy,
-			Entries:     fs.db.Count(),
-			Conflicts:   fs.conflicts,
-			LastScan:    fs.lastScan,
-			Permissions: p.apiPerms(),
-		})
+		out = append(out, fs.publish())
 	}
 	return out
 }

@@ -146,7 +146,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 // sides compute the same winner) and preserves the other as a
 // `.conflict-<hash8>` copy, indexed like any other file so it spreads.
 func (e *Engine) resolveConflict(peer string, fs *FolderState, loc, rem *Entry) {
-	fs.conflicts++
+	fs.addConflict()
 	win := winner(loc, rem)
 	merged := MergeVV(loc.VV, rem.VV)
 

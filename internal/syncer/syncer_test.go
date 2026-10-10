@@ -1306,3 +1306,30 @@ func TestLegacyViewMovesWhileDetached(t *testing.T) {
 		t.Fatalf("mount = %q (%v), want the storage root", target, err)
 	}
 }
+
+// Status must answer while a folder is busy: a scan or a materialisation of
+// tens of thousands of entries holds the folder's scan lock for minutes, and
+// an endpoint that waits on it looks like a dead daemon.
+func TestSnapshotNeverWaitsOnTheScanLock(t *testing.T) {
+	mount := filepath.Join(t.TempDir(), "docs")
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, true)
+	fs := n.eng.folders[0]
+	n.eng.prepare(fs)
+
+	// What the last free moment published.
+	want := n.eng.Snapshot()[0]
+
+	fs.scanMu.Lock() // a long scan, in progress
+	done := make(chan []api.FolderSync, 1)
+	go func() { done <- n.eng.Snapshot() }()
+	select {
+	case got := <-done:
+		if len(got) != 1 || got[0].State != want.State || got[0].Root != want.Root {
+			t.Fatalf("snapshot during a scan = %+v, want the published values %+v", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		fs.scanMu.Unlock()
+		t.Fatal("Snapshot waited on the scan lock")
+	}
+	fs.scanMu.Unlock()
+}

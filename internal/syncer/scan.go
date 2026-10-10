@@ -161,7 +161,7 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 			return changed, err
 		}
 	}
-	fs.lastScan = time.Now().UTC()
+	fs.setLastScan(time.Now().UTC())
 	return changed, nil
 }
 
