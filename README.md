@@ -108,6 +108,30 @@ bad option value fails nixos-rebuild instead of failing at startup.
 - Scans run every 15 s; `STOREBOARD_SCAN_INTERVAL` (a duration, e.g.
   `200ms`) overrides that for tests and tight loops.
 
+## Backup
+
+Opt-in per machine (`backup.enable`), with one window (`backup.keep`, default
+`1y`, units h/d/w/y) and per-folder opt-outs. Every version transition is
+recorded per folder as a line referencing the blob that holds those bytes —
+the content store is append-only, so the bytes are already there; the history
+is what makes them findable. Retention thins the record the standard way: the
+newest version of each hour for a day, each day for a week, each week for a
+month, each month for a year, each year beyond — and nothing older than the
+window. A file's current version is never dropped. A folder this machine
+*streams* (`keepOffline = false`) keeps no history: its versions belong to the
+machine that holds the content, which is what lets one group-level declaration
+be right everywhere.
+
+A startup collector frees content that nothing references — never a journal's,
+a kept version's, an orphan journal's, or a recent write's — and refuses to run
+at all when a reference source cannot be read. The trash ages out under the
+same window.
+
+    storeboard backup list photos "Screenshots/old.png"
+    storeboard backup restore photos "Screenshots/old.png" --at 2026-09-01T10:00:00Z
+    storeboard backup restore photos "gone.png"     # a deleted file comes back
+    storeboard backup restore photos notes.md --to /tmp/notes.old
+
 ## Query the daemon
 
     storeboardd --config config.example.json &

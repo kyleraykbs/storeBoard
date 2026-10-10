@@ -429,6 +429,7 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 		return err
 	}
 	_ = fs.db.Put(ent)
+	e.record(fs, ent)
 	return nil
 }
 
@@ -507,6 +508,10 @@ func (e *Engine) applyDelete(fs *FolderState, loc *Entry) error {
 	if err := moveOrCopy(src, dst, info.Mode()); err != nil {
 		return err
 	}
+	// Record the version that is leaving: a restore undoes exactly this.
+	gone := loc.clone()
+	gone.Deleted = true
+	e.record(fs, gone)
 	e.logger.Info("deleted (moved to trash)", "folder", fs.name, "path", loc.Path)
 	return nil
 }

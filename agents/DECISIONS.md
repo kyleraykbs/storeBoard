@@ -258,3 +258,30 @@
   again". Every incident of the day now has a test that describes it in its
   name and fails on the code that caused it.
 - **Reversible:** tests only.
+
+## 2026-10-09 — Backup: version history, thinning retention, and a collector
+
+- **Decision:** opt-in per machine (`backup.enable`), one `keep` window
+  (default one year, parsed as `1y`/`90d`/`4w`/`36h`), per-folder opt-out by
+  name. Every version transition (local edit, incoming apply, delete — local
+  or remote) appends a line to `<dataDir>/history/<folder>.ndjson`
+  referencing the blob; the content store is already append-only, so the
+  bytes were always there — this is the index that makes them recoverable.
+  Retention keeps the newest version of each hour for a day, each day for a
+  week, each week for a month, each month for a year, each year beyond — and
+  nothing older than `keep`; the current version is never dropped. The
+  collector runs at startup and frees blobs nothing references, refusing to
+  act when a reference source cannot be read; the trash ages out by the same
+  window. `storeboard backup list|restore` reads and restores it, `--at` or
+  `--blob` picking a version, `--to` writing a copy instead of restoring.
+- **Why:** user request: "each machine keeps a certain number of versions …
+  sparser and sparser … no files sticking around past the file deadline
+  1 year … a single configurable option for keep duration … restore through
+  the CLI". Streaming machines ignoring backup came from the user in the same
+  breath: a mirror should not accumulate versions of content it does not
+  hold, which also means one declaration is right on every machine.
+- **Reversible:** yes — turning `backup` off keeps the existing history files,
+  and the collector reads them off disk as references exactly as it does
+  orphan journals, so nothing a history points at is ever collected while the
+  file exists (re-enabling makes those versions listable and restorable
+  again).

@@ -142,3 +142,35 @@ type Status struct {
 	Connections   []Connection `json:"connections"`
 	Sync          []FolderSync `json:"sync"`
 }
+
+// Version is one recorded version of one file: the blob that holds its bytes
+// (content-addressed, so the same bytes are one blob everywhere), when this
+// machine recorded it, and what it looked like. Deleted versions carry the
+// content the deletion removed, which is what makes a delete restorable.
+type FileVersion struct {
+	Path    string    `json:"path,omitempty"`
+	Time    time.Time `json:"time"`
+	Blob    string    `json:"blob,omitempty"`
+	Size    int64     `json:"size"`
+	MTime   time.Time `json:"mtime,omitempty"`
+	Mode    string    `json:"mode,omitempty"`
+	Deleted bool      `json:"deleted,omitempty"`
+}
+
+// Versions is the answer to `backup list`: a file's recorded versions,
+// newest first.
+type Versions struct {
+	Folder   string        `json:"folder"`
+	Path     string        `json:"path"`
+	Keep     string        `json:"keep"`
+	Versions []FileVersion `json:"versions"`
+}
+
+// RestoreResult reports what a restore did.
+type RestoreResult struct {
+	Folder string    `json:"folder"`
+	Path   string    `json:"path"`
+	Blob   string    `json:"blob"`
+	At     time.Time `json:"at"`
+	Copied bool      `json:"copied,omitempty"` // written beside the folder rather than restored into it
+}

@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -35,6 +37,40 @@ type node struct {
 	eng    *Engine
 	mgr    *transport.Manager
 	cancel context.CancelFunc
+	log    *ringLog
+}
+
+// ringLog keeps the last few kilobytes of a node's log, so a failing test can
+// print *why* it failed instead of just timing out.
+type ringLog struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (r *ringLog) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > 16<<10 {
+		r.buf = r.buf[len(r.buf)-(16<<10):]
+	}
+	return len(p), nil
+}
+
+func (r *ringLog) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf)
+}
+
+// lastLines trims a log to its final n lines: the beginning of a test is never
+// where the story is.
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // twoEndpoints returns two distinct loopback addresses the tests can hand
@@ -83,9 +119,12 @@ func startNode(t *testing.T, n *node) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
-	var logger *slog.Logger
+	if n.log == nil {
+		n.log = &ringLog{}
+	}
+	logger := slog.New(slog.NewTextHandler(n.log, nil))
 	if os.Getenv("STOREBOARD_TEST_LOG") != "" {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		logger = slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, n.log), &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	n.mgr = transport.New(n.cfg, logger)
 	n.mgr.SetHandler(n.eng)
@@ -102,6 +141,9 @@ func (n *node) stop() {
 	n.cancel = nil
 	n.mgr.Close()
 	n.eng.Close()
+	if n.t.Failed() && n.log != nil && n.log.String() != "" {
+		n.t.Logf("node %q log (last lines):\n%s", n.name, lastLines(n.log.String(), 20))
+	}
 }
 
 // mkNode builds a two-peer config: both in group g, folder docs with the
@@ -139,7 +181,7 @@ func mkNode(t *testing.T, name, other, epSelf, epOther, mount string, docsKeep b
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &node{t: t, name: name, dir: dir, cfg: cfg, eng: eng}
+	return &node{t: t, name: name, dir: dir, cfg: cfg, eng: eng, log: &ringLog{}}
 }
 
 func waitFor(t *testing.T, d time.Duration, what string, fn func() bool) {

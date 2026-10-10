@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -102,6 +103,68 @@ func ParseMode(s string) (os.FileMode, error) {
 	return os.FileMode(m), nil
 }
 
+// Backup is a machine's version history: which folders keep one, and how far
+// back it reaches.
+type Backup struct {
+	// Enable turns history keeping on for this machine's folders.
+	Enable bool `json:"enable"`
+	// Keep is how long a version may live, as a duration with h/d/w/y units
+	// ("1y", "90d", "36h"). Empty means one year. Nothing older is ever
+	// kept, whatever the thinning schedule would say.
+	Keep string `json:"keep,omitempty"`
+	// Folders opts individual folders out by name.
+	Folders map[string]bool `json:"folders,omitempty"`
+}
+
+// ParseKeep parses a keep duration: the usual Go units plus d, w and y, so a
+// retention window reads the way it is spoken ("1y", "90d").
+func ParseKeep(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	unit := time.Duration(0)
+	digits := s
+	switch {
+	case strings.HasSuffix(s, "y"):
+		unit, digits = 365*24*time.Hour, strings.TrimSuffix(s, "y")
+	case strings.HasSuffix(s, "w"):
+		unit, digits = 7*24*time.Hour, strings.TrimSuffix(s, "w")
+	case strings.HasSuffix(s, "d"):
+		unit, digits = 24*time.Hour, strings.TrimSuffix(s, "d")
+	}
+	if unit == 0 {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("%q: want a duration like 36h, 90d, 4w or 1y", s)
+		}
+		if d <= 0 {
+			return 0, fmt.Errorf("%q: keep must be positive", s)
+		}
+		return d, nil
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%q: want a positive number before %q", s, s[len(s)-1:])
+	}
+	return time.Duration(n) * unit, nil
+}
+
+// BackupFor reports whether a folder keeps history on this machine and for
+// how long (zero duration means the default year).
+func (c *Config) BackupFor(folder string) (bool, time.Duration, error) {
+	if c.Backup == nil || !c.Backup.Enable {
+		return false, 0, nil
+	}
+	if off, ok := c.Backup.Folders[folder]; ok && !off {
+		return false, 0, nil
+	}
+	keep, err := ParseKeep(c.Backup.Keep)
+	if err != nil {
+		return false, 0, fmt.Errorf("backup keep: %w", err)
+	}
+	return true, keep, nil
+}
+
 // GroupFolder is a folder's declaration inside a group. Mount is the
 // default every peer sees; each peer overrides it locally in `mounts`.
 type GroupFolder struct {
@@ -145,6 +208,15 @@ type Config struct {
 	// may override it per group; a folder with content at its mount path is
 	// migrated into the storage directory on the next transition.
 	StorageDir *string `json:"storageDir,omitempty"`
+
+	// Backup, per machine, keeps a thinned history of every file's versions
+	// under the data directory: the newest version of each hour for a day,
+	// each day for a week, each week for a month, each month for a year (and
+	// each year beyond that), and nothing older than Keep. Folders opt out
+	// per name; a version is never dropped while it is the file's current
+	// one, and the retention policy is the only thing in the daemon that
+	// ever deletes anything of its own accord.
+	Backup *Backup `json:"backup,omitempty"`
 
 	// Permissions overrides, per folder on THIS machine, the ownership and
 	// mode the daemon gives the folder's entries. Fields left empty fall
@@ -450,6 +522,12 @@ func (c *Config) Validate() error {
 	}
 	if c.StorageDir != nil && *c.StorageDir != "" && !filepath.IsAbs(*c.StorageDir) {
 		return fmt.Errorf("storageDir %q must be absolute (or empty for content at the mount path)", *c.StorageDir)
+	}
+
+	if c.Backup != nil {
+		if _, err := ParseKeep(c.Backup.Keep); err != nil {
+			return fmt.Errorf("backup keep: %w", err)
+		}
 	}
 
 	// Two folders on one identical path stay an error: there is no reading

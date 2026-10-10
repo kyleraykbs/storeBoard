@@ -124,6 +124,7 @@ func (e *Engine) scan(fs *FolderState, tombstones bool) ([]*Entry, error) {
 		if err := fs.db.Put(ent); err != nil {
 			return err
 		}
+		e.record(fs, ent)
 		changed = append(changed, ent)
 		return nil
 	})
@@ -161,6 +162,13 @@ func (e *Engine) scan(fs *FolderState, tombstones bool) ([]*Entry, error) {
 		if err := fs.db.Put(tomb); err != nil {
 			return changed, err
 		}
+		// The version that vanished is worth keeping: this is the delete a
+		// restore would undo, so it is recorded as a deletion holding the
+		// content it removed - what `backup list` shows as gone and what a
+		// bare `backup restore` brings back.
+		gone := ent.clone()
+		gone.Deleted = true
+		e.record(fs, gone)
 		changed = append(changed, tomb)
 	}
 

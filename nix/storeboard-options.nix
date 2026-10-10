@@ -177,6 +177,46 @@ rec {
     '';
   };
 
+  backup = lib.mkOption {
+    type = lib.types.nullOr (
+      lib.types.submodule {
+        options = {
+          enable = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Keep a thinned history of every file's versions under the data directory.";
+          };
+          keep = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "1y";
+            description = ''
+              How long a version may live: a duration with h/d/w/y units
+              ("1y", "90d", "4w", "36h"). Null means one year. Nothing older
+              than this is ever kept.
+            '';
+          };
+          folders = lib.mkOption {
+            type = lib.types.attrsOf lib.types.bool;
+            default = { };
+            example = {
+              Videos = false;
+            };
+            description = "Per-folder opt-out by name: false keeps no history for that folder.";
+          };
+        };
+      }
+    );
+    default = null;
+    description = ''
+      Version history for this machine's folders, thinned the standard way:
+      the newest version of each hour for a day, of each day for a week, of
+      each week for a month, of each month for a year — and nothing older
+      than `keep`. The current version of a file is never dropped, and the
+      retention policy is the only thing the daemon ever deletes on its own.
+    '';
+  };
+
   # One Permissions block, shared by the group default and the per-folder
   # override, so the two can never drift apart.
   permSubmodule = lib.types.submodule {
@@ -252,6 +292,13 @@ rec {
     }
     // lib.optionalAttrs (cfg ? storageDir && cfg.storageDir != null) {
       storageDir = cfg.storageDir;
+    }
+    // lib.optionalAttrs (cfg ? backup && cfg.backup != null) {
+      backup = {
+        enable = cfg.backup.enable;
+      }
+      // lib.optionalAttrs (cfg.backup.keep != null) { keep = cfg.backup.keep; }
+      // lib.optionalAttrs (cfg.backup.folders != { }) { folders = cfg.backup.folders; };
     };
 
   # The config file, validated by the real `storeboard config check` during

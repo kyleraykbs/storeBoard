@@ -138,18 +138,31 @@ func (s *Server) handler() http.Handler {
 	return mux
 }
 
-// handleFolder serves the folder verbs: POST /v1/folders/<name>/takeover.
+// handleFolder serves the folder verbs:
+//
+//	GET  /v1/folders/<name>/versions?path=<p>
+//	POST /v1/folders/<name>/takeover
+//	POST /v1/folders/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
 func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/folders/")
 	name, verb, ok := strings.Cut(rest, "/")
 	if !ok || name == "" || strings.Contains(verb, "/") {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint; want /v1/folders/<name>/takeover"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint; want /v1/folders/<name>/<verb>"})
 		return
 	}
-	if verb != "takeover" {
+	switch verb {
+	case "takeover":
+		s.handleTakeover(w, r, name)
+	case "versions":
+		s.handleVersions(w, r, name)
+	case "restore":
+		s.handleRestore(w, r, name)
+	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such folder verb %q", verb)})
-		return
 	}
+}
+
+func (s *Server) handleTakeover(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -163,6 +176,60 @@ func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.engine.Takeover(name, uid)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleVersions lists a file's recorded versions. Reading is no more
+// privileged than status: the socket is world-readable already.
+func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	res, err := s.engine.Versions(name, r.URL.Query().Get("path"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	uid, ok := requestUID(r)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+		Blob string `json:"blob"`
+		At   string `json:"at"`
+		To   string `json:"to"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("body: %v", err)})
+		return
+	}
+	var at time.Time
+	if req.At != "" {
+		parsed, err := time.Parse(time.RFC3339, req.At)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("at: %v", err)})
+			return
+		}
+		at = parsed
+	}
+	res, err := s.engine.Restore(name, uid, req.Path, req.Blob, at, req.To)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
 		return

@@ -88,7 +88,8 @@ cat >"$config" <<EOF
       "folders": { "store": { "mount": "$work/storage-store-view" } }
     }
   },
-  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive", "store": "$work/storage-store-view" }
+  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive", "store": "$work/storage-store-view" },
+  "backup": { "enable": true, "keep": "7d" }
 }
 EOF
 
@@ -102,14 +103,27 @@ done
 [ -S "$socket" ] || { echo "FAIL: daemon socket never appeared" >&2; exit 1; }
 
 echo "== status, both modes"
+wait_for 10 "every folder is prepared" bash -c '
+  "$0" --config "$1" status --json 2>/dev/null |
+    jq -e "(.folders | length == 4) and ([.sync[].state] | all(. != \"\"))" >/dev/null
+' "$CLI" "$config"
 "$CLI" --config "$config" status | grep -q "photos"
-"$CLI" --config "$config" status --json |
+status_json=$("$CLI" --config "$config" status --json)
+echo "$status_json" |
 	jq -e --arg s "$socket" --arg w "$work" '
 		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
 		(.groups | length == 2) and (.folders | length == 4) and
 		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs")) and
 		([.folders[].keepOffline] | all) and
-		([.sync[].state] | all(. == "replica"))' >/dev/null
+		([.sync[].state] | all(. == "replica"))' >/dev/null || {
+	echo "FAIL: the status document is not what this test expects:" >&2
+	echo "$status_json" | jq -c '{
+		apiVersion, socket, peer,
+		groups: (.groups | length), folders: (.folders | length),
+		keepOffline: [.folders[].keepOffline], states: [.sync[] | {folder, state}]
+	}' >&2
+	exit 1
+}
 
 echo "== second daemon refused on a live socket"
 if "$DAEMON" --config "$config" 2>/dev/null; then
@@ -176,6 +190,32 @@ echo "== replica folder syncs"
 echo "hello from laptop" >"$work/Pictures/a.txt"
 wait_for 10 "file replicated to desktop (replica)" test -f "$work/PicturesB/a.txt"
 grep -q "hello from laptop" "$work/PicturesB/a.txt"
+
+echo "== backup lists versions and restores one"
+wait_for 10 "the first version is recorded" bash -c '
+  "$0" --config "$1" backup list photos a.txt 2>/dev/null | grep -q "1 recorded"
+' "$CLI" "$config"
+echo "edited later" >"$work/Pictures/a.txt"
+wait_for 10 "the edit is recorded" bash -c '
+  "$0" --config "$1" backup list photos a.txt 2>/dev/null | grep -q "2 recorded"
+' "$CLI" "$config"
+first=$("$CLI" --config "$config" backup list photos a.txt --json | jq -r '.versions[-1].time')
+"$CLI" --config "$config" backup restore photos a.txt --at "$first" >/dev/null
+grep -q "hello from laptop" "$work/Pictures/a.txt" || {
+	echo "FAIL: restore did not bring the first version back" >&2
+	exit 1
+}
+echo "== a deleted file comes back from its history"
+rm "$work/Pictures/a.txt"
+wait_for 10 "the delete is recorded" bash -c '
+  "$0" --config "$1" backup list photos a.txt --json 2>/dev/null | jq -e "[.versions[] | select(.deleted)] | length >= 1" >/dev/null
+' "$CLI" "$config"
+"$CLI" --config "$config" backup restore photos a.txt >/dev/null
+test -f "$work/Pictures/a.txt" || {
+	echo "FAIL: a deleted file was not restored" >&2
+	exit 1
+}
+
 
 echo "== streamed folder attaches"
 wait_for 10 "desktop mount attached" bash -c "[ -L '$work/remoteDocs' ]"

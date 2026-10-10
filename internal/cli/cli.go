@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,8 @@ const usage = `usage: storeboard [--config FILE] <command> [arguments]
 
 Commands:
   config check    validate the configuration file
+  backup <verb>   versions and restores: list a file's recorded history,
+                  restore a version, a deleted file included
   folder takeover <name>
                   mount a folder over a path that already holds files,
                   keeping that content and syncing it
@@ -65,6 +68,8 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return status(ctx, configPath, rest, stdout, stderr)
 	case "folder":
 		return folderCmd(ctx, configPath, rest, stdout, stderr)
+	case "backup":
+		return backupCmd(ctx, configPath, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "storeboard: unknown command %q\n\n%s", cmd, usage)
 		return ErrHandled
@@ -222,8 +227,17 @@ func status(ctx context.Context, configPath string, args []string, stdout, stder
 }
 
 // call sends one request to the daemon over its unix socket and returns the
-// body, with the daemon's own error message when it refuses.
-func call(ctx context.Context, socket, method, path string) ([]byte, error) {
+// body, with the daemon's own error message when it refuses. A non-nil body
+// is encoded as JSON.
+func call(ctx context.Context, socket, method, path string, body any) ([]byte, error) {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -232,16 +246,19 @@ func call(ctx context.Context, socket, method, path string) ([]byte, error) {
 			},
 		},
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "http://storeboard"+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, "http://storeboard"+path, reader)
 	if err != nil {
 		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -249,16 +266,195 @@ func call(ctx context.Context, socket, method, path string) ([]byte, error) {
 		var e struct {
 			Error string `json:"error"`
 		}
-		if json.Unmarshal(body, &e) == nil && e.Error != "" {
+		if json.Unmarshal(respBody, &e) == nil && e.Error != "" {
 			return nil, errors.New(e.Error)
 		}
 		return nil, fmt.Errorf("daemon answered %s", resp.Status)
 	}
-	return body, nil
+	return respBody, nil
 }
 
 func fetch(ctx context.Context, socket, path string) ([]byte, error) {
-	return call(ctx, socket, http.MethodGet, path)
+	return call(ctx, socket, http.MethodGet, path, nil)
+}
+
+// backupCmd is the backup verb group: list a file's recorded versions and
+// restore one of them.
+func backupCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, "storeboard: usage: storeboard backup <list|restore> …\n")
+		return ErrHandled
+	}
+	verb, rest := args[0], args[1:]
+	switch verb {
+	case "list":
+		return backupList(ctx, configPath, rest, stdout, stderr)
+	case "restore":
+		return backupRestore(ctx, configPath, rest, stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "storeboard: unknown backup command %q\n\nusage: storeboard backup <list|restore> …\n", verb)
+		return ErrHandled
+	}
+}
+
+// splitFlags separates the shared flags from positional arguments, so a
+// command can take both without the flag parser tripping over the names.
+func splitFlags(args []string, command string, stderr io.Writer) (bool, []string, error) {
+	var flags, positional []string
+	for _, arg := range args {
+		if arg == "--json" || arg == "-h" || arg == "--help" {
+			flags = append(flags, arg)
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	jsonOut, err := jsonFlag(flags, command, stderr)
+	return jsonOut, positional, err
+}
+
+func backupList(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	jsonOut, positional, err := splitFlags(args, "backup list <folder> [path]", stderr)
+	if err != nil {
+		return err
+	}
+	if len(positional) < 1 || len(positional) > 2 {
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup list <folder> [path] [--json]")
+		return ErrHandled
+	}
+	folder := positional[0]
+	path := ""
+	if len(positional) == 2 {
+		path = positional[1]
+	}
+
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	query := "/v1/folders/" + url.PathEscape(folder) + "/versions"
+	if path != "" {
+		query += "?path=" + url.QueryEscape(path)
+	}
+	body, err := fetch(ctx, cfg.Socket, query)
+	if err != nil {
+		return fmt.Errorf("backup list %s: %w", folder, err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var vs api.Versions
+	if err := json.Unmarshal(body, &vs); err != nil {
+		return fmt.Errorf("parse versions: %w", err)
+	}
+	kept := vs.Keep
+	if kept == "" {
+		kept = "1y"
+	}
+	what := folder
+	if path != "" {
+		what += " " + path
+	}
+	if len(vs.Versions) == 0 {
+		fmt.Fprintf(stdout, "%s: no recorded versions (keeping %s)\n", what, kept)
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: %d recorded versions, keeping %s\n", what, len(vs.Versions), kept)
+	for _, v := range vs.Versions {
+		detail := fmt.Sprintf("%8d bytes", v.Size)
+		if v.Deleted {
+			detail = "deleted"
+		}
+		line := fmt.Sprintf("  %s  %s", v.Time.Format(time.RFC3339), detail)
+		if v.Blob != "" {
+			line += "  " + shortBlob(v.Blob)
+		}
+		if v.Path != "" && path == "" {
+			line += "  " + v.Path
+		}
+		fmt.Fprintln(stdout, line)
+	}
+	return nil
+}
+
+func backupRestore(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	jsonOut, positional, err := splitFlags(args, "backup restore <folder> <path>", stderr)
+	if err != nil {
+		return err
+	}
+	if len(positional) < 2 {
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup restore <folder> <path> [--blob HASH] [--at RFC3339] [--to PATH] [--json]")
+		return ErrHandled
+	}
+	req := struct {
+		Path string `json:"path"`
+		Blob string `json:"blob,omitempty"`
+		At   string `json:"at,omitempty"`
+		To   string `json:"to,omitempty"`
+	}{Path: positional[1]}
+	folder := positional[0]
+
+	// The value flags take an argument, which is why this walks by index.
+	for i := range args {
+		want := ""
+		switch args[i] {
+		case "--blob":
+			want = "1"
+		case "--at":
+			want = "2"
+		case "--to":
+			want = "3"
+		default:
+			continue
+		}
+		if i+1 >= len(args) {
+			return usageErr(stderr, "backup restore <folder> <path>", args[i]+" needs a value")
+		}
+		switch want {
+		case "1":
+			req.Blob = args[i+1]
+		case "2":
+			req.At = args[i+1]
+		case "3":
+			req.To = args[i+1]
+		}
+	}
+
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(folder)+"/restore", req)
+	if err != nil {
+		return fmt.Errorf("backup restore %s: %w", folder, err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var res api.RestoreResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		return fmt.Errorf("parse restore result: %w", err)
+	}
+	if res.Copied {
+		fmt.Fprintf(stdout, "%s: wrote the version of %s to %s (the folder is untouched)\n", folder, positional[1], res.Path)
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: restored %s from %s; it is a new version and syncs like any other change\n",
+		folder, res.Path, res.At.Format(time.RFC3339))
+	return nil
+}
+
+func usageErr(stderr io.Writer, command, problem string) error {
+	fmt.Fprintf(stderr, "storeboard: %s: %s\n", command, problem)
+	return ErrHandled
+}
+
+func shortBlob(blob string) string {
+	if len(blob) > 12 {
+		return blob[:12]
+	}
+	return blob
 }
 
 // folderCmd is the folder verb group: `folder takeover <name>` converts a
@@ -310,7 +506,7 @@ func folderTakeover(ctx context.Context, configPath string, args []string, stdou
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(name)+"/takeover")
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(name)+"/takeover", nil)
 	if err != nil {
 		return fmt.Errorf("takeover %s: %w", name, err)
 	}

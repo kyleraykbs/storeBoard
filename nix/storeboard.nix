@@ -165,6 +165,7 @@ in
       keepOffline
       permissions
       storageDir
+      backup
       ;
   };
 

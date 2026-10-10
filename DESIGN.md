@@ -95,6 +95,11 @@ one, it changes here first, deliberately, with a decision log entry.
 
 ## Sync engine (2026-10-07)
 
+- Every version transition is recorded per folder in a history log
+  (`<dataDir>/history/<folder>.ndjson`, append-only, checkpointed like the
+  journals) referencing the blob that holds those bytes; retention thins it
+  on the schedule above and `storeboard backup list|restore` reads it.
+
 - Content is content-addressed (`<dataDir>/store/<sha256>`), shared by all
   folders on a machine, written temp → fsync → rename.
 - Every folder keeps an append-only NDJSON journal (`<dataDir>/journal/`)
@@ -150,3 +155,16 @@ one, it changes here first, deliberately, with a decision log entry.
   into a false conflict.
 - 4, 8, 9: forward-looking — policies/hooks and min/max protocol
   negotiation do not exist yet.
+16. Version history is opt-in per machine and thinned by a fixed schedule:
+    the newest version of each hour for a day, of each day for a week, of
+    each week for a month, of each month for a year, of each year beyond —
+    and nothing older than the keep window (`backup.keep`, default one
+    year). The current version of a file is never dropped. A folder that is
+    *streamed* on a machine keeps no history there: the versions belong to
+    whoever holds the content, which is what makes one group-level
+    declaration correct on every machine. The retention policy and the
+    content collector are the only things the daemon ever deletes on its
+    own: the collector frees a blob only when no journal, no kept version,
+    no orphan journal (a folder removed from the config still owns its
+    bytes, invariant 1) and no recent write references it, and it refuses
+    to act at all when a reference source cannot be read.

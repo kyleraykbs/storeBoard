@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, contents string) string {
@@ -620,5 +621,69 @@ func TestDefaultStorageMakesRootsDisjoint(t *testing.T) {
 	}
 	if w := cfg.Warnings(); len(w) != 0 {
 		t.Errorf("storage-backed roots warned: %v", w)
+	}
+}
+
+func TestParseKeep(t *testing.T) {
+	day := 24 * time.Hour
+	cases := map[string]time.Duration{
+		"1y":  365 * day,
+		"2y":  730 * day,
+		"90d": 90 * day,
+		"4w":  28 * day,
+		"36h": 36 * time.Hour,
+		"":    0, // the default, resolved by the daemon
+	}
+	for in, want := range cases {
+		got, err := ParseKeep(in)
+		if err != nil || got != want {
+			t.Errorf("ParseKeep(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"1y2d", "0d", "-1d", "d", "1m2", "soon"} {
+		if _, err := ParseKeep(bad); err == nil {
+			t.Errorf("ParseKeep(%q): want an error", bad)
+		}
+	}
+}
+
+func TestBackupConfig(t *testing.T) {
+	base := `{
+  "configVersion": 1,
+  "peer": "laptop",
+  "dataDir": "/var/lib/storeboard",
+  "socket": "/run/storeboard.sock",
+  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "media": {}}}},
+  %s
+}`
+
+	// No block: no history anywhere.
+	path := writeConfig(t, fmt.Sprintf(base, `"storageDir": ""`))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if on, _, err := cfg.BackupFor("docs"); err != nil || on {
+		t.Fatalf("BackupFor without a block = %v, %v; want off", on, err)
+	}
+
+	// Enabled, one folder opted out, a window of 90 days.
+	path = writeConfig(t, fmt.Sprintf(base, `"storageDir": "", "backup": {"enable": true, "keep": "90d", "folders": {"media": false}}`))
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, keep, err := cfg.BackupFor("docs")
+	if err != nil || !on || keep != 90*24*time.Hour {
+		t.Fatalf("docs backup = %v/%v/%v, want on for 90d", on, keep, err)
+	}
+	if on, _, err := cfg.BackupFor("media"); err != nil || on {
+		t.Fatalf("media backup = %v, %v; want it opted out", on, err)
+	}
+
+	// A keep value the daemon cannot read fails the config, not the daemon.
+	path = writeConfig(t, fmt.Sprintf(base, `"storageDir": "", "backup": {"enable": true, "keep": "1y2d"}`))
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "keep") {
+		t.Fatalf("err = %v, want a keep error", err)
 	}
 }

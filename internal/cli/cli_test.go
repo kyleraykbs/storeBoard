@@ -285,3 +285,64 @@ func TestFolderTakeoverReportsTheDaemonError(t *testing.T) {
 		t.Fatalf("err = %v, want the daemon's own reason", err)
 	}
 }
+
+// backup list renders a file's recorded versions; backup restore posts the
+// version asked for and reports what the daemon did.
+func TestBackupCommands(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "s.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var gotBody []byte
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/versions"):
+			_, _ = w.Write([]byte(`{"folder":"docs","path":"note.txt","keep":"8760h0m0s","versions":[
+				{"path":"note.txt","time":"2026-10-09T12:00:00Z","blob":"abc123def4567890","size":11},
+				{"path":"note.txt","time":"2026-10-08T12:00:00Z","deleted":true,"size":0}]}`))
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/restore"):
+			gotBody, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"folder":"docs","path":"note.txt","blob":"abc123def4567890","at":"2026-10-08T12:00:00Z"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"no such endpoint"}`))
+		}
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	path := writeConfig(t, `{"configVersion": 1, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"backup", "list", "docs", "note.txt"}, path, &out, &errOut); err != nil {
+		t.Fatalf("backup list: %v (%s)", err, errOut.String())
+	}
+	for _, want := range []string{"2 recorded versions", "2026-10-09T12:00:00Z", "deleted", "abc123def456"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("backup list output missing %q:\n%s", want, out.String())
+		}
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"backup", "restore", "docs", "note.txt", "--at", "2026-10-08T12:00:00Z"}, path, &out, &errOut); err != nil {
+		t.Fatalf("backup restore: %v (%s)", err, errOut.String())
+	}
+	if !strings.Contains(string(gotBody), `"path":"note.txt"`) || !strings.Contains(string(gotBody), `"at":"2026-10-08T12:00:00Z"`) {
+		t.Fatalf("restore body = %s", gotBody)
+	}
+	if !strings.Contains(out.String(), "restored note.txt") {
+		t.Fatalf("restore output = %s", out.String())
+	}
+
+	// Usage: a missing argument and an unknown verb are errors, not panics.
+	for _, args := range [][]string{{"backup"}, {"backup", "list"}, {"backup", "restore", "docs"}, {"backup", "revert"}} {
+		var o, e bytes.Buffer
+		if err := Run(context.Background(), args, path, &o, &e); err != ErrHandled {
+			t.Errorf("%v: err = %v, want ErrHandled", args, err)
+		}
+	}
+}

@@ -45,6 +45,7 @@ type FolderState struct {
 	state     string
 	busy      string // why state is busy, one of the api.Busy* reasons
 	db        *FileDB
+	hist      *History // nil when this machine keeps no history for the folder
 	conflicts int
 	lastScan  time.Time
 
@@ -178,6 +179,24 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		var hist *History
+		on, keep, herr := cfg.BackupFor(f.Name)
+		if herr != nil {
+			return nil, herr
+		}
+		if on {
+			if f.KeepOffline {
+				hist, err = OpenHistory(filepath.Join(cfg.DataDir, "history", f.Name+".ndjson"), keep)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				// A streamed folder is a mirror, not a holder: its versions
+				// belong to the machine that holds the content, so backup is
+				// ignored on this one.
+				logger.Debug("backup ignored: the folder is streamed on this machine", "folder", f.Name)
+			}
+		}
 		fs := &FolderState{
 			name:     f.Name,
 			group:    f.Group,
@@ -185,6 +204,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			storage:  f.Storage,
 			streamed: !f.KeepOffline,
 			db:       db,
+			hist:     hist,
 			perm:     noPerms(),
 			published: api.FolderSync{
 				Folder:      f.Name,
@@ -203,6 +223,12 @@ func (e *Engine) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, fs := range e.folders {
 		e.prepare(fs)
+		// Retention first (an in-memory pass), then unreferenced content: the
+		// collector runs before anything is in flight, and a blob touched in the
+		// last few minutes is kept regardless - a peer may be mid-transfer.
+		e.pruneOnce(time.Now())
+		e.Collect()
+		go e.pruneLoop(ctx, pruneInterval)
 		wg.Add(1)
 		go func(fs *FolderState) {
 			defer wg.Done()
@@ -428,9 +454,12 @@ func (e *Engine) Snapshot() []api.FolderSync {
 	return out
 }
 
-// Close releases the journals.
+// Close releases the journals and histories.
 func (e *Engine) Close() {
 	for _, fs := range e.folders {
 		fs.db.Close()
+		if fs.hist != nil {
+			fs.hist.Close()
+		}
 	}
 }

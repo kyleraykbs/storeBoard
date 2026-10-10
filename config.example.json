@@ -25,5 +25,10 @@
   "permissions": {
     "documents": { "user": "alice", "mode": "0755" }
   },
-  "storageDir": "/srv/storeboard"
+  "storageDir": "/srv/storeboard",
+  "backup": {
+    "enable": true,
+    "keep": "1y",
+    "folders": { "archive": false }
+  }
 }
