@@ -93,12 +93,23 @@ const (
 // no holder is reachable), busy (something else owns the mount path, e.g. a
 // samba mount, and the engine leaves it alone). Busy carries the reason when
 // state is busy; empty otherwise.
+//
+// The counts describe the work in progress, which is what a streamed folder
+// grinding through a large tree looks like from outside: Entries is what the
+// folder knows, Local how much of it exists here, Pending the difference
+// (the queue being materialised), Scanning whether a walk is running right
+// now, and Receiving how many blobs are arriving. All are read without the
+// scan lock, so status stays answerable while the folder is busy.
 type FolderSync struct {
 	Folder      string      `json:"folder"`
 	Root        string      `json:"root"`
 	State       string      `json:"state"`
 	Busy        string      `json:"busy,omitempty"`
 	Entries     int         `json:"entries"`
+	Local       int         `json:"local"`
+	Pending     int         `json:"pending"`
+	Scanning    bool        `json:"scanning"`
+	Receiving   int         `json:"receiving"`
 	Conflicts   int         `json:"conflicts"`
 	LastScan    time.Time   `json:"lastScan"`
 	Permissions Permissions `json:"permissions"`

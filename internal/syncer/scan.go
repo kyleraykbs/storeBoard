@@ -25,6 +25,8 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 	defer fs.scanMu.Unlock()
 
 	root := fs.root
+	fs.setScanning(true)
+	defer fs.setScanning(false)
 	seen := make(map[string]bool)
 	var changed []*Entry
 	var unmaterialised int
@@ -122,6 +124,7 @@ func (e *Engine) scan(fs *FolderState) ([]*Entry, error) {
 	if walkErr != nil {
 		return changed, walkErr
 	}
+	fs.setLocal(len(seen))
 
 	for _, ent := range fs.db.All() {
 		if ent.Deleted || seen[ent.Path] {

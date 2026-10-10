@@ -34,8 +34,9 @@ type pending struct {
 }
 
 type incomingBlob struct {
-	f     *os.File
-	entry *Entry
+	folder string
+	f      *os.File
+	entry  *Entry
 }
 
 func wantKey(folder, path string) string { return folder + "\x00" + path }
@@ -284,7 +285,7 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.mu.Unlock()
 			return
 		}
-		inc = &incomingBlob{f: f}
+		inc = &incomingBlob{folder: fr.Folder, f: f}
 		e.incoming[key] = inc
 	}
 	e.mu.Unlock()

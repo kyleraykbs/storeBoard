@@ -405,6 +405,20 @@ func renderStatus(w io.Writer, st *api.Status) {
 			detail += fmt.Sprintf(", %s:%s %s", s.Permissions.User, s.Permissions.Group, s.Permissions.Mode)
 		}
 		fmt.Fprintf(w, "  %s\n    %s\n", s.Folder, detail)
+		if s.Scanning || s.Pending > 0 || s.Receiving > 0 {
+			// The grind, visible: what a large folder is doing right now.
+			line := fmt.Sprintf("%d/%d local", s.Local, s.Entries)
+			if s.Scanning {
+				line += ", scanning"
+			}
+			if s.Receiving > 0 {
+				line += fmt.Sprintf(", receiving %d", s.Receiving)
+			}
+			if s.Pending > 0 {
+				line += fmt.Sprintf(" (%d to fetch)", s.Pending)
+			}
+			fmt.Fprintf(w, "    %s\n", line)
+		}
 		if s.State != "busy" || s.Busy == "" {
 			continue
 		}

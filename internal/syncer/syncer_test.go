@@ -1333,3 +1333,38 @@ func TestSnapshotNeverWaitsOnTheScanLock(t *testing.T) {
 	}
 	fs.scanMu.Unlock()
 }
+
+// The grind has to be visible while it happens: local vs pending, scanning,
+// and how many blobs are arriving — all readable without the scan lock.
+func TestProgressIsVisibleWhileWorking(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "docs")
+	mount := filepath.Join(t.TempDir(), "remote-docs")
+
+	holder := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", root, true)
+	client := mkNode(t, "b", "a", "127.0.0.1:2", "127.0.0.1:1", mount, false)
+	fs := client.eng.folders[0]
+	client.eng.prepare(fs)
+
+	// Known from the mesh, not fetched yet: pending, and nothing to do with
+	// the scan lock being held.
+	if err := fs.db.Put(&Entry{Path: "a.txt", Blob: strings.Repeat("ab", 32), Size: 4, MTime: time.Now().UnixNano(), VV: map[string]uint64{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	fs.scanMu.Lock()
+	s := client.eng.Snapshot()[0]
+	fs.scanMu.Unlock()
+	if s.Entries != 1 || s.Local != 0 || s.Pending != 1 {
+		t.Fatalf("grind counts = entries %d local %d pending %d, want 1/0/1", s.Entries, s.Local, s.Pending)
+	}
+
+	// A scan reports what it found; afterwards the counts settle.
+	writeFile(t, filepath.Join(fs.root, "here.txt"), "present", time.Now())
+	if _, err := client.eng.scan(fs); err != nil {
+		t.Fatal(err)
+	}
+	s = client.eng.Snapshot()[0]
+	if s.Local != 1 || s.Scanning {
+		t.Fatalf("after a scan: local %d scanning %v, want 1/false", s.Local, s.Scanning)
+	}
+	_ = holder
+}

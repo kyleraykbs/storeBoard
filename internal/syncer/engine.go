@@ -59,6 +59,8 @@ type FolderState struct {
 	// from a dead daemon).
 	metaMu    sync.Mutex
 	published api.FolderSync
+	local     int  // entries present on this machine, as of the last scan
+	scanning  bool // a scan is walking the folder right now
 }
 
 // publish returns the folder's status, refreshing the fields that need the
@@ -84,6 +86,11 @@ func (fs *FolderState) publish() api.FolderSync {
 	out.Entries = fs.db.Count()
 	out.Conflicts = fs.conflicts
 	out.LastScan = fs.lastScan
+	out.Local = fs.local
+	out.Scanning = fs.scanning
+	if pending := out.Entries - fs.local; pending > 0 {
+		out.Pending = pending
+	}
 	return out
 }
 
@@ -98,6 +105,22 @@ func (fs *FolderState) addConflict() {
 func (fs *FolderState) setLastScan(t time.Time) {
 	fs.metaMu.Lock()
 	fs.lastScan = t
+	fs.metaMu.Unlock()
+}
+
+// setLocal records how many of the folder's entries exist on this machine
+// (the rest are pending — the work a streamed folder is grinding through),
+// and setScanning whether a walk is running right now. Both live under
+// metaMu so publish sees them without the scan lock.
+func (fs *FolderState) setLocal(local int) {
+	fs.metaMu.Lock()
+	fs.local = local
+	fs.metaMu.Unlock()
+}
+
+func (fs *FolderState) setScanning(scanning bool) {
+	fs.metaMu.Lock()
+	fs.scanning = scanning
 	fs.metaMu.Unlock()
 }
 
@@ -381,9 +404,18 @@ func (e *Engine) participantConnected(fs *FolderState) bool {
 // Snapshot is the status document's sync section. It never waits on the scan
 // or apply locks.
 func (e *Engine) Snapshot() []api.FolderSync {
+	receiving := map[string]int{}
+	e.mu.Lock()
+	for _, inc := range e.incoming {
+		receiving[inc.folder]++
+	}
+	e.mu.Unlock()
+
 	out := make([]api.FolderSync, 0, len(e.folders))
 	for _, fs := range e.folders {
-		out = append(out, fs.publish())
+		s := fs.publish()
+		s.Receiving = receiving[fs.name]
+		out = append(out, s)
 	}
 	return out
 }
