@@ -37,22 +37,45 @@ type node struct {
 	cancel context.CancelFunc
 }
 
-// twoEndpoints returns two distinct loopback addresses. The listeners stay
-// open while both are allocated: asking one at a time lets the kernel hand
-// out the same port twice, which made one daemon dial itself.
+// twoEndpoints returns two distinct loopback addresses the tests can hand
+// to daemons. The listeners stay open while both are allocated: asking one
+// at a time lets the kernel hand out the same port twice, which made one
+// daemon dial itself. They are then closed and immediately re-checked, so a
+// port taken by something else in that window is retried rather than
+// turning into a daemon that never listens (a silently stalled sync).
 func twoEndpoints(t *testing.T) (string, string) {
 	t.Helper()
-	l1, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 5; attempt++ {
+		l1, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		l2, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			l1.Close()
+			t.Fatal(err)
+		}
+		ep1, ep2 := l1.Addr().String(), l2.Addr().String()
+		l1.Close()
+		l2.Close()
+
+		// Both must still be free, or the daemons will not be able to bind.
+		p1, err1 := net.Listen("tcp", ep1)
+		p2, err2 := net.Listen("tcp", ep2)
+		if err1 == nil && err2 == nil {
+			p1.Close()
+			p2.Close()
+			return ep1, ep2
+		}
+		if p1 != nil {
+			p1.Close()
+		}
+		if p2 != nil {
+			p2.Close()
+		}
 	}
-	defer l1.Close()
-	l2, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l2.Close()
-	return l1.Addr().String(), l2.Addr().String()
+	t.Fatal("could not find two free loopback ports")
+	return "", ""
 }
 
 // start brings the engine and its transport up.
