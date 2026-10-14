@@ -173,15 +173,21 @@ func mkNode(t *testing.T, name, other, epSelf, epOther, mount string, docsKeep b
 		Mounts:      map[string]string{"docs": mount},
 		KeepOffline: map[string]bool{"docs": docsKeep},
 	}
-	var logger *slog.Logger
+	ring := &ringLog{}
+	// The engine is built here, so it has to log to the ring too: a node whose
+	// engine wrote to a discard handler made its own failure unreadable.
+	// Debug into the ring, not just Info: when a test times out, the
+	// interesting thing is usually a debug line (a dropped want, a failed
+	// send), and hiding it made failures unreadable.
+	logger := slog.New(slog.NewTextHandler(ring, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	if os.Getenv("STOREBOARD_TEST_LOG") != "" {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		logger = slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, ring), &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	eng, err := New(cfg, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &node{t: t, name: name, dir: dir, cfg: cfg, eng: eng, log: &ringLog{}}
+	return &node{t: t, name: name, dir: dir, cfg: cfg, eng: eng, log: ring}
 }
 
 func waitFor(t *testing.T, d time.Duration, what string, fn func() bool) {
