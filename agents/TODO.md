@@ -2,11 +2,12 @@
 
 ## Android app (2026-10-15)
 
-- Run the app's own build end to end: `scripts/build-android-app.sh`
-  (composes a trimmed SDK — see NOTES — then binds the AAR and runs
-  `gradle assembleDebug`). The bind and the Kotlin/Gradle side are the parts
-  not yet verified; the Go-side calls they make are covered by `mobile/`'s
-  tests on the host.
+- Built and packaged; the remaining step is a device: `adb install
+  android/app/build/outputs/apk/debug/app-debug.apk`, then edit the config
+  on first run (pool name + endpoint here, `phone` in the pool's group).
+  Nothing has exercised the app at runtime yet — the engine it embeds is
+  covered on the host, and `TestAppDefaultConfigIsValid` pins the config it
+  writes.
 - Decide the camera-roll question: keep the app-private `camera` folder, or
   adopt `DCIM/` with `MANAGE_EXTERNAL_STORAGE` (sideload-only) or a
   MediaStore importer that copies instead of mounting.

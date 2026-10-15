@@ -306,5 +306,6 @@
 - **Reversible:** yes — `mobile/` is additive; deleting it leaves the daemon
   and the CLI untouched. `send` is additive on the wire and in the CLI, with
   `apiVersion` unchanged.
-- **Open:** the app's own build (SDK/NDK, `gradle assembleDebug`) and the
-  `DCIM/` adoption decision — both in NOTES.
+- **Open:** the app builds — the bind, the Java surface and the APK are
+  verified — but nothing has run it on a device yet; and the `DCIM/`
+  adoption decision is Kyle's. Both in NOTES and TODO.

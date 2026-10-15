@@ -5,9 +5,10 @@ copies on the machines that want it, and going offline never loses data.
 
 Status: working. The flake, the daemon, the CLI, the sync engine, the peer
 transport and the embedded library build and run, with the invariants in
-`DESIGN.md` covered by tests. The event stream and the Android app's build
-are the live edges. `DESIGN.md` holds the invariants the JSON contracts
-already pin down.
+`DESIGN.md` covered by tests. The Android app builds (engine bound by
+gomobile, APK via `scripts/build-android-app.sh`) and has not yet been run
+on a device. The event stream is the live edge. `DESIGN.md` holds the
+invariants the JSON contracts already pin down.
 
 ## Build and run
 
@@ -25,7 +26,8 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
   phone runs the same syncer, store and peer wire the daemon does. No local
   socket (an app has no CLI to serve); everything crossing the boundary is
   the JSON the contracts already name.
-- `android/` — the app that embeds it. Its README has the build.
+- `android/` — the app that embeds it (`scripts/build-android-app.sh` builds
+  it; its README has the details).
 - `nix/` — one NixOS module (daemon + CLI under `services.storeboard`)
   and the home-manager CLI module.
 - `agents/` — decisions, structure, terminology for agent sessions.

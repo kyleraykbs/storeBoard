@@ -71,9 +71,15 @@ object Engine {
      * readable offline.
      *
      * The peer list must name this phone exactly as the pool's config
-     * declares it, and must name the pool by fingerprint, so pairing stays a
-     * config change on machines the operator owns rather than a secret
-     * passed around. That is the one line to paste in and edit.
+     * declares it, and must carry the pool's own name and a dialable
+     * endpoint — the phone dials out, so the endpoint is what makes the pool
+     * reachable. The pool needs the matching line on its side: this phone
+     * listed in its group, no endpoint needed, because a declared but
+     * unaddressed peer simply waits to be dialled.
+     *
+     * This document is pinned by TestAppDefaultConfigIsValid in mobile/ —
+     * the config is strict (an unknown key is an error), so the two have to
+     * move together.
      */
     fun defaultConfig(context: Context): String {
         val data = dataDir(context)
@@ -88,20 +94,17 @@ object Engine {
           "peer": "phone",
           "dataDir": "${data.absolutePath}",
           "socket": "${File(data, "storeboard.sock").absolutePath}",
-          "keepOffline": true,
           "backup": { "enable": true, "keep": "1y" },
+          "peers": {
+            "phone": {},
+            "pool": { "endpoints": ["192.168.1.10:4242"] }
+          },
           "groups": {
             "kyle": {
-              "peers": ["phone", "<the pool's device fingerprint>"],
+              "peers": ["phone", "pool"],
               "folders": {
-                "camera": {
-                  "mount": "${mount("camera")}",
-                  "from": "camera"
-                },
-                "photos": {
-                  "mount": "${mount("photos")}",
-                  "from": "photos"
-                }
+                "camera": { "mount": "${mount("camera")}" },
+                "photos": { "mount": "${mount("photos")}" }
               }
             }
           }

@@ -51,10 +51,20 @@ Maven into `~/.gradle` on first run.
 
 The app writes a config with two folders — `camera` (the roll, kept local,
 syncing out) and `photos` (the library, syncing down, kept readable offline)
-— and starts the engine. The one line to edit before it is useful is the
-peer list: it must name this phone exactly as the pool's config declares it,
-and the pool by fingerprint. Pairing stays a config change on machines you
-own rather than a secret passed around.
+— and starts the engine. Two lines to edit before it is useful, and they are
+the same line on both sides:
+
+- here: the pool's name and a dialable endpoint (`peers.pool.endpoints`).
+  The phone dials out, so the endpoint is what makes the pool reachable.
+- on the pool: this phone, listed in the group (`peers = [ "…" "phone" ]`).
+  No endpoint needed — a declared but unaddressed peer just waits to be
+  dialled, and the daemon rejects a name it does not know (DESIGN
+  invariant 11/14), which is what keeps pairing a config change on machines
+  you own rather than a secret passed around.
+
+Install with `adb install android/app/build/outputs/apk/debug/app-debug.apk`.
+The APK carries all four ABIs (~30 MB, mostly the Go runtime), so any phone
+or emulator will take it.
 
 ## Deliberate gaps
 
