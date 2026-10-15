@@ -65,9 +65,12 @@
             pname = "storeboard";
             inherit version;
             src = lib.cleanSource ./.;
-            # No module dependencies — the stdlib covers the whole
-            # foundation, so there is no vendor tree to hash.
-            vendorHash = null;
+            # The program itself is stdlib-only, but the module graph has one
+            # entry: golang.org/x/mobile, which gomobile's generated bindings
+            # import (mobile/tools.go keeps the requirement tidy-clean).
+            # Nothing in a normal build imports it — hence a vendor hash
+            # rather than a committed vendor tree.
+            vendorHash = "sha256-4IqTxmSbAc/0J7nkIaDjR5lqk/heGaM1ZtRa5YBBUiY=";
             subPackages = [
               "cmd/storeboard"
               "cmd/storeboardd"

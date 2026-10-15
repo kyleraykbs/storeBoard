@@ -2,11 +2,11 @@
 
 ## Android app (2026-10-15)
 
-- Run the app's own build end to end: `scripts/build-android-engine.sh`
-  (needs the SDK/NDK, ~19 GB on first evaluation — see NOTES) then
-  `gradle assembleDebug` in `android/`. Until that passes, the app's
-  *source* is verified only by inspection and by the Go-side tests that
-  exercise the same calls.
+- Run the app's own build end to end: `scripts/build-android-app.sh`
+  (composes a trimmed SDK — see NOTES — then binds the AAR and runs
+  `gradle assembleDebug`). The bind and the Kotlin/Gradle side are the parts
+  not yet verified; the Go-side calls they make are covered by `mobile/`'s
+  tests on the host.
 - Decide the camera-roll question: keep the app-private `camera` folder, or
   adopt `DCIM/` with `MANAGE_EXTERNAL_STORAGE` (sideload-only) or a
   MediaStore importer that copies instead of mounting.

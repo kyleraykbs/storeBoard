@@ -77,7 +77,11 @@ object Engine {
      */
     fun defaultConfig(context: Context): String {
         val data = dataDir(context)
-        val mount = { name: String -> File(data, name).absolutePath }
+        // Mounts live beside the data directory, never inside it: that tree
+        // is the daemon's own (store, journals, storage) and a folder mounted
+        // in there would be indexing the daemon's state.
+        val files = context.filesDir
+        val mount = { name: String -> File(files, name).absolutePath }
         return """
         {
           "configVersion": 1,

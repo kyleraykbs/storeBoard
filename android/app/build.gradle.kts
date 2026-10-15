@@ -7,6 +7,9 @@ plugins {
 android {
     namespace = "dev.kyle.storeboard"
     compileSdk = 35
+    // Declared, not defaulted: AGP would otherwise reach for 34.0.0 and try
+    // to install it, and the SDK comes from the nix store, which is read-only.
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "dev.kyle.storeboard"

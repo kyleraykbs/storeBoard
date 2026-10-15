@@ -23,25 +23,29 @@ and its own history.
 
 ## Building
 
-Two steps. First bind the engine (writes `android/app/libs/storeboard.aar`,
-which is not committed):
+One command builds everything — the composed SDK, the bound engine, and the
+APK:
+
+```sh
+scripts/build-android-app.sh
+# -> android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+For the fast loop after a Go change, bind only (this is the step that makes
+`android/app/libs/storeboard.aar`, which is not committed):
 
 ```sh
 scripts/build-android-engine.sh
 ```
 
-Then build the app:
-
-```sh
-nix shell nixpkgs#jdk21 nixpkgs#gradle -c bash -c '
-  cd android
-  ANDROID_HOME=$ANDROID_SDK_ROOT gradle assembleDebug'
-```
-
-The AAR's `-androidapi 26` matches the app's `minSdk`. The SDK and NDK come
-from nixpkgs and are unfree, and the SDK build needs Google's licence
-accepted (`NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1`, which the script sets) —
-that is the same acceptance a NixOS Android setup already makes.
+Both compose the SDK from nixpkgs themselves — one platform, one set of
+build tools, the NDK — because the nixpkgs aggregate also drags in every
+other platform, every system image and the emulator. The AAR's `-androidapi
+26` matches the app's `minSdk`. The SDK and NDK are unfree and the SDK build
+needs Google's licence accepted (`NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1`,
+which the scripts set) — the same acceptance a NixOS Android setup already
+makes. Gradle fetches the Android Gradle Plugin and AndroidX from Google's
+Maven into `~/.gradle` on first run.
 
 ## First run
 
