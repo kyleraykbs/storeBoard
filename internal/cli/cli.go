@@ -35,6 +35,9 @@ Commands:
   folder takeover <name>
                   mount a folder over a path that already holds files,
                   keeping that content and syncing it
+  send <folder> <file>
+                  copy a file into a folder: it syncs like any other
+                  change, and a name already taken is parked, not lost
   status          show the daemon's status document
   version         print version information
   help            show this help
@@ -66,6 +69,8 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return configCheck(configPath, rest[1:], stdout, stderr)
 	case "status":
 		return status(ctx, configPath, rest, stdout, stderr)
+	case "send":
+		return sendCmd(ctx, configPath, rest, stdout, stderr)
 	case "folder":
 		return folderCmd(ctx, configPath, rest, stdout, stderr)
 	case "backup":
@@ -455,6 +460,62 @@ func shortBlob(blob string) string {
 		return blob[:12]
 	}
 	return blob
+}
+
+// sendCmd is the send verb: copy a local file into a folder, which is how a
+// share sheet and a desktop both put a file on the mesh. The daemon does the
+// copying, so the file must be one it can see — the same machine, in
+// practice. Nothing is overwritten: a taken name is parked and reported.
+func sendCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	jsonOut, positional, err := splitFlags(args, "send <folder> <file>", stderr)
+	if err != nil {
+		return err
+	}
+	if len(positional) < 2 {
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard send <folder> <file> [--as PATH] [--json]")
+		return ErrHandled
+	}
+	folder := positional[0]
+	req := struct {
+		Source string `json:"source"`
+		Path   string `json:"path,omitempty"`
+	}{Source: positional[1]}
+
+	// --as takes a value, which is why this walks by index.
+	for i := range args {
+		if args[i] != "--as" {
+			continue
+		}
+		if i+1 >= len(args) {
+			return usageErr(stderr, "send <folder> <file>", "--as needs a value")
+		}
+		req.Path = args[i+1]
+	}
+
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(folder)+"/send", req)
+	if err != nil {
+		return fmt.Errorf("send %s: %w", folder, err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var res api.SendResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		return fmt.Errorf("parse send result: %w", err)
+	}
+	if res.Parked != "" {
+		fmt.Fprintf(stdout, "%s: sent %s (%d bytes); the file already there is parked at %s\n",
+			folder, res.Path, res.Size, res.Parked)
+		return nil
+	}
+	fmt.Fprintf(stdout, "%s: sent %s (%d bytes); it is a new change and syncs like any other\n",
+		folder, res.Path, res.Size)
+	return nil
 }
 
 // folderCmd is the folder verb group: `folder takeover <name>` converts a

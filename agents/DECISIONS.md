@@ -285,3 +285,26 @@
   orphan journals, so nothing a history points at is ever collected while the
   file exists (re-enabling makes those versions listable and restorable
   again).
+
+## 2026-10-15 — The phone is a peer: the engine as a library
+
+- **Decision:** the Android app embeds the engine (`mobile/`, bound by
+  gomobile) instead of talking to a daemon: the same syncer, store and peer
+  wire, with a boundary of JSON strings because that is what gomobile
+  carries natively and it is the contract the daemon already serves
+  (invariant 17). No local socket inside the app — there is no CLI to serve
+  — and the acting verbs authorize the app's own uid, which is the owner of
+  the folders the app created. `send` came out of the same work as a
+  first-class verb: the share sheet needs it, the desktop wants it, and a
+  send never overwrites — a taken name parks the existing file under the
+  deterministic conflict name and reports where.
+- **Why:** user request — "make an android app … the phone a full peer …
+  engine inside the app". A thin client would be a second implementation of
+  sync; embedding means the camera roll, the journals and the history are
+  hosted by the phone, so a phone with no signal still has its files. The Go
+  side was already pure and CGO-free for exactly this.
+- **Reversible:** yes — `mobile/` is additive; deleting it leaves the daemon
+  and the CLI untouched. `send` is additive on the wire and in the CLI, with
+  `apiVersion` unchanged.
+- **Open:** the app's own build (SDK/NDK, `gradle assembleDebug`) and the
+  `DCIM/` adoption decision — both in NOTES.

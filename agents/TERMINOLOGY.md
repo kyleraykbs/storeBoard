@@ -14,3 +14,10 @@
   state (store, journal, index, default mounts).
 - **endpoint** → a declared `host:port` address other peers dial; bare
   hostnames are rejected until the protocol picks a default port.
+- **send** → copy a local file into one of this machine's folders so it
+  syncs onwards (the phone's share sheet, `storeboard send`). An ordinary
+  local change, and never an overwrite: a name already taken is parked
+  under the deterministic conflict name.
+- **the library** (`mobile/`) → the engine bound into an app; the phone
+  runs it as a full peer with no local socket, so the UI calls it in
+  process. One engine, no client-only mode (DESIGN invariant 17).

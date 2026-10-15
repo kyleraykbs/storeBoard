@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.Storeboard" parent="android:Theme.DeviceDefault.NoActionBar" />
+</resources>

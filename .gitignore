@@ -3,3 +3,11 @@
 result
 result-*
 dist/
+
+# Android: build output and the bound engine, both rebuilt locally.
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/libs/*.aar
+android/local.properties

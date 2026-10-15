@@ -143,6 +143,7 @@ func (s *Server) handler() http.Handler {
 //	GET  /v1/folders/<name>/versions?path=<p>
 //	POST /v1/folders/<name>/takeover
 //	POST /v1/folders/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
+//	POST /v1/folders/<name>/send      {"source": …, "path"?: …}
 func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/folders/")
 	name, verb, ok := strings.Cut(rest, "/")
@@ -157,9 +158,42 @@ func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
 		s.handleVersions(w, r, name)
 	case "restore":
 		s.handleRestore(w, r, name)
+	case "send":
+		s.handleSend(w, r, name)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such folder verb %q", verb)})
 	}
+}
+
+// handleSend copies a local file into a folder: the share sheet's path onto
+// the mesh, and the same verb the app's engine offers directly. The file the
+// caller names is read by the daemon, so it must be a path this machine can
+// see — the CLI's own host, which is also the one the daemon runs on.
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	uid, ok := requestUID(r)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
+		return
+	}
+	var req struct {
+		Source string `json:"source"`
+		Path   string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("body: %v", err)})
+		return
+	}
+	res, err := s.engine.Send(name, uid, req.Source, req.Path)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleTakeover(w http.ResponseWriter, r *http.Request, name string) {

@@ -16,10 +16,16 @@ import (
 // the source's base name. Nothing is ever overwritten — a name already taken
 // is parked under the deterministic conflict name first, and the caller is
 // told where it landed.
-func (e *Engine) Send(folder, src, dst string) (api.SendResult, error) {
+//
+// uid is the requesting user, from the socket's peer credentials: root and
+// the folder's owner may send, nobody else.
+func (e *Engine) Send(folder string, uid int, src, dst string) (api.SendResult, error) {
 	fs := e.byName[folder]
 	if fs == nil {
 		return api.SendResult{}, fmt.Errorf("unknown folder %q", folder)
+	}
+	if err := e.checkOwner(fs, uid, "send into"); err != nil {
+		return api.SendResult{}, err
 	}
 	info, err := os.Lstat(src)
 	if err != nil {

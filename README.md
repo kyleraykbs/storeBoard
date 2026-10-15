@@ -3,9 +3,11 @@
 Replicated folders across your own devices: every folder keeps healthy
 copies on the machines that want it, and going offline never loses data.
 
-Status: foundation. The flake, the daemon and the CLI build and run; the
-sync engine, peer transport and event stream are not implemented yet.
-`DESIGN.md` holds the invariants the JSON contracts already pin down.
+Status: working. The flake, the daemon, the CLI, the sync engine, the peer
+transport and the embedded library build and run, with the invariants in
+`DESIGN.md` covered by tests. The event stream and the Android app's build
+are the live edges. `DESIGN.md` holds the invariants the JSON contracts
+already pin down.
 
 ## Build and run
 
@@ -19,6 +21,11 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
 
 - `cmd/`, `internal/`, `pkg/api` — Go. `pkg/api` is the versioned JSON
   contract; every command takes `--json` and prints those shapes verbatim.
+- `mobile/` — the engine as a library: gomobile binds this package, so the
+  phone runs the same syncer, store and peer wire the daemon does. No local
+  socket (an app has no CLI to serve); everything crossing the boundary is
+  the JSON the contracts already name.
+- `android/` — the app that embeds it. Its README has the build.
 - `nix/` — one NixOS module (daemon + CLI under `services.storeboard`)
   and the home-manager CLI module.
 - `agents/` — decisions, structure, terminology for agent sessions.
@@ -131,6 +138,22 @@ same window.
     storeboard backup restore photos "Screenshots/old.png" --at 2026-09-01T10:00:00Z
     storeboard backup restore photos "gone.png"     # a deleted file comes back
     storeboard backup restore photos notes.md --to /tmp/notes.old
+
+## Send a file
+
+    storeboard send photos holiday.jpg --as "2026/holiday.jpg"
+
+Copies a local file into a folder: from then on it is an ordinary local
+change — indexed at once, recorded in the history, synced onwards. Nothing
+is overwritten; a name already taken parks the existing file under the same
+deterministic conflict name the merge uses and reports where. The daemon
+does the copying, so the file must be one it can see (the same machine, in
+practice), and root or the folder's owner is the only caller allowed.
+
+The phone's share sheet is the same verb, one layer down: the app's UI calls
+the engine directly (there is no socket inside an app), and a shared file is
+copied in and sent into the camera folder. `storeboard/mobile` and this
+command are two doors onto one operation.
 
 ## Query the daemon
 

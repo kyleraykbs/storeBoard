@@ -41,11 +41,12 @@ one, it changes here first, deliberately, with a decision log entry.
    one; unknown fields are tolerated on the wire, matching invariant 6.
 10. Verbs that act on the user's data are authorized per caller, never by
     socket access alone. The daemon socket is world-writable so any user's
-    CLI can read status; an acting verb (today: `folder takeover`) checks
-    the requesting uid through the socket's peer credentials and allows only
-    root or the folder's owner — a refusal, not a guess, when the uid cannot
-    be read. This is the sequence the earlier version of this invariant
-    demanded: the authorization exists before the verb ships.
+    CLI can read status; an acting verb (today: `folder takeover`, `send`)
+    checks the requesting uid through the socket's peer credentials and
+    allows only root or the folder's owner — a refusal, not a guess, when
+    the uid cannot be read. This is the sequence the earlier version of
+    this invariant demanded: the authorization exists before the verb
+    ships.
 11. Peers are declared, never invented: the config (Nix-generated) is the
     authoritative peer list, and the daemon learns a peer only from it.
     Address discovery (DNS, NAT traversal) may layer on top later;
@@ -138,8 +139,11 @@ one, it changes here first, deliberately, with a decision log entry.
 - 5: version vectors per file; the deterministic winner/conflict-copy rule
   converges replicas without ping-pong.
 - 6, 7: strict config, three-point validation, versioned status document.
-- 10: still only status-grade verbs over the local socket; the wire carries
-  names, versions, journals and file content over the nebula overlay.
+- 10: acting verbs exist and are authorized per caller: `folder takeover`
+  and `send` (socket peer credentials, root or the folder's owner, refusal
+  when the uid cannot be read); everything else on the socket is
+  status-grade, and the peer wire carries names, versions, journals and
+  file content over the nebula overlay.
 - 11: config-only peers; the transport rejects undeclared names.
 - 12: enforced by `Validate` plus the mount-precedence tests.
 - 13: attach/detach/remerge implemented (views + symlink swap + detached
@@ -155,6 +159,10 @@ one, it changes here first, deliberately, with a decision log entry.
   into a false conflict.
 - 4, 8, 9: forward-looking — policies/hooks and min/max protocol
   negotiation do not exist yet.
+- 16: implemented with the history log and the retention collector.
+- 17: the library and the daemon are one engine — `mobile/` binds the same
+  syncer and transport, and its tests exercise start, send, status, history
+  and restore end to end on the host. The app's own build is the open edge.
 16. Version history is opt-in per machine and thinned by a fixed schedule:
     the newest version of each hour for a day, of each day for a week, of
     each week for a month, of each month for a year, of each year beyond —
@@ -168,3 +176,13 @@ one, it changes here first, deliberately, with a decision log entry.
     no orphan journal (a folder removed from the config still owns its
     bytes, invariant 1) and no recent write references it, and it refuses
     to act at all when a reference source cannot be read.
+17. One engine, no client-only mode. Anything that syncs runs the same
+    syncer, content store and peer wire: the daemon, and the phone app via
+    the bound library (`storeboard/mobile`) rather than a reimplemented
+    subset. A device with no CLI to serve has no local socket — but the
+    documents it answers with are the ones the daemon serves, `apiVersion`
+    and all, so a second protocol cannot drift into existence. Sending a
+    file (the share sheet, `storeboard send`) is an ordinary local change:
+    indexed at once, recorded in the history, synced onwards. Nothing is
+    overwritten — a name already taken parks the existing file under the
+    deterministic conflict name — and the sender is told where it went.

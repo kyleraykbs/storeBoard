@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">storeboard</string>
+    <string name="channel_name">syncing</string>
+    <string name="notification_title">storeboard is syncing</string>
+</resources>

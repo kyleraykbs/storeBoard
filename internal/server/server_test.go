@@ -359,3 +359,80 @@ func TestTakeoverNeedsPeerCreds(t *testing.T) {
 		t.Fatalf("takeover without credentials = %s, want 403", resp.Status)
 	}
 }
+
+// The send verb over the real socket: a file the caller names lands in the
+// folder as an ordinary local change, a taken name parks the old file
+// instead of losing it, and the answer says where it went.
+func TestSendOverUnixSocket(t *testing.T) {
+	cfg := testConfig(t)
+	mount := filepath.Join(t.TempDir(), "pictures")
+	cfg.Mounts = map[string]string{"photos": mount}
+
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", cfg.Socket)
+			},
+		},
+	}
+
+	// No readiness wait: folders are prepared before the server serves, and
+	// a send is an ordinary write into the mount.
+	send := func(source, path string) api.SendResult {
+		t.Helper()
+		body, err := json.Marshal(map[string]string{"source": source, "path": path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Post("http://storeboard/v1/folders/photos/send", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST send = %s", resp.Status)
+		}
+		var res api.SendResult
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	first := filepath.Join(t.TempDir(), "holiday.txt")
+	if err := os.WriteFile(first, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := send(first, "shared/holiday.txt")
+	if res.Path != "shared/holiday.txt" || res.Parked != "" || res.Size != 5 {
+		t.Fatalf("send = %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(mount, "shared", "holiday.txt")); err != nil || string(b) != "first" {
+		t.Fatalf("sent content = %q, %v", b, err)
+	}
+
+	// A second send onto the same name keeps both.
+	second := filepath.Join(t.TempDir(), "holiday2.txt")
+	if err := os.WriteFile(second, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res = send(second, "shared/holiday.txt")
+	if res.Parked == "" {
+		t.Fatalf("second send = %+v, want the first file parked", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(mount, "shared", "holiday.txt")); err != nil || string(b) != "second" {
+		t.Fatalf("destination = %q, %v; want the new content", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(mount, res.Parked)); err != nil || string(b) != "first" {
+		t.Fatalf("parked = %q, %v; want the old content kept", b, err)
+	}
+}

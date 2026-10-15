@@ -38,6 +38,10 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
 - `pkg/api` — the versioned JSON contract: `Status`, `Peer`, `Group`,
   `Folder`, `Version`. The daemon serves it and the CLI renders it; the
   config file speaks the same peer/group/folder/mount vocabulary.
+- `mobile` — the engine as an app sees it, bound by gomobile: `Start`,
+  `Stop`, `Status`, `Versions`, `Restore`, `Send`, all JSON strings in the
+  shapes `pkg/api` names. No socket; the UI calls it in-process. The
+  Android app that consumes it lives in `android/`.
 
 ## Nix
 

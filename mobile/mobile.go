@@ -158,8 +158,11 @@ func (d *Daemon) Restore(folder, path, blob, at, to string) (string, error) {
 // path onto the mesh. dst is relative inside the folder; empty uses the
 // source's name (JSON api.SendResult). The copy is an ordinary local change:
 // it is indexed at once, recorded in the history and synced onwards.
+//
+// The acting verbs authorize per caller, and in an app the caller is the app:
+// its own uid, which is the owner of the folders it created.
 func (d *Daemon) Send(folder, src, dst string) (string, error) {
-	res, err := d.eng.Send(folder, src, dst)
+	res, err := d.eng.Send(folder, os.Getuid(), src, dst)
 	if err != nil {
 		return "", err
 	}
