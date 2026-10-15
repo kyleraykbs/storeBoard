@@ -222,6 +222,22 @@ wait_for 10 "desktop mount attached" bash -c "[ -L '$work/remoteDocs' ]"
 "$CLI" --config "$config2" status --json |
 	jq -e '[.sync[] | select(.folder == "documents")][0].state == "attached"' >/dev/null
 
+echo "== send puts a file into a folder, and a taken name is parked, not lost"
+echo "from the share sheet" >"$work/send-me.txt"
+"$CLI" --config "$config" send photos "$work/send-me.txt" --as "sent/holiday.txt" --json |
+	jq -e '.folder == "photos" and .path == "sent/holiday.txt" and (.parked // "") == ""' >/dev/null
+grep -q "from the share sheet" "$work/Pictures/sent/holiday.txt"
+wait_for 10 "the sent file reached the peer" test -f "$work/PicturesB/sent/holiday.txt"
+grep -q "from the share sheet" "$work/PicturesB/sent/holiday.txt"
+echo "second take" >"$work/send-me2.txt"
+parked=$("$CLI" --config "$config" send photos "$work/send-me2.txt" --as "sent/holiday.txt" --json | jq -r '.parked')
+[ -n "$parked" ] && [ "$parked" != "null" ] || {
+	echo "FAIL: a taken name was not parked" >&2
+	exit 1
+}
+grep -q "from the share sheet" "$work/Pictures/$parked"
+grep -q "second take" "$work/Pictures/sent/holiday.txt"
+
 echo "== a path with content says why, and takeover mounts it without losing anything"
 "$CLI" --config "$config2" status |
 	grep -q "not managed: path has content"
