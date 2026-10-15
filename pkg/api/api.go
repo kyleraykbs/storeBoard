@@ -174,3 +174,13 @@ type RestoreResult struct {
 	At     time.Time `json:"at"`
 	Copied bool      `json:"copied,omitempty"` // written beside the folder rather than restored into it
 }
+
+// SendResult reports where a file sent into a folder landed. Parked names the
+// conflict copy an existing file at that path was moved to, if there was one:
+// a send never overwrites.
+type SendResult struct {
+	Folder string `json:"folder"`
+	Path   string `json:"path"`
+	Parked string `json:"parked,omitempty"`
+	Size   int64  `json:"size"`
+}

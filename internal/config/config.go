@@ -13,6 +13,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -343,17 +344,32 @@ func Load(path string) (*Config, error) {
 	}
 	defer f.Close()
 
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	cfg, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// Parse reads a configuration from JSON text: the same strict decoding,
+// defaulting and validation Load applies to a file, exposed so an embedder
+// (the Android app, whose config arrives as a string) uses one code path.
+func Parse(raw []byte) (*Config, error) {
 	// Decode into an empty config, not Default(): every default that depends
 	// on another field (storageDir under dataDir, above all) has to be
 	// computed from what the file actually says, not from the XDG guess.
 	cfg := &Config{ConfigVersion: ConfigVersion}
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("parse config %s: trailing data after JSON value", path)
+		return nil, fmt.Errorf("parse config: trailing data after JSON value")
 	}
 
 	// An explicitly blanked string falls back to the default; JSON cannot
@@ -409,7 +425,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("config %s: %w", path, err)
+		return nil, err
 	}
 	return cfg, nil
 }
