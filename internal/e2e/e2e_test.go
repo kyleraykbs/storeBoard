@@ -1,0 +1,508 @@
+// Package e2e drives the real binaries: it builds storeboard and storeboardd,
+// starts daemons on loopback, and asserts what a person running the program
+// would see. The syncer tests exercise the engine in-process; these ones
+// prove the shipped artifacts agree with each other over a socket and a wire.
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// wait bounds every poll: a store that has not converged in this long is a
+// failure, not a slow machine.
+const wait = 90 * time.Second
+
+var (
+	buildOnce sync.Once
+	binDir    string
+	buildErr  error
+)
+
+// binaries builds both commands once per test run and returns their paths.
+func binaries(t *testing.T) (cli, daemon string) {
+	t.Helper()
+	buildOnce.Do(func() {
+		binDir, buildErr = os.MkdirTemp("", "storeboard-e2e-bin")
+		if buildErr != nil {
+			return
+		}
+		for _, name := range []string{"storeboard", "storeboardd"} {
+			cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, name), "./cmd/"+name)
+			cmd.Dir = moduleRoot()
+			if out, err := cmd.CombinedOutput(); err != nil {
+				buildErr = fmt.Errorf("build %s: %v\n%s", name, err, out)
+				return
+			}
+		}
+	})
+	if buildErr != nil {
+		t.Fatal(buildErr)
+	}
+	return filepath.Join(binDir, "storeboard"), filepath.Join(binDir, "storeboardd")
+}
+
+func moduleRoot() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(filepath.Dir(dir))
+}
+
+// freePort returns a loopback address nothing is listening on.
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+// peer is one daemon under test.
+type peer struct {
+	name    string
+	root    string
+	dataDir string
+	socket  string
+	cfgPath string
+	cmd     *exec.Cmd
+	log     *os.File
+}
+
+// mesh describes a two-machine set-up so a test only names what it cares
+// about: the store declarations on each side.
+type mesh struct {
+	storesA map[string]storeDecl
+	storesB map[string]storeDecl
+}
+
+// storeDecl mirrors the config's store object: everything is optional except
+// the group.
+type storeDecl struct {
+	Group    string            `json:"group"`
+	Sync     string            `json:"sync,omitempty"`
+	Symlinks []string          `json:"symlinks,omitempty"`
+	Links    map[string]string `json:"links,omitempty"`
+}
+
+// startMesh builds a config per side, launches both daemons and returns them.
+func startMesh(t *testing.T, m mesh) (*peer, *peer) {
+	t.Helper()
+	cli, daemon := binaries(t)
+	_ = cli
+	dir := t.TempDir()
+	epA, epB := freePort(t), freePort(t)
+
+	a := &peer{name: "alpha", root: filepath.Join(dir, "a", "root"), dataDir: filepath.Join(dir, "a", "data"), socket: filepath.Join(dir, "a", "s.sock")}
+	b := &peer{name: "bravo", root: filepath.Join(dir, "b", "root"), dataDir: filepath.Join(dir, "b", "data"), socket: filepath.Join(dir, "b", "s.sock")}
+	for _, p := range []*peer{a, b} {
+		if err := os.MkdirAll(p.root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.cfgPath = writeConfig(t, a, map[string]storeDecl{})
+	b.cfgPath = writeConfig(t, b, map[string]storeDecl{})
+	// The mesh ports are only known after both sides are allocated, so the
+	// configs are written once more with the real endpoints.
+	a.cfgPath = writeConfig(t, a, m.storesA, endpoint{a.name, epA}, endpoint{b.name, epB})
+	b.cfgPath = writeConfig(t, b, m.storesB, endpoint{a.name, epA}, endpoint{b.name, epB})
+
+	startDaemon(t, daemon, a)
+	startDaemon(t, daemon, b)
+	t.Cleanup(func() {
+		for _, p := range []*peer{a, b} {
+			stop(p)
+		}
+	})
+	return a, b
+}
+
+type endpoint struct{ name, addr string }
+
+// writeConfig renders one daemon's config file and returns its path.
+func writeConfig(t *testing.T, p *peer, stores map[string]storeDecl, extra ...endpoint) string {
+	t.Helper()
+	self := endpoint{p.name, ""}
+	peers := map[string]any{}
+	for _, e := range extra {
+		if e.name == p.name {
+			self.addr = e.addr
+		}
+		peers[e.name] = map[string]any{"endpoints": []string{e.addr}}
+	}
+	if self.addr != "" {
+		peers[p.name] = map[string]any{"endpoints": []string{self.addr}}
+	}
+	members := []string{}
+	for name := range peers {
+		members = append(members, name)
+	}
+	doc := map[string]any{
+		"configVersion": 2,
+		"root":          p.root,
+		"dataDir":       p.dataDir,
+		"socket":        p.socket,
+		"peer":          p.name,
+		"peers":         peers,
+		"groups":        map[string]any{"g": map[string]any{"peers": members}},
+		"stores":        stores,
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(filepath.Dir(p.root), "config.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func startDaemon(t *testing.T, daemon string, p *peer) {
+	t.Helper()
+	logPath := filepath.Join(filepath.Dir(p.root), p.name+".log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.log = logFile
+	cmd := exec.Command(daemon, "-config", p.cfgPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	// The scanner polls; a test cannot wait fifteen seconds per tick.
+	cmd.Env = append(os.Environ(),
+		"STOREBOARD_SCAN_INTERVAL=200ms",
+		"STOREBOARD_LINK_INTERVAL=200ms",
+		"STOREBOARD_INDEX_INTERVAL=1s",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p.cmd = cmd
+	t.Cleanup(func() { stop(p) })
+	waitFor(t, "daemon "+p.name+" socket", func() bool {
+		_, err := os.Stat(p.socket)
+		return err == nil
+	})
+}
+
+func stop(p *peer) {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	_ = p.cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		_ = p.cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		_ = p.cmd.Process.Kill()
+		<-done
+	}
+	if p.log != nil {
+		_ = p.log.Close()
+	}
+	p.cmd = nil
+}
+
+func waitFor(t *testing.T, what string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// storeDir is where a store's canonical directory lives.
+func (p *peer) storeDir(name string) string { return filepath.Join(p.root, name) }
+
+// cli runs the real CLI against this daemon and returns stdout.
+func cliRun(t *testing.T, p *peer, args ...string) string {
+	t.Helper()
+	cli, daemon := binaries(t)
+	_ = daemon
+	full := append([]string{"-config", p.cfgPath}, args...)
+	out, err := exec.Command(cli, full...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("storeboard %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// status parses the daemon's own status document.
+func statusOf(t *testing.T, p *peer) statusDoc {
+	t.Helper()
+	raw := cliRun(t, p, "status", "--json")
+	var doc statusDoc
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("status json: %v\n%s", err, raw)
+	}
+	return doc
+}
+
+type statusDoc struct {
+	Peer        string `json:"peer"`
+	Connections []struct {
+		Peer  string `json:"peer"`
+		State string `json:"state"`
+	} `json:"connections"`
+	Sync []struct {
+		Store   string `json:"store"`
+		State   string `json:"state"`
+		Root    string `json:"root"`
+		Entries int    `json:"entries"`
+	} `json:"sync"`
+}
+
+// syncState reports one store's state name: replica, attached or detached.
+func (d statusDoc) syncState(store string) string {
+	for _, s := range d.Sync {
+		if s.Store == store {
+			return s.State
+		}
+	}
+	return ""
+}
+
+func write(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func read(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// TestSyncDeliversFileBetweenMachines is the base promise: a file written on
+// one machine appears, byte for byte, on the other.
+func TestSyncDeliversFileBetweenMachines(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	const body = "the same bytes on both machines\n"
+	write(t, filepath.Join(a.storeDir("docs"), "note.txt"), body)
+
+	waitFor(t, "note.txt on bravo", func() bool {
+		got, err := os.ReadFile(filepath.Join(b.storeDir("docs"), "note.txt"))
+		return err == nil && string(got) == body
+	})
+
+	// Both sides agree they are a full replica of the store.
+	if state := statusOf(t, b).syncState("docs"); state != "replica" {
+		t.Fatalf("bravo reports docs as %q, want replica", state)
+	}
+}
+
+// TestRemoteStoreStreamsFromHolder covers the split this project exists for:
+// one machine holds the bytes locally, the other mounts the same store as a
+// remote stream and still sees new files.
+func TestRemoteStoreStreamsFromHolder(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"media": {Group: "g", Sync: "local"}},
+		storesB: map[string]storeDecl{"media": {Group: "g", Sync: "remote"}},
+	})
+
+	// A remote store goes live once its holder's link is up, which is after
+	// the socket exists: wait for the state instead of racing the handshake.
+	waitFor(t, "bravo to attach the remote store", func() bool {
+		return statusOf(t, b).syncState("media") == "attached"
+	})
+
+	const body = "streamed from the holder\n"
+	write(t, filepath.Join(a.storeDir("media"), "clip.txt"), body)
+
+	waitFor(t, "clip.txt streamed to bravo", func() bool {
+		got, err := os.ReadFile(filepath.Join(b.storeDir("media"), "clip.txt"))
+		return err == nil && string(got) == body
+	})
+	if state := statusOf(t, b).syncState("media"); state != "attached" {
+		t.Fatalf("bravo left attached state: %q", state)
+	}
+}
+
+// TestNestedStoreAppearsInsideParent covers nesting: a child store mounts
+// inside its parent at a relative path, and content written through that path
+// syncs as the child's content.
+func TestNestedStoreAppearsInsideParent(t *testing.T) {
+	// links maps a child store id to the relative path it appears at inside
+	// the parent. BulkPictures is local on alpha and remote on bravo, so the
+	// parent holds a real directory while the child is only attached.
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{
+			"Pictures":     {Group: "g", Links: map[string]string{"BulkPictures": "Bulk"}},
+			"BulkPictures": {Group: "g", Sync: "local"},
+		},
+		storesB: map[string]storeDecl{
+			"Pictures":     {Group: "g", Links: map[string]string{"BulkPictures": "Bulk"}},
+			"BulkPictures": {Group: "g", Sync: "remote"},
+		},
+	})
+
+	linkPath := filepath.Join(a.storeDir("Pictures"), "Bulk")
+	waitFor(t, "the child link inside the parent", func() bool {
+		target, err := os.Readlink(linkPath)
+		return err == nil && target == a.storeDir("BulkPictures")
+	})
+
+	// Writing through the nested path writes the child store.
+	const body = "a picture in the bulk child\n"
+	write(t, filepath.Join(linkPath, "shot.jpg"), body)
+	if got := read(t, filepath.Join(a.storeDir("BulkPictures"), "shot.jpg")); got != body {
+		t.Fatalf("write through the link landed elsewhere: %q", got)
+	}
+
+	waitFor(t, "the child's content on bravo", func() bool {
+		got, err := os.ReadFile(filepath.Join(b.storeDir("BulkPictures"), "shot.jpg"))
+		return err == nil && string(got) == body
+	})
+	// The parent never indexes the child: the link is a mountpoint, not data.
+	if _, err := os.Stat(filepath.Join(b.storeDir("Pictures"), "Bulk", "shot.jpg")); err != nil {
+		t.Fatalf("bravo's parent does not expose the child: %v", err)
+	}
+}
+
+// TestSendVerbPlacesFileForEveryPeer exercises the CLI's send verb: the file
+// goes into the store's canonical dir and then reaches the other machine.
+func TestSendVerbPlacesFileForEveryPeer(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	src := filepath.Join(t.TempDir(), "share me.txt")
+	const body = "sent from the share sheet\n"
+	write(t, src, body)
+
+	out := cliRun(t, a, "send", "docs", src, "--as", "inbox/share me.txt", "--json")
+	var res struct {
+		Store string `json:"store"`
+		Path  string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("send json: %v\n%s", err, out)
+	}
+	if res.Path != "inbox/share me.txt" {
+		t.Fatalf("send reported path %q", res.Path)
+	}
+	if got := read(t, filepath.Join(a.storeDir("docs"), "inbox", "share me.txt")); got != body {
+		t.Fatalf("send wrote %q", got)
+	}
+
+	waitFor(t, "the sent file on bravo", func() bool {
+		got, err := os.ReadFile(filepath.Join(b.storeDir("docs"), "inbox", "share me.txt"))
+		return err == nil && string(got) == body
+	})
+}
+
+// TestNewFileReachesPeerWhileLargeBlobStreams is the regression for the bug
+// that stopped every store converging on the real mesh: one multi-gigabyte
+// transfer monopolised the peer's socket and its single want worker, so index
+// frames and blob requests for other stores waited behind it. A small file
+// must arrive while the large one is still mid-transfer, not after it lands.
+func TestNewFileReachesPeerWhileLargeBlobStreams(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"bulk": {Group: "g"}, "docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"bulk": {Group: "g"}, "docs": {Group: "g"}},
+	})
+
+	// Big enough that its transfer outlasts the deadline below by a wide
+	// margin on loopback.
+	large := make([]byte, 512<<20)
+	for i := range large {
+		large[i] = byte('a' + i%26)
+	}
+	bigPath := filepath.Join(a.storeDir("bulk"), "big.bin")
+	if err := os.MkdirAll(filepath.Dir(bigPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bigPath, large, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the transfer get underway, then send one small file in another
+	// store exactly once.
+	// The receiver accumulates chunks in its scratch directory, so that is
+	// where partial progress is observable; the store root only ever holds a
+	// finished file.
+	waitFor(t, "the large blob to start arriving", func() bool {
+		files, _ := filepath.Glob(filepath.Join(b.dataDir, "tmp", "blob-*"))
+		for _, f := range files {
+			if info, err := os.Stat(f); err == nil && info.Size() > 1<<20 {
+				return true
+			}
+		}
+		return false
+	})
+
+	const body = "small file, urgent\n"
+	write(t, filepath.Join(a.storeDir("docs"), "urgent.txt"), body)
+
+	// The small file must not wait for the transfer: unlike the eventual
+	// delivery the other tests assert, this one has a deadline well under the
+	// time the blob needs.
+	const budget = 8 * time.Second
+	start := time.Now()
+	arrived := false
+	for time.Since(start) < budget {
+		if got, err := os.ReadFile(filepath.Join(b.storeDir("docs"), "urgent.txt")); err == nil && string(got) == body {
+			arrived = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	took := time.Since(start)
+	if !arrived {
+		t.Fatalf("the small file did not arrive within %s while a %d MiB blob was streaming: it is waiting behind the transfer\nbravo log:\n%s",
+			budget, len(large)>>20, tailLog(b))
+	}
+	if info, err := os.Stat(filepath.Join(b.storeDir("bulk"), "big.bin")); err == nil && info.Size() == int64(len(large)) {
+		t.Skipf("the %d MiB blob finished within %s; the machine is too fast to measure", len(large)>>20, took.Round(time.Millisecond))
+	}
+	t.Logf("small file arrived in %s while the %d MiB blob was still streaming", took.Round(time.Millisecond), len(large)>>20)
+}
+
+func tailLog(p *peer) string {
+	if p.log == nil {
+		return ""
+	}
+	b, err := os.ReadFile(p.log.Name())
+	if err != nil {
+		return err.Error()
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > 40 {
+		lines = lines[len(lines)-40:]
+	}
+	return strings.Join(lines, "\n")
+}
