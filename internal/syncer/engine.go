@@ -18,6 +18,7 @@ import (
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
+	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
@@ -169,7 +170,7 @@ type Engine struct {
 	mu             sync.Mutex
 	stores         []*StoreState
 	byName         map[string]*StoreState
-	sends          map[string]func([]byte) error
+	sends          map[string]transport.Sender
 	wants          map[string]*pending
 	incoming       map[string]*incomingBlob
 	closed         chan struct{}
@@ -182,7 +183,7 @@ type Engine struct {
 	// indefinitely: small stores never converged at all. Blob and want work
 	// stays shared — those are bounded per frame.
 	indexFrames map[string]chan peerFrame
-	wantFrames  chan peerFrame
+	wantFrames  map[string]chan peerFrame
 	blobFrames  chan peerFrame
 }
 
@@ -196,13 +197,15 @@ const syncFrameQueue = 256
 func (e *Engine) startFrameWorkers() {
 	e.frameStartOnce.Do(func() {
 		e.indexFrames = make(map[string]chan peerFrame, len(e.stores))
-		e.wantFrames = make(chan peerFrame, syncFrameQueue)
+		e.wantFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.blobFrames = make(chan peerFrame, syncFrameQueue)
-		e.frameWG.Add(2 + len(e.stores))
-		// One index worker per store: a slow store delays only itself.
+		e.frameWG.Add(1 + 2*len(e.stores))
+		// One worker per store for each class: a slow store delays only
+		// itself, and serving a multi-gigabyte blob cannot hold another
+		// store's index frames hostage.
 		for _, fs := range e.stores {
-			ch := make(chan peerFrame, syncFrameQueue)
-			e.indexFrames[fs.name] = ch
+			index := make(chan peerFrame, syncFrameQueue)
+			e.indexFrames[fs.name] = index
 			go func(ch chan peerFrame) {
 				defer e.frameWG.Done()
 				for {
@@ -213,19 +216,21 @@ func (e *Engine) startFrameWorkers() {
 						e.handleIndex(pf.peer, &pf.fr)
 					}
 				}
-			}(ch)
-		}
-		go func() {
-			defer e.frameWG.Done()
-			for {
-				select {
-				case <-e.closed:
-					return
-				case pf := <-e.wantFrames:
-					e.handleWant(pf.peer, &pf.fr)
+			}(index)
+			want := make(chan peerFrame, syncFrameQueue)
+			e.wantFrames[fs.name] = want
+			go func(ch chan peerFrame) {
+				defer e.frameWG.Done()
+				for {
+					select {
+					case <-e.closed:
+						return
+					case pf := <-ch:
+						e.handleWant(pf.peer, &pf.fr)
+					}
 				}
-			}
-		}()
+			}(want)
+		}
 		go func() {
 			defer e.frameWG.Done()
 			for {
@@ -287,7 +292,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		me:       cfg.Peer,
 		store:    st,
 		byName:   map[string]*StoreState{},
-		sends:    map[string]func([]byte) error{},
+		sends:    map[string]transport.Sender{},
 		wants:    map[string]*pending{},
 		incoming: map[string]*incomingBlob{},
 		closed:   make(chan struct{}),
@@ -540,15 +545,15 @@ func (e *Engine) broadcastIndex(fs *StoreState, entries []*Entry) {
 	}
 	b = append(b, '\n')
 	for _, s := range sends {
-		_ = s(b)
+		_ = s.Send(b)
 	}
 }
 
-func (e *Engine) sendListFor(fs *StoreState) []func([]byte) error {
+func (e *Engine) sendListFor(fs *StoreState) []transport.Sender {
 	members := e.cfg.Groups[fs.group].Peers
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := make([]func([]byte) error, 0, len(e.sends))
+	out := make([]transport.Sender, 0, len(e.sends))
 	for peer, s := range e.sends {
 		if slices.Contains(members, peer) {
 			out = append(out, s)
@@ -561,7 +566,7 @@ func (e *Engine) sendListFor(fs *StoreState) []func([]byte) error {
 
 // OnPeerConnected opens a sync session: the peer gets this machine's full
 // index for every store the two share, and remote stores may now go live.
-func (e *Engine) OnPeerConnected(peer string, send func([]byte) error) {
+func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 	e.mu.Lock()
 	e.sends[peer] = send
 	e.mu.Unlock()
@@ -606,7 +611,11 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 		}
 		e.enqueueFrame(ch, pf)
 	case "want":
-		e.enqueueFrame(e.wantFrames, pf)
+		ch, ok := e.wantFrames[fr.Store]
+		if !ok {
+			return // a store this machine does not carry
+		}
+		e.enqueueFrame(ch, pf)
 	case "blob", "blobEnd":
 		e.enqueueFrame(e.blobFrames, pf)
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,5 +213,83 @@ func TestUnaddressedPeerNeverDials(t *testing.T) {
 	}
 	if byName["stranger"].State != stateUnaddressed || byName["stranger"].Error == "" {
 		t.Errorf("stranger = %+v, want unaddressed with a reason", byName["stranger"])
+	}
+}
+
+// blockingConn records each write and blocks the first one until released.
+type blockingConn struct {
+	net.Conn
+	mu      sync.Mutex
+	writes  []string
+	release chan struct{}
+	started chan string
+}
+
+func (c *blockingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.writes = append(c.writes, string(b))
+	c.mu.Unlock()
+	select {
+	case c.started <- string(b):
+	default:
+	}
+	<-c.release
+	return len(b), nil
+}
+
+func (c *blockingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// A blob transfer writes thousands of chunks. While one is in flight the
+// socket is busy, so control frames wait for the next chunk boundary -- but
+// they must never wait behind further bulk writes, or a 21 GB video starves
+// every index frame to that peer and small stores stop converging.
+func TestControlFramesOvertakeQueuedBulkWrites(t *testing.T) {
+	c := &blockingConn{
+		release: make(chan struct{}),
+		started: make(chan string, 8),
+	}
+	w := newLinkWriter(c)
+	go w.SendBulk([]byte("bulk-1"))
+	<-c.started // bulk-1 owns the socket
+
+	controlDone := make(chan struct{})
+	go func() {
+		_ = w.Send([]byte("control"))
+		close(controlDone)
+	}()
+	// Give the control writer time to queue behind the in-flight chunk.
+	time.Sleep(20 * time.Millisecond)
+
+	bulkDone := make(chan struct{})
+	go func() {
+		_ = w.SendBulk([]byte("bulk-2"))
+		close(bulkDone)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Let the first chunk complete, then keep draining.
+	go func() {
+		for i := 0; i < 2; i++ {
+			<-c.started
+			c.release <- struct{}{}
+		}
+	}()
+	c.release <- struct{}{}
+
+	select {
+	case <-controlDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the control frame never got the socket")
+	}
+	<-bulkDone
+
+	c.mu.Lock()
+	got := append([]string(nil), c.writes...)
+	c.mu.Unlock()
+	if len(got) < 3 {
+		t.Fatalf("writes = %v", got)
+	}
+	if got[0] != "bulk-1" || got[1] != "control" || got[2] != "bulk-2" {
+		t.Fatalf("order = %v, want the queued control frame second", got)
 	}
 }

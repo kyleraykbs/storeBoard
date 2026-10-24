@@ -71,7 +71,24 @@ func (e *Engine) sendTo(peer string, fr frame) error {
 	if send == nil {
 		return fmt.Errorf("peer %q not connected", peer)
 	}
-	return send(b)
+	return send.Send(b)
+}
+
+// sendBulkTo writes a blob chunk: it yields the socket to control frames
+// between chunks so a long transfer cannot starve the rest of the mesh.
+func (e *Engine) sendBulkTo(peer string, fr frame) error {
+	b, err := json.Marshal(fr)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	e.mu.Lock()
+	send := e.sends[peer]
+	e.mu.Unlock()
+	if send == nil {
+		return fmt.Errorf("peer %q not connected", peer)
+	}
+	return send.SendBulk(b)
 }
 
 func (e *Engine) sendIndexTo(peer string, fs *StoreState, entries []*Entry) error {
@@ -282,7 +299,9 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 	for {
 		n, rerr := blob.Read(buf)
 		if n > 0 {
-			if err := e.sendTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: seq, Data: buf[:n]}); err != nil {
+			// Bulk: index frames for every store overtake a transfer in
+			// progress instead of waiting behind gigabytes of video.
+			if err := e.sendBulkTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: seq, Data: buf[:n]}); err != nil {
 				return
 			}
 			seq++

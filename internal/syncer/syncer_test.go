@@ -544,7 +544,7 @@ func TestRemoteStoreTombstonesOnlyWhileLive(t *testing.T) {
 	fs.state = stateAttached
 	fs.scanMu.Unlock()
 	n.eng.mu.Lock()
-	n.eng.sends["a"] = func([]byte) error { return nil }
+	n.eng.sends["a"] = nopSender{}
 	n.eng.mu.Unlock()
 
 	n.eng.scanOnce(fs)
@@ -1262,6 +1262,12 @@ func mustFrame(t *testing.T, fr frame) []byte {
 	return b
 }
 
+// nopSender satisfies transport.Sender for tests that only need the wiring.
+type nopSender struct{}
+
+func (nopSender) Send([]byte) error     { return nil }
+func (nopSender) SendBulk([]byte) error { return nil }
+
 func sameDevice(a, b string) bool {
 	sa, ea := os.Stat(a)
 	sb, eb := os.Stat(b)
@@ -1271,4 +1277,109 @@ func sameDevice(a, b string) bool {
 	da, oka := sa.Sys().(*syscall.Stat_t)
 	db, okb := sb.Sys().(*syscall.Stat_t)
 	return !oka || !okb || da.Dev == db.Dev
+}
+
+// recordingSender captures which path each frame took.
+type recordingSender struct {
+	mu      sync.Mutex
+	control []string
+	bulk    []string
+	block   chan struct{}
+}
+
+func (s *recordingSender) Send(b []byte) error {
+	s.mu.Lock()
+	s.control = append(s.control, string(b))
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *recordingSender) SendBulk(b []byte) error {
+	if s.block != nil {
+		<-s.block
+	}
+	s.mu.Lock()
+	s.bulk = append(s.bulk, string(b))
+	s.mu.Unlock()
+	return nil
+}
+
+// Serving a blob is bulk traffic. Index frames must use the control path, or
+// a multi-gigabyte transfer occupies the peer's socket and every other
+// store's index waits behind it.
+func TestBlobChunksAreBulkAndIndexIsControl(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	content := strings.Repeat("chunk", store.ChunkSize/5+1)
+	path := filepath.Join(fs.root, "big.bin")
+	writeFile(t, path, content, time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &recordingSender{}
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = rec
+	n.eng.mu.Unlock()
+
+	n.eng.broadcastIndex(fs, fs.db.All())
+	n.eng.handleWant("b", &frame{Type: "want", Store: "docs", Path: "big.bin"})
+
+	rec.mu.Lock()
+	control, bulk := len(rec.control), len(rec.bulk)
+	rec.mu.Unlock()
+	if control == 0 {
+		t.Fatal("index frames did not use the control path")
+	}
+	if bulk == 0 {
+		t.Fatal("blob chunks did not use the bulk path")
+	}
+}
+
+// A want for one store must not delay an index for another. The want worker
+// per store exists so that serving a large file cannot hold the mesh still.
+func TestBusyWantDoesNotBlockAnotherStoresIndex(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"slow":  {Group: "g"},
+		"quick": {Group: "g"},
+	})
+	n.prepareAll()
+	slow := n.store("slow")
+	writeFile(t, filepath.Join(slow.root, "big.bin"), "some bytes to serve", time.Now())
+	if _, err := n.eng.scan(slow, true); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	rec := &recordingSender{block: release}
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = rec
+	n.eng.mu.Unlock()
+
+	n.eng.startFrameWorkers()
+	// This want blocks the slow store's worker inside SendBulk.
+	n.eng.OnPeerFrame("b", mustFrame(t, frame{Type: "want", Store: "slow", Path: "big.bin"}))
+	time.Sleep(50 * time.Millisecond)
+
+	content := "quick store arrives"
+	sum, err := store.Sum(strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent := &Entry{
+		Path: "quick.txt", Blob: sum, Size: int64(len(content)),
+		MTime: time.Now().UnixNano(), Mode: 0o644,
+		VV: map[string]uint64{"b": 1},
+	}
+	n.eng.OnPeerFrame("b", mustFrame(t, frame{Type: "index", Store: "quick", Entries: []*Entry{ent}}))
+
+	waitFor(t, 20*time.Second, "the quick store to request its blob", func() bool {
+		n.eng.mu.Lock()
+		_, asked := n.eng.wants[wantKey("quick", ent.Path)]
+		n.eng.mu.Unlock()
+		return asked
+	})
+	close(release)
 }

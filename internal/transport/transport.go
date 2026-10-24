@@ -110,9 +110,9 @@ func (p *peerState) backoff() time.Duration {
 // Handler receives peer lifecycle and frames. The sync engine implements it;
 // the transport itself only keeps links alive.
 type Handler interface {
-	// OnPeerConnected reports a live, handshaked link. send writes one
-	// newline-terminated frame; it is safe from any goroutine.
-	OnPeerConnected(peer string, send func([]byte) error)
+	// OnPeerConnected reports a live, handshaked link. The sender writes
+	// newline-terminated frames and is safe from any goroutine.
+	OnPeerConnected(peer string, send Sender)
 	// OnPeerFrame delivers one frame line from a peer.
 	OnPeerFrame(peer string, line []byte)
 	// OnPeerDisconnected reports a link going away.
@@ -165,16 +165,63 @@ func (m *Manager) getHandler() Handler {
 	return m.handler
 }
 
-// linkWriter serializes writes on one connection: keepalives and sync
-// frames share the socket.
-type linkWriter struct {
-	mu sync.Mutex
-	c  net.Conn
+// Sender writes frames to one peer. Blob chunks are bulk: a multi-gigabyte
+// file is thousands of them, and while one is in flight every other frame to
+// that peer waits. Separating the two lets index frames overtake a transfer
+// instead of queueing behind 21 GB of video, which is what stopped small
+// stores from converging at all on the real mesh.
+type Sender interface {
+	// Send writes one newline-terminated frame ahead of any bulk traffic.
+	Send(b []byte) error
+	// SendBulk writes one chunk of a blob, yielding to waiting Send calls.
+	SendBulk(b []byte) error
 }
 
-func (w *linkWriter) write(b []byte) error {
+// linkWriter serializes writes on one connection: keepalives and sync frames
+// share the socket. Priority writers are admitted before bulk ones, so a
+// transfer that owns the socket for minutes still lets control frames through
+// between chunks.
+type linkWriter struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	busy    bool
+	waiting int
+	c       net.Conn
+}
+
+func newLinkWriter(c net.Conn) *linkWriter {
+	w := &linkWriter{c: c}
+	w.cond = sync.NewCond(&w.mu)
+	return w
+}
+
+// acquire takes the socket. A bulk writer waits while any priority writer is
+// queued; priority writers only wait for the chunk currently being written.
+func (w *linkWriter) acquire(priority bool) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	if priority {
+		w.waiting++
+	}
+	for w.busy || (!priority && w.waiting > 0) {
+		w.cond.Wait()
+	}
+	if priority {
+		w.waiting--
+	}
+	w.busy = true
+	w.mu.Unlock()
+}
+
+func (w *linkWriter) release() {
+	w.mu.Lock()
+	w.busy = false
+	w.cond.Broadcast()
+	w.mu.Unlock()
+}
+
+func (w *linkWriter) writeWith(b []byte, priority bool) error {
+	w.acquire(priority)
+	defer w.release()
 	if err := w.c.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		return err
 	}
@@ -182,6 +229,9 @@ func (w *linkWriter) write(b []byte) error {
 	_ = w.c.SetWriteDeadline(time.Time{})
 	return err
 }
+
+func (w *linkWriter) Send(b []byte) error     { return w.writeWith(b, true) }
+func (w *linkWriter) SendBulk(b []byte) error { return w.writeWith(b, false) }
 
 // New prepares the manager. No sockets are opened until Run.
 func New(cfg *config.Config, logger *slog.Logger) *Manager {
@@ -497,7 +547,7 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 // serveLink consumes one live connection: it answers pings and detects the
 // peer going away.
 func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key, direction string) {
-	w := &linkWriter{c: c}
+	w := newLinkWriter(c)
 	handler := m.getHandler()
 	p.mu.Lock()
 	current := p.conn == c
@@ -538,7 +588,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			stillCurrent := p.conn == c
 			p.mu.Unlock()
 			if stillCurrent {
-				handler.OnPeerConnected(p.name, w.write)
+				handler.OnPeerConnected(p.name, w)
 			}
 		})
 	}
@@ -566,7 +616,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			case <-stop:
 				return
 			case <-t.C:
-				if err := w.write([]byte("{\"ping\"}\n")); err != nil {
+				if err := w.Send([]byte("{\"ping\"}\n")); err != nil {
 					c.Close()
 					return
 				}
@@ -584,7 +634,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		}
 		switch trimmed := strings.TrimSpace(line); trimmed {
 		case "{\"ping\"}":
-			if err := w.write([]byte("{\"pong\"}\n")); err != nil {
+			if err := w.Send([]byte("{\"pong\"}\n")); err != nil {
 				return
 			}
 		case "{\"pong\"}", "":
