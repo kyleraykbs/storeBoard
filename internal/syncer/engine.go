@@ -171,14 +171,87 @@ type Engine struct {
 	me      string
 	store   *store.Store
 
-	mu        sync.Mutex
-	stores    []*StoreState
-	byName    map[string]*StoreState
-	sends     map[string]func([]byte) error
-	wants     map[string]*pending
-	incoming  map[string]*incomingBlob
-	closed    chan struct{}
-	closeOnce sync.Once
+	mu             sync.Mutex
+	stores         []*StoreState
+	byName         map[string]*StoreState
+	sends          map[string]func([]byte) error
+	wants          map[string]*pending
+	incoming       map[string]*incomingBlob
+	closed         chan struct{}
+	closeOnce      sync.Once
+	frameStartOnce sync.Once
+	frameWG        sync.WaitGroup
+	indexFrames    chan peerFrame
+	wantFrames     chan peerFrame
+	blobFrames     chan peerFrame
+}
+
+type peerFrame struct {
+	peer string
+	fr   frame
+}
+
+const syncFrameQueue = 256
+
+func (e *Engine) startFrameWorkers() {
+	e.frameStartOnce.Do(func() {
+		e.indexFrames = make(chan peerFrame, syncFrameQueue)
+		e.wantFrames = make(chan peerFrame, syncFrameQueue)
+		e.blobFrames = make(chan peerFrame, syncFrameQueue)
+		e.frameWG.Add(3)
+		go func() {
+			defer e.frameWG.Done()
+			for {
+				select {
+				case <-e.closed:
+					return
+				case pf := <-e.indexFrames:
+					e.handleIndex(pf.peer, &pf.fr)
+				}
+			}
+		}()
+		go func() {
+			defer e.frameWG.Done()
+			for {
+				select {
+				case <-e.closed:
+					return
+				case pf := <-e.wantFrames:
+					e.handleWant(pf.peer, &pf.fr)
+				}
+			}
+		}()
+		go func() {
+			defer e.frameWG.Done()
+			for {
+				select {
+				case <-e.closed:
+					return
+				case pf := <-e.blobFrames:
+					switch pf.fr.Type {
+					case "blob":
+						e.handleBlob(pf.peer, &pf.fr)
+					case "blobEnd":
+						e.handleBlobEnd(pf.peer, &pf.fr)
+					}
+				}
+			}
+		}()
+	})
+}
+
+func (e *Engine) enqueueFrame(ch chan peerFrame, pf peerFrame) {
+	select {
+	case ch <- pf:
+	case <-e.closed:
+	}
+}
+
+// StopFrames makes frame callbacks return immediately and stops queued sync
+// work without closing journals. Callers use it before stopping transport so
+// a full work queue cannot hold network shutdown hostage.
+func (e *Engine) StopFrames() {
+	e.closeOnce.Do(func() { close(e.closed) })
 }
 
 // New prepares the engine. No store is touched until Run.
@@ -267,10 +340,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		e.stores = append(e.stores, fs)
 		e.byName[fs.name] = fs
 	}
+	e.startFrameWorkers()
 	return e, nil
 }
 
-// Run prepares the tree and drives scanning until ctx ends.
 func (e *Engine) Run(ctx context.Context) {
 	e.reconcileLinks()
 
@@ -487,21 +560,23 @@ func (e *Engine) OnPeerDisconnected(peer string) {
 	e.evaluatePeers()
 }
 
-// OnPeerFrame routes one wire frame.
+// OnPeerFrame parses one wire frame and queues it by work class. The queues
+// keep blob chunks ordered while allowing blob receive/apply to proceed while
+// an index or a want handler is doing filesystem work.
 func (e *Engine) OnPeerFrame(peer string, line []byte) {
+	e.startFrameWorkers()
 	var fr frame
 	if err := json.Unmarshal(line, &fr); err != nil {
 		return
 	}
+	pf := peerFrame{peer: peer, fr: fr}
 	switch fr.Type {
 	case "index":
-		e.handleIndex(peer, &fr)
+		e.enqueueFrame(e.indexFrames, pf)
 	case "want":
-		e.handleWant(peer, &fr)
-	case "blob":
-		e.handleBlob(peer, &fr)
-	case "blobEnd":
-		e.handleBlobEnd(peer, &fr)
+		e.enqueueFrame(e.wantFrames, pf)
+	case "blob", "blobEnd":
+		e.enqueueFrame(e.blobFrames, pf)
 	}
 }
 
@@ -572,7 +647,8 @@ func (e *Engine) Snapshot() []api.StoreSync {
 // shutdown calls this first, so a large queued index cannot keep a systemd
 // stop job waiting on journals or files.
 func (e *Engine) Close() {
-	e.closeOnce.Do(func() { close(e.closed) })
+	e.StopFrames()
+	e.frameWG.Wait()
 	for _, fs := range e.stores {
 		fs.db.Close()
 		if fs.hist != nil {

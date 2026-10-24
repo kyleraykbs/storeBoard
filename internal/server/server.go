@@ -331,9 +331,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// Close stops the server and removes the socket file. Transport closes first
-// so queued peer frame handlers stop before journals and histories close.
+// Close stops frame callbacks before transport and durable state. This keeps
+// a bounded sync queue from delaying network teardown.
 func (s *Server) Close() error {
+	s.engine.StopFrames()
 	s.transport.Close()
 	s.engine.Close()
 	s.http.Close()

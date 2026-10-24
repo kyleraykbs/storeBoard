@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -676,6 +677,45 @@ func TestProgressIsVisibleWhileWorking(t *testing.T) {
 	if s.Local != 1 || s.Scanning {
 		t.Fatalf("after a scan: local %d scanning %v, want 1/false", s.Local, s.Scanning)
 	}
+}
+
+// A slow index apply must not prevent blob frames from being received. The
+// transport keeps reading while the engine applies an index; this test pins
+// the index worker on a store lock and proves the blob worker still creates an
+// incoming transfer.
+func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	path := filepath.Join(fs.root, "old.txt")
+	writeFile(t, path, "old", time.Now())
+	if err := fs.db.Put(&Entry{Path: "old.txt", Blob: strings.Repeat("ab", 32), Size: 3, MTime: time.Now().UnixNano(), VV: map[string]uint64{"b": 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.scanMu.Lock()
+	index, err := json.Marshal(frame{Type: "index", Store: "docs", Entries: []*Entry{{
+		Path: "old.txt", Deleted: true, VV: map[string]uint64{"b": 2},
+	}}})
+	if err != nil {
+		fs.scanMu.Unlock()
+		t.Fatal(err)
+	}
+	n.eng.OnPeerFrame("a", index)
+	time.Sleep(20 * time.Millisecond)
+
+	blob, err := json.Marshal(frame{Type: "blob", Store: "docs", Path: "new.txt", Data: []byte("new")})
+	if err != nil {
+		fs.scanMu.Unlock()
+		t.Fatal(err)
+	}
+	n.eng.OnPeerFrame("a", blob)
+	waitFor(t, 2*time.Second, "blob receive while index is blocked", func() bool {
+		n.eng.mu.Lock()
+		defer n.eng.mu.Unlock()
+		return len(n.eng.incoming) == 1
+	})
+	fs.scanMu.Unlock()
 }
 
 // The stale-dirent repair: an entry whose recorded size contradicts the file
