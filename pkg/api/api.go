@@ -37,13 +37,14 @@ type Group struct {
 // a holder). Symlinks are the absolute paths declared to point at the
 // canonical directory.
 type Store struct {
-	Name     string   `json:"name"`
-	Parent   string   `json:"parent,omitempty"`
-	Path     string   `json:"path,omitempty"`
-	Group    string   `json:"group"`
-	Sync     string   `json:"sync"`
-	Root     string   `json:"root"`
-	Symlinks []string `json:"symlinks"`
+	Name     string            `json:"name"`
+	Parent   string            `json:"parent,omitempty"` // retained for additive API compatibility; reusable links have no owner
+	Path     string            `json:"path,omitempty"`   // retained for additive API compatibility
+	Group    string            `json:"group"`
+	Sync     string            `json:"sync"`
+	Root     string            `json:"root"`
+	Symlinks []string          `json:"symlinks"`
+	Links    map[string]string `json:"links"`
 }
 
 // Connection is this machine's link to one declared peer, as the daemon

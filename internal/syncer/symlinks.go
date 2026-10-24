@@ -10,26 +10,23 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
-// settleLinks makes the tree real: this store's declared external symlinks,
-// and a symlink inside it for each child store. Nothing is ever overwritten —
-// a path that belongs to something else is reported busy and left alone.
+// settleLinks makes this store's external symlinks and named store references
+// real. A referenced store may be linked by any number of parents.
 func (e *Engine) settleLinks(fs *StoreState) {
-	states := make([]api.StoreSymlink, 0, len(fs.symlinks))
+	states := make([]api.StoreSymlink, 0, len(fs.symlinks)+len(fs.links))
 	for _, path := range fs.symlinks {
 		states = append(states, e.settleOne(fs, fs, path, fs.root))
 	}
-	fs.metaMu.Lock()
-	fs.links = states
-	fs.metaMu.Unlock()
-
-	// Present this store's children inside it. This is the only thing that
-	// composes the tree; the canonical dirs stay flat under root.
-	for _, child := range e.stores {
-		if child.parent != fs.name {
+	for target, path := range fs.links {
+		child := e.byName[target]
+		if child == nil {
 			continue
 		}
-		e.settleOne(child, fs, filepath.Join(fs.root, child.path), child.root)
+		states = append(states, e.settleOne(child, fs, filepath.Join(fs.root, path), child.root))
 	}
+	fs.metaMu.Lock()
+	fs.linkState = states
+	fs.metaMu.Unlock()
 }
 
 // settleOne makes path a symlink to target, or reports why it is not. owner

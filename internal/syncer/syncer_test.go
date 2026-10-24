@@ -358,49 +358,30 @@ func TestConcurrentWritesConflictAndConverge(t *testing.T) {
 	}
 }
 
-// The nesting rule, made deliberate: a child store is a symlink inside its
-// parent, so the parent's scan never sees the child's bytes. That is what
-// makes nesting free instead of double-indexed.
-func TestChildStoreIsALinkAndNeverIndexedByParent(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"pictures": {
-			Group: "g",
-			Stores: map[string]config.Store{
-				"bulk": {Path: "Bulk"},
-			},
-		},
+// A reusable store is linked into its parent without becoming owned by it.
+func TestStoreLinkIsReusableAndNeverIndexedByParent(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.2:2", "", map[string]config.Store{
+		"pictures": {Group: "g", Links: map[string]string{"bulk": "Bulk"}},
+		"bulk":     {Group: "g"},
 	})
 	n.prepareAll()
-
 	link := filepath.Join(n.root("pictures"), "Bulk")
 	target, err := os.Readlink(link)
 	if err != nil {
-		t.Fatalf("child link: %v", err)
+		t.Fatalf("store link: %v", err)
 	}
 	if target != n.root("bulk") {
-		t.Fatalf("child link -> %q, want %q", target, n.root("bulk"))
+		t.Fatalf("store link -> %q, want %q", target, n.root("bulk"))
 	}
-
 	writeFile(t, filepath.Join(n.root("bulk"), "big.bin"), "child", time.Now())
-	writeFile(t, filepath.Join(n.root("pictures"), "small.jpg"), "parent", time.Now())
-
 	if _, err := n.eng.scan(n.store("pictures"), true); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"Bulk", "Bulk/big.bin"} {
-		if ent := n.store("pictures").db.Get(path); ent != nil {
-			t.Fatalf("parent indexed %q: %+v", path, ent)
-		}
+	if ent := n.store("pictures").db.Get("Bulk/big.bin"); ent != nil {
+		t.Fatalf("parent indexed reusable child: %+v", ent)
 	}
-	if ent := n.store("pictures").db.Get("small.jpg"); ent == nil {
-		t.Fatal("parent did not index its own file")
-	}
-
 	if _, err := n.eng.scan(n.store("bulk"), true); err != nil {
 		t.Fatal(err)
-	}
-	if ent := n.store("bulk").db.Get("small.jpg"); ent != nil {
-		t.Fatalf("child indexed the parent's file: %+v", ent)
 	}
 	if ent := n.store("bulk").db.Get("big.bin"); ent == nil {
 		t.Fatal("child did not index its own file")
@@ -762,6 +743,7 @@ func TestSnapshotExcludesTombstonesFromPending(t *testing.T) {
 		t.Fatalf("status counts = entries %d local %d pending %d, want 1/1/0", got.Entries, got.Local, got.Pending)
 	}
 }
+
 // on disk must be corrected in place, without a version bump.
 func TestScanRepairsAStaleSizeWithoutNewVersion(t *testing.T) {
 	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")

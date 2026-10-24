@@ -1,20 +1,20 @@
 # NixOS module for storeboard — one options set for the daemon and its CLI.
 #
+# Stores are flat top-level declarations. A store can reference another store
+# by name with `links.<store> = "relative/path"`; the referenced store may be
+# linked by any number of parents.
+#
 #   services.storeboard = {
 #     enable = true;
 #     peer = "laptop";
-#     peers = {
-#       laptop.endpoints = [ "192.168.1.10:4242" ];
-#       desktop.endpoints = [ "192.168.1.11:4242" ];
-#     };
 #     groups.family.peers = [ "laptop" "desktop" ];
 #     stores.pictures = {
 #       group = "family";
-#       stores.bulk = { group = "media"; sync = "remote"; };
+#       links.bulk = "Bulk";
 #     };
-#     stores.documents = {
+#     stores.bulk = {
 #       group = "family";
-#       symlinks = [ "/home/kyle/Documents" ];
+#       sync = "remote";
 #     };
 #   };
 #
@@ -46,12 +46,9 @@ let
 
   configFile = if cfg.configFile != null then cfg.configFile else generatedConfig;
 
-  # Every store in the tree, flattened: the ids are global, the placement is
-  # a tree. Used only to collect the paths the service may write.
-  flattenStores =
-    tree: lib.concatLists (lib.mapAttrsToList (_: s: [ s ] ++ flattenStores (s.stores or { })) tree);
-
-  allStores = flattenStores cfg.stores;
+  # All stores are top-level; links are references and do not create owned
+  # nested declarations.
+  allStores = lib.attrValues cfg.stores;
 
   # What the engine may write: the root, the data directory, and every
   # declared symlink path (and its parent — a store's link is created where

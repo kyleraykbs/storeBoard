@@ -31,7 +31,7 @@ func setXDG(t *testing.T) (dataHome, runtimeDir string) {
 }
 
 // valid returns the baseline model: this peer, two more devices, two groups,
-// two top-level stores, one child, one external symlink.
+// and three flat stores with a reusable bulk link.
 func valid() *Config {
 	return &Config{
 		ConfigVersion: ConfigVersion,
@@ -49,16 +49,9 @@ func valid() *Config {
 			"media":  {Peers: []string{"laptop", "desktop"}},
 		},
 		StoreTree: map[string]Store{
-			"pictures": {
-				Group: "family",
-				Stores: map[string]Store{
-					"bulk": {Group: "media", Sync: SyncRemote, Path: "Bulk"},
-				},
-			},
-			"documents": {
-				Group:    "family",
-				Symlinks: []string{"/home/kyle/Documents"},
-			},
+			"pictures":  {Group: "family", Links: map[string]string{"bulk": "Bulk"}},
+			"bulk":      {Group: "media", Sync: SyncRemote},
+			"documents": {Group: "family", Symlinks: []string{"/home/kyle/Documents"}},
 		},
 		Permissions: map[string]Permissions{},
 	}
@@ -153,38 +146,26 @@ func TestLoadFullModel(t *testing.T) {
 		"root": "/srv/board",
 		"peer": "laptop",
 		"peers": {
-			"laptop":  { "endpoints": ["192.168.1.10:4242"] },
+			"laptop": { "endpoints": ["192.168.1.10:4242"] },
 			"desktop": { "endpoints": ["192.168.1.11:4242"] }
 		},
 		"groups": {
 			"family": { "peers": ["laptop", "desktop"] },
-			"media":  { "peers": ["laptop"] }
+			"media": { "peers": ["laptop"] }
 		},
 		"stores": {
-			"pictures": {
-				"group": "family",
-				"stores": { "bulk": { "group": "media", "sync": "remote" } }
-			},
+			"pictures": { "group": "family", "links": { "bulk": "Bulk" } },
+			"bulk": { "group": "media", "sync": "remote" },
 			"documents": { "group": "family", "symlinks": ["/home/alice/Documents"] }
 		}
 	}`)
-
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Peer != "laptop" {
-		t.Errorf("peer = %q, want laptop", cfg.Peer)
-	}
 	bulk, ok := cfg.StoreView("bulk")
-	if !ok {
-		t.Fatalf("bulk not resolved: %#v", cfg.StoreViews())
-	}
-	if bulk.Parent != "pictures" || bulk.Path != "bulk" || bulk.Sync != SyncRemote {
-		t.Errorf("bulk = %+v, want parent pictures, path bulk, remote", bulk)
-	}
-	if want := filepath.Join("/srv/board", "bulk"); bulk.Dir != want {
-		t.Errorf("bulk dir = %q, want %q", bulk.Dir, want)
+	if !ok || bulk.Sync != SyncRemote || bulk.Dir != filepath.Join("/srv/board", "bulk") {
+		t.Fatalf("bulk = %+v", bulk)
 	}
 	docs, _ := cfg.StoreView("documents")
 	if len(docs.Symlinks) != 1 || docs.Symlinks[0] != "/home/alice/Documents" {
@@ -234,22 +215,27 @@ func TestValidate(t *testing.T) {
 		{"bad sync type", func(c *Config) {
 			c.StoreTree["loose"] = Store{Group: "family", Sync: "sometimes"}
 		}, "sync"},
-		{"top-level path", func(c *Config) {
-			c.StoreTree["loose"] = Store{Group: "family", Path: "Place"}
-		}, "top level"},
-		{"absolute child path", func(c *Config) {
-			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "/Bulk"}
+		{"invalid link path", func(c *Config) {
+			c.StoreTree["pictures"].Links["bulk"] = "/Bulk"
 		}, "relative"},
-		{"escaping child path", func(c *Config) {
-			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "../Bulk"}
+		{"escaping link path", func(c *Config) {
+			c.StoreTree["pictures"].Links["bulk"] = "../Bulk"
 		}, "clean relative"},
-		{"duplicate sibling paths", func(c *Config) {
-			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "Same"}
-			c.StoreTree["pictures"].Stores["other"] = Store{Path: "Same"}
+		{"duplicate link paths", func(c *Config) {
+			c.StoreTree["other"] = Store{Group: "family"}
+			c.StoreTree["pictures"].Links["other"] = "Bulk"
 		}, "both appear"},
-		{"duplicate id across the tree", func(c *Config) {
-			c.StoreTree["pictures"].Stores["documents"] = Store{}
-		}, "twice"},
+		{"unknown link target", func(c *Config) {
+			c.StoreTree["pictures"].Links["missing"] = "Missing"
+		}, "unknown store"},
+		{"link cycle", func(c *Config) {
+			bulk := c.StoreTree["bulk"]
+			bulk.Links = map[string]string{"pictures": "Pictures"}
+			pictures := c.StoreTree["pictures"]
+			pictures.Links["bulk"] = "Bulk"
+			c.StoreTree["bulk"] = bulk
+			c.StoreTree["pictures"] = pictures
+		}, "cycle"},
 		{"store name is a path", func(c *Config) {
 			c.StoreTree["a/b"] = Store{Group: "family"}
 		}, "identifier"},
@@ -295,34 +281,18 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-// Undeclared -> follow the parent; declared -> do our own thing.
-func TestInheritance(t *testing.T) {
+// Store policy is declared on each top-level store; links only choose where
+// another store is presented.
+func TestFlatStorePolicies(t *testing.T) {
 	cfg := valid()
-	cfg.StoreTree["pictures"] = Store{
-		Group:       "family",
-		Sync:        SyncLocal,
-		Permissions: &Permissions{Group: "users", Mode: "0770"},
-		Stores: map[string]Store{
-			"bulk":  {}, // inherits everything
-			"media": {Group: "media", Sync: SyncRemote, Path: "Media", Permissions: &Permissions{User: "kyle"}},
-		},
-	}
+	cfg.StoreTree["pictures"] = Store{Group: "family", Sync: SyncLocal, Permissions: &Permissions{Group: "users", Mode: "0770"}, Links: map[string]string{"bulk": "Bulk"}}
+	cfg.StoreTree["bulk"] = Store{Group: "media", Sync: SyncRemote, Permissions: &Permissions{User: "kyle"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	bulk, _ := cfg.StoreView("bulk")
-	if bulk.Group != "family" || bulk.Sync != SyncLocal || bulk.Path != "bulk" {
-		t.Errorf("bulk = %+v, want the parent's group and sync, its own name as path", bulk)
-	}
-	if bulk.Permissions == nil || bulk.Permissions.Group != "users" || bulk.Permissions.Mode != "0770" {
-		t.Errorf("bulk permissions = %+v, want the parent's", bulk.Permissions)
-	}
-	media, _ := cfg.StoreView("media")
-	if media.Group != "media" || media.Sync != SyncRemote || media.Path != "Media" {
-		t.Errorf("media = %+v, want its own declarations", media)
-	}
-	if media.Permissions == nil || media.Permissions.User != "kyle" || media.Permissions.Group != "users" {
-		t.Errorf("media permissions = %+v, want user kyle over inherited group users", media.Permissions)
+	if bulk.Group != "media" || bulk.Sync != SyncRemote || bulk.Permissions.User != "kyle" {
+		t.Errorf("bulk = %+v", bulk)
 	}
 }
 

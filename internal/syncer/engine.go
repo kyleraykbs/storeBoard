@@ -62,21 +62,19 @@ const (
 	stateDetached = "detached"
 )
 
-// StoreState is one store's engine-side state.
+// StoreState is one top-level store's engine-side state.
 type StoreState struct {
-	name     string
-	parent   string
-	path     string // relpath inside the parent; "" at the top level
-	group    string
-	streamed bool
-	root     string // canonical directory: <root>/<id>
-
-	symlinks []string // declared external paths
-	links    []api.StoreSymlink
-	state    string
+	name      string
+	group     string
+	streamed  bool
+	root      string // canonical directory: <root>/<id>
+	symlinks  []string
+	links     map[string]string // target store id -> relative path
+	linkState []api.StoreSymlink
+	state     string
 
 	db        *FileDB
-	hist      *History // nil when this machine keeps no history for the store
+	hist      *History
 	conflicts int
 	lastScan  time.Time
 
@@ -85,14 +83,11 @@ type StoreState struct {
 
 	// metaMu guards published, the status document's copy of this store's
 	// state. Snapshot refreshes it whenever the scan lock happens to be
-	// free and otherwise serves the last values: a store materialising tens
-	// of gigabytes holds that lock for minutes, and `storeboard status` has
-	// to answer regardless (an endpoint that waits is indistinguishable from
-	// a dead daemon).
+	// free and otherwise serves the last values.
 	metaMu    sync.Mutex
 	published api.StoreSync
-	local     int  // entries present on this machine, as of the last scan
-	scanning  bool // a scan is walking the store right now
+	local     int
+	scanning  bool
 }
 
 // publish returns the store's status, refreshing the fields that need the
@@ -101,7 +96,7 @@ type StoreState struct {
 // needed that lock.
 func (fs *StoreState) publish() api.StoreSync {
 	fs.metaMu.Lock()
-	links := append([]api.StoreSymlink(nil), fs.links...)
+	links := append([]api.StoreSymlink(nil), fs.linkState...)
 	if links == nil {
 		links = []api.StoreSymlink{}
 	}
@@ -319,12 +314,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		}
 		fs := &StoreState{
 			name:     v.ID,
-			parent:   v.Parent,
-			path:     v.Path,
 			group:    v.Group,
 			streamed: streamed,
 			root:     v.Dir,
 			symlinks: v.Symlinks,
+			links:    v.Links,
 			state:    state,
 			db:       db,
 			hist:     hist,

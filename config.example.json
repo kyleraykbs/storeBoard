@@ -19,16 +19,14 @@
     }
   },
   "stores": {
-    "photos": {
+    "pictures": {
       "group": "family",
       "symlinks": ["/home/alice/Pictures"],
-      "stores": {
-        "bulk": {
-          "group": "media",
-          "sync": "remote",
-          "path": "Bulk"
-        }
-      }
+      "links": { "bulk": "Bulk" }
+    },
+    "bulk": {
+      "group": "media",
+      "sync": "remote"
     },
     "documents": {
       "group": "family",

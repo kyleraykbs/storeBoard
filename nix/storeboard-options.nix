@@ -109,61 +109,35 @@ rec {
     description = "Groups of peers that share stores.";
   };
 
-  # One store's declaration. Everything but `path` and `symlinks` is
-  # inherited from the parent when unset: a child only says what makes it
-  # different (its group, its mount type, its permissions).
+  # One flat store declaration. Links reference another top-level store by id.
   storeModule =
     { name, ... }:
     {
       options = {
-        path = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "Bulk";
-          description = ''
-            Relpath inside the parent, and the name it appears under there.
-            Null means the store's key, at the parent's top level. A
-            top-level store's canonical dir is its key, so this is
-            meaningless at the top level.
-          '';
-        };
         group = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          example = "family";
-          description = "Group that shares this store. Null inherits the parent's; a top-level store must declare one.";
+          description = "Group that shares this store; required for top-level declarations.";
         };
         sync = lib.mkOption {
           type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]);
           default = null;
-          example = "remote";
-          description = ''
-            `local` holds a replica that works offline; `remote` streams the
-            store from a holder. Null inherits the parent's; the top-level
-            default is local.
-          '';
+          description = "Whether this store is local or remote.";
         };
         symlinks = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [ ];
-          example = [ "/home/kyle/Documents" ];
-          description = ''
-            Absolute paths that become symlinks to this store's canonical
-            dir. Never inherited: a path belongs to one machine.
-          '';
+          description = "Absolute paths linked to this store's canonical directory.";
         };
         permissions = lib.mkOption {
           type = lib.types.nullOr permSubmodule;
           default = null;
-          example = {
-            user = "kyle";
-          };
-          description = "Ownership and mode for this store; overrides the parent field by field.";
+          description = "Ownership and mode for this store.";
         };
-        stores = lib.mkOption {
-          type = lib.types.attrsOf (lib.types.submodule storeModule);
+        links = lib.mkOption {
+          type = lib.types.attrsOf lib.types.str;
           default = { };
-          description = "Child stores, presented as symlinks inside this one.";
+          description = "Referenced store id to relative presentation path.";
         };
       };
     };
@@ -171,21 +145,9 @@ rec {
   stores = lib.mkOption {
     type = lib.types.attrsOf (lib.types.submodule storeModule);
     default = { };
-    example = {
-      pictures = {
-        group = "family";
-        stores.bulk = {
-          group = "media";
-          sync = "remote";
-        };
-      };
-      documents = {
-        group = "family";
-        symlinks = [ "/home/kyle/Documents" ];
-      };
-    };
-    description = "The store tree, by id. Ids are globally unique and name the canonical dir under `root`.";
+    description = "Flat top-level stores; links reference stores by name.";
   };
+
 
   backup = lib.mkOption {
     type = lib.types.nullOr (
@@ -267,20 +229,19 @@ rec {
     '';
   };
 
-  # The store tree as it goes into the JSON file: only what is declared.
+  # The flat store namespace as it goes into JSON: only declared fields.
   storesJSON =
-    tree:
+    stores:
     lib.mapAttrs (
       _: s:
-      lib.optionalAttrs (s.path != null) { path = s.path; }
-      // lib.optionalAttrs (s.group != null) { group = s.group; }
+      lib.optionalAttrs (s.group != null) { group = s.group; }
       // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
       // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
+      // lib.optionalAttrs (s.links != { }) { links = s.links; }
       // lib.optionalAttrs (s.permissions != null) {
         permissions = lib.filterAttrs (_: v: v != null) s.permissions;
       }
-      // lib.optionalAttrs (s.stores != { }) { stores = storesJSON s.stores; }
-    ) tree;
+    ) stores;
 
   # The configuration file both binaries read: strict JSON, configVersion 2,
   # unknown keys an error. Sections appear only when the calling scope has the
@@ -306,19 +267,7 @@ rec {
         }
       ) cfg.groups;
     }
-    // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; }
-    // lib.optionalAttrs (cfg ? permissions && cfg.permissions != { }) {
-      permissions = lib.mapAttrs (_: p: lib.filterAttrs (_: v: v != null) p) cfg.permissions;
-    }
-    // lib.optionalAttrs (cfg ? backup && cfg.backup != null) {
-      backup = { enable = cfg.backup.enable; }
-      // lib.optionalAttrs (cfg.backup.keep != null) { keep = cfg.backup.keep; }
-      // lib.optionalAttrs (cfg.backup.stores != { }) { stores = cfg.backup.stores; };
-    };
-
-  # The config file, validated by the real `storeboard config check` during
-  # the build: nixos-rebuild fails with the validator's message, and the file
-  # that lands in /etc (or a home) is one the daemon is guaranteed to accept.
+    // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; };
   checkedConfig =
     package: cfg: name:
     let

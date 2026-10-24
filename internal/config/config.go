@@ -6,10 +6,10 @@
 // like every other JSON surface (configVersion); this build reads exactly
 // version 2.
 //
-// The model: one `root` directory holds the bytes, a tree of `stores` below
-// it, and `symlinks` pointing at a store from anywhere else. A store declares
-// its group, mount type, permissions and children; anything undeclared is
-// inherited from its parent, so a child only says what makes it different.
+// The model: one `root` directory holds flat top-level stores. A store may
+// reference any other store by name through `links`; each link is a relative
+// presentation path inside the referencing store. Store identity and policy
+// belong only to the referenced top-level declaration.
 package config
 
 import (
@@ -174,26 +174,14 @@ func (c *Config) BackupFor(store string) (bool, time.Duration, error) {
 	return true, keep, nil
 }
 
-// Store is one store's declaration inside its parent (or at the top level).
-// Everything but Path and Symlinks is inherited from the parent when empty.
+// Store is one top-level store declaration. Links reference other top-level
+// stores by id and give their presentation path inside this store.
 type Store struct {
-	// Path is the store's relpath inside its parent, and the name it appears
-	// under there. Absent means the store's id, at the parent's top level.
-	// A top-level store's directory is its id, so Path is meaningless there.
-	Path string `json:"path,omitempty"`
-	// Group names the peers that share this store. Empty inherits the
-	// parent's group; a top-level store must declare one.
-	Group string `json:"group,omitempty"`
-	// Sync is SyncLocal or SyncRemote. Empty inherits the parent's; the
-	// top-level default is local.
-	Sync string `json:"sync,omitempty"`
-	// Symlinks are absolute paths that become symlinks to this store's
-	// canonical directory. Never inherited: a path belongs to one machine.
-	Symlinks []string `json:"symlinks,omitempty"`
-	// Permissions overrides the parent's declaration field by field.
-	Permissions *Permissions `json:"permissions,omitempty"`
-	// Stores are this store's children, presented as symlinks inside it.
-	Stores map[string]Store `json:"stores,omitempty"`
+	Group       string            `json:"group,omitempty"`
+	Sync        string            `json:"sync,omitempty"`
+	Symlinks    []string          `json:"symlinks,omitempty"`
+	Permissions *Permissions      `json:"permissions,omitempty"`
+	Links       map[string]string `json:"links,omitempty"`
 }
 
 // Config is the complete configuration, shared by the daemon and the CLI.
@@ -237,16 +225,15 @@ type Config struct {
 	Permissions map[string]Permissions `json:"permissions,omitempty"`
 }
 
-// StoreView is one store resolved against its ancestors and this machine.
+// StoreView is one resolved top-level store.
 type StoreView struct {
 	ID          string
-	Parent      string // "" at the top level
-	Path        string // relpath inside the parent; "" at the top level
 	Group       string
-	Sync        string // SyncLocal or SyncRemote
+	Sync        string
 	Symlinks    []string
-	Permissions *Permissions // effective declaration, nearest ancestor wins per field
-	Dir         string       // canonical directory: <root>/<id>
+	Links       map[string]string
+	Permissions *Permissions
+	Dir         string
 }
 
 // DefaultRoot is where the store tree lives when the config does not say.
@@ -508,18 +495,16 @@ func (c *Config) Validate() error {
 
 	views := c.StoreViews()
 	seenID := map[string]bool{}
-	for _, v := range views {
-		if seenID[v.ID] {
-			return fmt.Errorf("store %q: declared twice; ids are global", v.ID)
+	for id := range c.StoreTree {
+		if err := checkName("store", id); err != nil {
+			return err
 		}
+	}
+	for _, v := range views {
 		seenID[v.ID] = true
 	}
-
-	// Presentation paths must be unique among siblings, and a symlink path
-	// may not be an ancestor or descendant of root (either would make the
-	// tree point into itself).
-	var symlinks []struct{ path, store string }
 	for _, v := range views {
+		seenID[v.ID] = true
 		if v.Group == "" {
 			return fmt.Errorf("store %q: no group; a top-level store must declare one", v.ID)
 		}
@@ -531,6 +516,17 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote)
 		}
+		for target, path := range v.Links {
+			if !seenID[target] {
+				return fmt.Errorf("store %q link target %q: unknown store", v.ID, target)
+			}
+			if err := checkRelPath(path); err != nil {
+				return fmt.Errorf("store %q link path: %w", v.ID, err)
+			}
+		}
+	}
+	var symlinks []struct{ path, store string }
+	for _, v := range views {
 		for _, sp := range v.Symlinks {
 			if !filepath.IsAbs(sp) {
 				return fmt.Errorf("store %q symlink %q: path must be absolute", v.ID, sp)
@@ -539,30 +535,39 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("store %q symlink %q: path must be clean", v.ID, sp)
 			}
 			if sp == c.Root || containsPath(sp, c.Root) || containsPath(c.Root, sp) {
-				return fmt.Errorf("store %q symlink %q: overlaps root %s", v.ID, sp, c.Root)
+				return fmt.Errorf("store %q symlink %q overlaps root %s", v.ID, sp, c.Root)
 			}
 			symlinks = append(symlinks, struct{ path, store string }{sp, v.ID})
 		}
 	}
 	for i, a := range symlinks {
 		for _, b := range symlinks[i+1:] {
-			switch {
-			case a.path == b.path:
-				if a.store == b.store {
-					return fmt.Errorf("store %q: symlink %q is declared twice", a.store, a.path)
-				}
+			if a.path == b.path {
 				return fmt.Errorf("stores %q and %q both claim symlink %q", a.store, b.store, a.path)
-			case containsPath(a.path, b.path), containsPath(b.path, a.path):
+			}
+			if containsPath(a.path, b.path) || containsPath(b.path, a.path) {
 				return fmt.Errorf("symlinks %q and %q nest: one path cannot be inside another", a.path, b.path)
 			}
 		}
 	}
-
-	// Sibling presentation paths are unique within their parent.
-	if err := c.checkSiblings(c.StoreTree, ""); err != nil {
+	for _, v := range views {
+		seenPaths := map[string]string{}
+		for target, path := range v.Links {
+			if !seenID[target] {
+				return fmt.Errorf("store %q link target %q: unknown store", v.ID, target)
+			}
+			if other, ok := seenPaths[path]; ok {
+				return fmt.Errorf("store %q links %q and %q both appear as %q", v.ID, other, target, path)
+			}
+			seenPaths[path] = target
+			if target == v.ID {
+				return fmt.Errorf("store %q links to itself", v.ID)
+			}
+		}
+	}
+	if err := c.checkLinkCycles(); err != nil {
 		return err
 	}
-
 	if c.Backup != nil {
 		if _, err := ParseKeep(c.Backup.Keep); err != nil {
 			return fmt.Errorf("backup keep: %w", err)
@@ -585,38 +590,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// checkSiblings enforces unique presentation names under one parent.
-func (c *Config) checkSiblings(stores map[string]Store, parent string) error {
-	seen := map[string]string{}
-	for id, s := range stores {
-		if err := checkName("store", id); err != nil {
-			return err
-		}
-		if parent == "" {
-			if s.Path != "" {
-				return fmt.Errorf("store %q: path is meaningless at the top level; the canonical dir is its name", id)
-			}
-			seen[id] = id
-		} else {
-			path := s.Path
-			if path == "" {
-				path = id
-			}
-			if err := checkRelPath(path); err != nil {
-				return fmt.Errorf("store %q path: %w", id, err)
-			}
-			if other, dup := seen[path]; dup {
-				return fmt.Errorf("stores %q and %q both appear as %q in %q", other, id, path, parent)
-			}
-			seen[path] = id
-		}
-		if err := c.checkSiblings(s.Stores, id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // checkRelPath accepts a clean relative path inside a parent.
 func checkRelPath(p string) error {
 	if p == "" {
@@ -632,35 +605,55 @@ func checkRelPath(p string) error {
 	return nil
 }
 
-// StoreViews resolves every store in the tree, sorted by id. Inheritance is
-// nearest-declared-wins per field: group, sync and permissions come from the
-// store, else its nearest ancestor, else (sync) local.
 func (c *Config) StoreViews() []StoreView {
-	var out []StoreView
-	var walk func(parent string, stores map[string]Store, inherited StoreView)
-	walk = func(parent string, stores map[string]Store, inherited StoreView) {
-		for id, s := range stores {
-			v := StoreView{ID: id, Parent: parent, Dir: filepath.Join(c.Root, id)}
-			if parent != "" {
-				v.Path = s.Path
-				if v.Path == "" {
-					v.Path = id
-				}
-			}
-			v.Group = firstNonEmpty(s.Group, inherited.Group)
-			v.Sync = firstNonEmpty(s.Sync, inherited.Sync, SyncLocal)
-			v.Symlinks = append([]string(nil), s.Symlinks...)
-			v.Permissions = mergePerms(inherited.Permissions, s.Permissions)
-			out = append(out, v)
-			walk(id, s.Stores, v)
+	out := make([]StoreView, 0, len(c.StoreTree))
+	for id, s := range c.StoreTree {
+		links := map[string]string{}
+		for target, path := range s.Links {
+			links[target] = path
 		}
+		out = append(out, StoreView{
+			ID:          id,
+			Group:       s.Group,
+			Sync:        firstNonEmpty(s.Sync, SyncLocal),
+			Symlinks:    append([]string(nil), s.Symlinks...),
+			Links:       links,
+			Permissions: mergePerms(nil, s.Permissions),
+			Dir:         filepath.Join(c.Root, id),
+		})
 	}
-	walk("", c.StoreTree, StoreView{})
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-// StoreView returns one resolved store by id.
+func (c *Config) checkLinkCycles() error {
+	state := map[string]uint8{}
+	var visit func(string) error
+	visit = func(id string) error {
+		if state[id] == 1 {
+			return fmt.Errorf("store link cycle involving %q", id)
+		}
+		if state[id] == 2 {
+			return nil
+		}
+		state[id] = 1
+		for target := range c.StoreTree[id].Links {
+			if err := visit(target); err != nil {
+				return err
+			}
+		}
+		state[id] = 2
+		return nil
+	}
+	for id := range c.StoreTree {
+		if err := visit(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StoreView returns one resolved top-level store.
 func (c *Config) StoreView(id string) (StoreView, bool) {
 	for _, v := range c.StoreViews() {
 		if v.ID == id {
@@ -670,11 +663,8 @@ func (c *Config) StoreView(id string) (StoreView, bool) {
 	return StoreView{}, false
 }
 
-// PermissionsFor is the declared permissions for a store: this machine's
-// per-store entry wins field by field over the store's effective declaration
-// (own, then nearest ancestor), which wins over its group's default. Nil
-// when none of the three declares anything — the daemon then inherits from
-// the directory the canonical dir lives in.
+// PermissionsFor is the declared permissions for a store: the store's own
+// declaration wins over its group's default, then the machine override.
 func (c *Config) PermissionsFor(store string) *Permissions {
 	v, ok := c.StoreView(store)
 	var declared, groupDefault *Permissions
@@ -727,7 +717,7 @@ func (c *Config) GroupList() []api.Group {
 	return out
 }
 
-// Stores lists every store with its resolved view, sorted by id.
+// Stores lists every top-level store with its resolved view, sorted by id.
 func (c *Config) Stores() []api.Store {
 	views := c.StoreViews()
 	out := make([]api.Store, 0, len(views))
@@ -738,12 +728,11 @@ func (c *Config) Stores() []api.Store {
 		}
 		out = append(out, api.Store{
 			Name:     v.ID,
-			Parent:   v.Parent,
-			Path:     v.Path,
 			Group:    v.Group,
 			Sync:     v.Sync,
 			Root:     v.Dir,
 			Symlinks: symlinks,
+			Links:    v.Links,
 		})
 	}
 	return out
