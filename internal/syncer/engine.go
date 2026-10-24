@@ -271,6 +271,12 @@ func migrateRenamedStores(cfg *config.Config) error {
 			}
 			dst := filepath.Join(filepath.Dir(dir), id)
 			if _, err := os.Lstat(dst); err == nil {
+				if emptyRenameDestination(dir) && !emptyRenameDestination(dst) {
+					if err := os.RemoveAll(dir); err != nil {
+						return fmt.Errorf("remove empty old store state %q: %w", old, err)
+					}
+					continue
+				}
 				if !emptyRenameDestination(dst) {
 					return fmt.Errorf("rename store %q to %q: destination exists", old, id)
 				}
