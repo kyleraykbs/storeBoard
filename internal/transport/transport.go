@@ -456,6 +456,12 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 
 	preferred := m.preferredDirection(h.Name)
 	p.mu.Lock()
+	if p.conn == nil && direction != preferred {
+		p.mu.Unlock()
+		m.logger.Debug("noncanonical link dropped", "peer", h.Name, "direction", direction, "want", preferred)
+		c.Close()
+		return
+	}
 	if p.conn != nil && p.conn != c {
 		old := p.conn
 		switch {
