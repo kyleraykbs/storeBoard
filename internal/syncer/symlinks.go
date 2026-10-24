@@ -50,9 +50,18 @@ func (e *Engine) settleOne(owner, dirOwner *StoreState, path, target string) api
 			st.State = api.SymlinkLinked
 			return st
 		}
-		st.State, st.Busy = api.SymlinkBusy, api.BusySymlink
-		e.logger.Warn("symlink path points elsewhere; leaving it alone",
-			"store", owner.name, "path", path, "target", got, "want", target)
+		// A declared symlink is ours to update even when it points at an
+		// old storeboard root. Replacing the link inode never follows or
+		// deletes its target, so old content remains available for manual
+		// migration.
+		if err := symlinkSwap(path, target); err != nil {
+			st.State, st.Busy = api.SymlinkBusy, api.BusySymlink
+			e.logger.Warn("replace symlink", "store", owner.name, "path", path, "target", got, "want", target, "error", err)
+			return st
+		}
+		e.chownLink(owner, path)
+		st.State = api.SymlinkLinked
+		e.logger.Info("updated symlink", "store", owner.name, "path", path, "oldTarget", got, "target", target)
 		return st
 	}
 

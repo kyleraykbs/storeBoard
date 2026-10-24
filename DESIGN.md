@@ -32,10 +32,12 @@ one, it changes here first, deliberately, with a decision log entry.
 4. Policies fail closed. A receiver filter or any config expression that
    errors rejects and logs — never accepts.
 5. The daemon never migrates, moves or adopts existing content on its own.
-   A declared symlink path that already holds files is reported `busy` and
-   left exactly where it is until the user runs `store takeover`. A store's
-   canonical dir that already exists is adopted as it stands; nothing is
-   renamed into it.
+   A declared foreign symlink may be replaced atomically: replacing the link
+   inode never follows or deletes its target, so old content remains intact.
+   A real non-empty directory, a live mountpoint, or an ordinary file at the
+   declared path is reported `busy` and left exactly where it is until the
+   user runs `store takeover`. A store's canonical dir that already exists is
+   adopted as it stands; nothing is renamed into it.
 
 ## Ordering and conflicts
 

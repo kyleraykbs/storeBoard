@@ -97,10 +97,10 @@ tree, the root and the symlinks are declared fresh.
   a symlink and never journals one, so the parent never indexes the child's
   bytes. Nesting therefore costs nothing: no double indexing, no content-store
   copy of the outer tree.
-- **Declared paths are symlinks outward.** A store's `symlinks` become links
-  to its canonical dir. A path that already belongs to something else is left
-  alone and reported `busy` (`sync[].symlinks[]`): content of its own, a
-  foreign symlink, a live mount, or a file in the way.
+- **Declared paths are symlinks outward.** A declared foreign symlink may be
+  replaced atomically; replacing the link inode never follows or deletes its
+  old target. Real non-empty directories, live mounts and ordinary files are
+  left alone and reported `busy` (`sync[].symlinks[]`).
 - **`local`** stores hold a replica and sync it with every other participant:
   creates, edits and deletes (deletes land in `<dataDir>/trash/<id>/`).
 - **`remote`** stores are streams from a holder. The canonical dir is always

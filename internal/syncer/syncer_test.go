@@ -475,20 +475,22 @@ func TestTakeoverMovesContentIntoTheStore(t *testing.T) {
 		t.Fatal("taken-over file was not indexed")
 	}
 
-	// A foreign symlink is refused, never replaced.
+	// A declared foreign symlink is replaced, but its target is untouched.
+	oldTarget := filepath.Join(t.TempDir(), "old-storeboard-storage")
+	writeFile(t, filepath.Join(oldTarget, "old.txt"), "keep me", time.Now())
 	foreign := filepath.Join(t.TempDir(), "Foreign")
-	if err := os.Symlink("/tmp", foreign); err != nil {
+	if err := os.Symlink(oldTarget, foreign); err != nil {
 		t.Fatal(err)
 	}
 	m := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
 		"documents": {Group: "g", Symlinks: []string{foreign}},
 	})
 	m.prepareAll()
-	if _, err := m.eng.Takeover("documents", foreign, os.Getuid()); err == nil {
-		t.Fatal("takeover replaced a foreign symlink")
+	if target, _ := os.Readlink(foreign); target != m.root("documents") {
+		t.Fatalf("declared symlink target = %q, want %q", target, m.root("documents"))
 	}
-	if target, _ := os.Readlink(foreign); target != "/tmp" {
-		t.Fatalf("foreign symlink changed to %q", target)
+	if got := readFile(t, filepath.Join(oldTarget, "old.txt")); got != "keep me" {
+		t.Fatalf("old symlink target changed: %q", got)
 	}
 }
 
