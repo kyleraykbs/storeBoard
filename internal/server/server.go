@@ -331,10 +331,11 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// Close stops the server and removes the socket file.
+// Close stops the server and removes the socket file. Transport closes first
+// so queued peer frame handlers stop before journals and histories close.
 func (s *Server) Close() error {
-	s.engine.Close()
 	s.transport.Close()
+	s.engine.Close()
 	s.http.Close()
 	if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
 		return err

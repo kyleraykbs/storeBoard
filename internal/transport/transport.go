@@ -508,17 +508,28 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 
 	var frames chan []byte
 	var framesDone chan struct{}
+	var framesStop context.CancelFunc
 	if handler != nil {
+		framesCtx, cancelFrames := context.WithCancel(ctx)
+		framesStop = cancelFrames
 		frames = make(chan []byte, 1024)
 		framesDone = make(chan struct{})
 		m.spawn(func() {
 			defer close(framesDone)
-			for line := range frames {
-				p.mu.Lock()
-				stillCurrent := p.conn == c
-				p.mu.Unlock()
-				if stillCurrent {
-					handler.OnPeerFrame(p.name, line)
+			for {
+				select {
+				case <-framesCtx.Done():
+					return
+				case line, ok := <-frames:
+					if !ok {
+						return
+					}
+					p.mu.Lock()
+					stillCurrent := p.conn == c
+					p.mu.Unlock()
+					if stillCurrent {
+						handler.OnPeerFrame(p.name, line)
+					}
 				}
 			}
 		})
@@ -535,6 +546,9 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 	stop := make(chan struct{})
 	defer func() {
 		close(stop)
+		if framesStop != nil {
+			framesStop()
+		}
 		if frames != nil {
 			close(frames)
 			<-framesDone

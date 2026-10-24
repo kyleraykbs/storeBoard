@@ -91,6 +91,11 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		return // a store this machine does not carry
 	}
 	for _, rem := range fr.Entries {
+		select {
+		case <-e.closed:
+			return
+		default:
+		}
 		if rem == nil || !validRel(rem.Path) {
 			continue
 		}

@@ -171,14 +171,17 @@ type Engine struct {
 	me      string
 	store   *store.Store
 
-	mu       sync.Mutex
-	stores   []*StoreState
-	byName   map[string]*StoreState
-	sends    map[string]func([]byte) error
-	wants    map[string]*pending
-	incoming map[string]*incomingBlob
+	mu        sync.Mutex
+	stores    []*StoreState
+	byName    map[string]*StoreState
+	sends     map[string]func([]byte) error
+	wants     map[string]*pending
+	incoming  map[string]*incomingBlob
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
+// New prepares the engine. No store is touched until Run.
 // New prepares the engine. No store is touched until Run.
 func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 	if logger == nil {
@@ -210,6 +213,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		sends:    map[string]func([]byte) error{},
 		wants:    map[string]*pending{},
 		incoming: map[string]*incomingBlob{},
+		closed:   make(chan struct{}),
 	}
 
 	for _, v := range cfg.StoreViews() {
@@ -564,8 +568,11 @@ func (e *Engine) Snapshot() []api.StoreSync {
 	return out
 }
 
-// Close releases the journals and histories.
+// Close cancels frame application before closing durable state. Transport
+// shutdown calls this first, so a large queued index cannot keep a systemd
+// stop job waiting on journals or files.
 func (e *Engine) Close() {
+	e.closeOnce.Do(func() { close(e.closed) })
 	for _, fs := range e.stores {
 		fs.db.Close()
 		if fs.hist != nil {
