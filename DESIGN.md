@@ -37,7 +37,9 @@ one, it changes here first, deliberately, with a decision log entry.
    A real non-empty directory, a live mountpoint, or an ordinary file at the
    declared path is reported `busy` and left exactly where it is until the
    user runs `store takeover`. A store's canonical dir that already exists is
-   adopted as it stands; nothing is renamed into it.
+   adopted as it stands; nothing is renamed into it. Canonical dirs and links
+   are reconciled every five seconds: missing paths are recreated, empty
+   declared directories become links, and non-empty directories remain busy.
 
 ## Ordering and conflicts
 

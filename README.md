@@ -110,7 +110,11 @@ tree, the root and the symlinks are declared fresh.
 - Concurrent edits to one file resolve deterministically on every replica
   (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
   conflicts are visible in `status --json` (`.sync[]`).
-- Permissions are re-applied to every path the daemon creates on every scan;
+- The daemon reconciles canonical dirs and declared symlinks every 5 s
+  (`STOREBOARD_LINK_INTERVAL` overrides it for tests). Missing canonical dirs
+  and links are recreated; empty declared directories become links again;
+  non-empty directories, ordinary files and mountpoints remain protected and
+  report `busy`.
   resolved values show up in `status` (`sync[].permissions`).
 - Scans run every 15 s; `STOREBOARD_SCAN_INTERVAL` (a duration, e.g.
   `200ms`) overrides that for tests and tight loops.

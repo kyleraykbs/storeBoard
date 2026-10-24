@@ -25,13 +25,22 @@ import (
 // for a home mesh (a 15 s poll, cheap because the scanner only hashes files
 // whose size or mtime moved). STOREBOARD_SCAN_INTERVAL overrides it, which
 // is how the smoke test drives the engine fast; tests set it directly.
-// (Rate limiting and ignore rules are a later pass.)
 var scanInterval = 15 * time.Second
+
+// linkInterval is how often canonical dirs and declared symlinks are
+// reconciled after startup. A deleted link or canonical dir comes back on the
+// next pass; a non-empty directory remains protected until it becomes empty.
+var linkInterval = 5 * time.Second
 
 func init() {
 	if v := os.Getenv("STOREBOARD_SCAN_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			scanInterval = d
+		}
+	}
+	if v := os.Getenv("STOREBOARD_LINK_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			linkInterval = d
 		}
 	}
 }
@@ -249,18 +258,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 
 // Run prepares the tree and drives scanning until ctx ends.
 func (e *Engine) Run(ctx context.Context) {
-	// The root is the one container the tree lives in; create it before any
-	// store resolves permissions against its parent.
-	e.ensureRoot()
-
-	// Every canonical dir first, then the links that present them: a child's
-	// link can only be made once the parent's dir exists.
-	for _, fs := range e.stores {
-		e.prepareRoot(fs)
-	}
-	for _, fs := range e.stores {
-		e.settleLinks(fs)
-	}
+	e.reconcileLinks()
 
 	// Retention first (an in-memory pass), then unreferenced content: the
 	// collector runs before anything is in flight, and a blob touched in the
@@ -270,6 +268,11 @@ func (e *Engine) Run(ctx context.Context) {
 	go e.pruneLoop(ctx, pruneInterval)
 
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.linkLoop(ctx)
+	}()
 	for _, fs := range e.stores {
 		wg.Add(1)
 		go func(fs *StoreState) {
@@ -278,11 +281,35 @@ func (e *Engine) Run(ctx context.Context) {
 		}(fs)
 	}
 	<-ctx.Done()
-	// Scanners must be down before the caller tears anything down: an
-	// in-flight scan that writes a journal entry or a scratch file after Run
-	// returned races whatever comes next (in tests, removing the data
-	// directory; in production, a restarted daemon claiming the same paths).
+	// Scanners and link reconciliation must be down before the caller tears
+	// anything down: both can be writing paths or journals.
 	wg.Wait()
+}
+
+// reconcileLinks recreates missing canonical dirs and declared symlinks. It
+// never moves content: non-empty directories and mountpoints remain busy,
+// while stale symlink inodes are safely replaced.
+func (e *Engine) reconcileLinks() {
+	e.ensureRoot()
+	for _, fs := range e.stores {
+		e.prepareRoot(fs)
+	}
+	for _, fs := range e.stores {
+		e.settleLinks(fs)
+	}
+}
+
+func (e *Engine) linkLoop(ctx context.Context) {
+	t := time.NewTicker(linkInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			e.reconcileLinks()
+		}
+	}
 }
 
 // ensureRoot creates the one container the store tree lives in. It is not a

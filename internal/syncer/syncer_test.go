@@ -905,6 +905,87 @@ func TestTrashAcrossFilesystems(t *testing.T) {
 	}
 }
 
+func TestReconcileRestoresDeletedCanonicalDirAndSymlink(t *testing.T) {
+	old := linkInterval
+	linkInterval = 10 * time.Millisecond
+	defer func() { linkInterval = old }()
+
+	link := filepath.Join(t.TempDir(), "Documents")
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"documents": {Group: "g", Symlinks: []string{link}},
+	})
+	n.prepareAll()
+	root := n.root("documents")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.eng.Run(ctx)
+	waitFor(t, time.Second, "canonical dir restored", func() bool { return exists(root) })
+	waitFor(t, time.Second, "symlink restored", func() bool {
+		target, err := os.Readlink(link)
+		return err == nil && target == root
+	})
+}
+
+func TestReconcileReplacesEmptyDeclaredDirectory(t *testing.T) {
+	old := linkInterval
+	linkInterval = 10 * time.Millisecond
+	defer func() { linkInterval = old }()
+
+	link := filepath.Join(t.TempDir(), "Documents")
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"documents": {Group: "g", Symlinks: []string{link}},
+	})
+	n.prepareAll()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(link, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.eng.Run(ctx)
+	waitFor(t, time.Second, "empty directory replaced", func() bool {
+		target, err := os.Readlink(link)
+		return err == nil && target == n.root("documents")
+	})
+}
+
+func TestReconcileKeepsNonEmptyDirectoryBusy(t *testing.T) {
+	old := linkInterval
+	linkInterval = 10 * time.Millisecond
+	defer func() { linkInterval = old }()
+
+	link := filepath.Join(t.TempDir(), "Documents")
+	writeFile(t, filepath.Join(link, "keep.txt"), "mine", time.Now())
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"documents": {Group: "g", Symlinks: []string{link}},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.eng.Run(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if target, err := os.Readlink(link); err == nil {
+		t.Fatalf("non-empty directory replaced by %q", target)
+	}
+	if got := readFile(t, filepath.Join(link, "keep.txt")); got != "mine" {
+		t.Fatalf("non-empty directory changed: %q", got)
+	}
+	s := n.eng.Snapshot()[0]
+	if s.Symlinks[0].State != api.SymlinkBusy || s.Symlinks[0].Busy != api.BusyContent {
+		t.Fatalf("status = %+v, want busy content", s.Symlinks)
+	}
+}
+
 func sameDevice(a, b string) bool {
 	sa, ea := os.Stat(a)
 	sb, eb := os.Stat(b)
