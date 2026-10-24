@@ -271,7 +271,12 @@ func migrateRenamedStores(cfg *config.Config) error {
 			}
 			dst := filepath.Join(filepath.Dir(dir), id)
 			if _, err := os.Lstat(dst); err == nil {
-				return fmt.Errorf("rename store %q to %q: destination exists", old, id)
+				if !emptyRenameDestination(dst) {
+					return fmt.Errorf("rename store %q to %q: destination exists", old, id)
+				}
+				if err := os.RemoveAll(dst); err != nil {
+					return fmt.Errorf("remove empty rename destination %q: %w", id, err)
+				}
 			} else if !os.IsNotExist(err) {
 				return fmt.Errorf("inspect rename destination %q: %w", id, err)
 			}
@@ -283,7 +288,18 @@ func migrateRenamedStores(cfg *config.Config) error {
 	return nil
 }
 
-// New prepares the engine. No store is touched until Run.
+func emptyRenameDestination(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		return err == nil && len(entries) == 0
+	}
+	return info.Size() == 0
+}
+
 // New prepares the engine. No store is touched until Run.
 func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 	if err := migrateRenamedStores(cfg); err != nil {
