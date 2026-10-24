@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -603,7 +604,15 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 // disk); without the fallback a delete fails silently, the caller still
 // records the tombstone, and the scanner then resurrects the file it was
 // told to delete — a loop that never converges.
+//
+// A name already taken in the trash is not a failure: the trash holds
+// content the store no longer has, and two deletions of the same path are
+// ordinary. Refusing made applyDelete fail forever, so the entry was never
+// tombstoned and the store retried the same doomed delete on every index
+// exchange, starving everything behind it. The existing copy is parked under
+// a numbered sibling and both are kept.
 func moveOrCopy(src, dst string, mode os.FileMode) error {
+	dst = freeTrashName(dst)
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	} else if !errors.Is(err, syscall.EXDEV) {
@@ -645,4 +654,18 @@ func moveOrCopy(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return os.Remove(src)
+}
+
+// freeTrashName returns dst, or the first unused numbered sibling when dst is
+// taken. Deleting the same path twice must not be able to fail.
+func freeTrashName(dst string) string {
+	if _, err := os.Lstat(dst); err != nil {
+		return dst
+	}
+	for i := 1; ; i++ {
+		alt := dst + ".storeboard-deleted-" + strconv.Itoa(i)
+		if _, err := os.Lstat(alt); err != nil {
+			return alt
+		}
+	}
 }

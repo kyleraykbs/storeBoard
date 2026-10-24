@@ -1154,6 +1154,47 @@ func TestSupersededWantDropsArrivingBlob(t *testing.T) {
 	}
 }
 
+// Deleting the same path twice must not be able to fail. The trash holds
+// content the store no longer has, so a name already taken there is ordinary.
+// Refusing made applyDelete fail forever: the entry was never tombstoned, and
+// the store retried the same doomed delete on every index exchange, starving
+// every other file behind it (the Videos store stopped converging entirely).
+func TestDeletingTheSamePathTwiceKeepsBothTrashCopies(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	trashed := func() int {
+		matches, _ := filepath.Glob(filepath.Join(n.cfg.DataDir, "trash", "docs", "twice.txt*"))
+		return len(matches)
+	}
+
+	for i, body := range []string{"first", "second"} {
+		path := filepath.Join(fs.root, "twice.txt")
+		writeFile(t, path, body, time.Now())
+		if _, err := n.eng.scan(fs, true); err != nil {
+			t.Fatalf("scan %d: %v", i, err)
+		}
+		loc := fs.db.Get("twice.txt")
+		if loc == nil || loc.Deleted {
+			t.Fatalf("round %d: scan did not index the file: %+v", i, loc)
+		}
+		if err := n.eng.applyDelete(fs, loc); err != nil {
+			t.Fatalf("round %d: applyDelete refused a repeat deletion: %v", i, err)
+		}
+		if exists(path) {
+			t.Fatalf("round %d: the file is still in the store root", i)
+		}
+		if err := fs.db.Put(&Entry{Path: "twice.txt", Deleted: true, VV: loc.VV}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := trashed(); got != 2 {
+		t.Fatalf("trash holds %d copies, want both deletions kept", got)
+	}
+}
+
 func sameDevice(a, b string) bool {
 	sa, ea := os.Stat(a)
 	sb, eb := os.Stat(b)
