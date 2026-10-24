@@ -454,6 +454,11 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 
 func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 	e.scanOnce(fs)
+	// The journal may already contain files from a previous run, so the first
+	// scan can produce no delta even though a peer connected before scanning.
+	if err := e.broadcastFullIndex(fs); err != nil {
+		e.logger.Debug("initial index", "store", fs.name, "error", err)
+	}
 	t := time.NewTicker(scanInterval)
 	defer t.Stop()
 	for {
@@ -464,6 +469,23 @@ func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 			e.scanOnce(fs)
 		}
 	}
+}
+
+func (e *Engine) broadcastFullIndex(fs *StoreState) error {
+	e.mu.Lock()
+	peers := make([]string, 0, len(e.sends))
+	for peer := range e.sends {
+		peers = append(peers, peer)
+	}
+	e.mu.Unlock()
+	for _, peer := range peers {
+		if e.storeSharedWith(fs, peer) {
+			if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (e *Engine) scanOnce(fs *StoreState) {
