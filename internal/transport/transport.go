@@ -59,12 +59,13 @@ type hello struct {
 // by mu; the linkReset channel is closed (and replaced) whenever a live
 // link dies, waking the dial loop without polling.
 type peerState struct {
-	name    string
-	endps   []string // dial targets, from the peer's registry entry
-	state   string
-	since   time.Time
-	lastErr string
-	attempt int
+	name      string
+	endps     []string // dial targets, from the peer's registry entry
+	direction string   // the registered link: inbound or outbound
+	state     string
+	since     time.Time
+	lastErr   string
+	attempt   int
 
 	conn      net.Conn
 	linkReset chan struct{}
@@ -429,9 +430,19 @@ func connKey(c net.Conn) string {
 	return pair[0] + "|" + pair[1]
 }
 
-// register adopts a handshaked connection. When a link to that peer already
-// exists, the connection with the smaller key survives and the other is
-// closed — whichever side runs the check second closes its own.
+// preferredDirection gives each peer pair one stable link: the lexically
+// lower peer dials, so it keeps outbound; the higher peer keeps inbound.
+func (m *Manager) preferredDirection(peer string) string {
+	if m.cfg.Peer < peer {
+		return "outbound"
+	}
+	return "inbound"
+}
+
+// register adopts a handshaked connection. The direction rule is symmetric
+// on both peers and does not depend on ephemeral TCP ports. That matters for
+// large initial indexes: choosing different links makes both sides close the
+// other's connection and leaves the index exchange deadlocked.
 func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *bufio.Reader, direction string) {
 	key := connKey(c)
 
@@ -439,26 +450,34 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	p, ok := m.peers[h.Name]
 	m.mu.Unlock()
 	if !ok {
-		// The config cannot have changed mid-handshake (it is fixed for the
-		// process), so this is purely defensive.
 		c.Close()
 		return
 	}
 
+	preferred := m.preferredDirection(h.Name)
 	p.mu.Lock()
 	if p.conn != nil && p.conn != c {
 		old := p.conn
-		if connKey(old) <= key {
-			// The existing link wins; drop the new one.
+		switch {
+		case p.direction == preferred:
+			// The existing link has the canonical direction.
 			p.mu.Unlock()
 			m.logger.Debug("duplicate link dropped", "peer", h.Name, "direction", direction)
 			c.Close()
 			return
+		case direction != preferred:
+			// Neither link is canonical; retain the first one to avoid churn.
+			p.mu.Unlock()
+			m.logger.Debug("duplicate link dropped", "peer", h.Name, "direction", direction)
+			c.Close()
+			return
+		default:
+			// The new link has the canonical direction; replace the old one.
+			old.Close()
 		}
-		// The new link has the smaller key: it wins, the old dies.
-		old.Close()
 	}
 	p.conn = c
+	p.direction = direction
 	p.attempt = 0
 	p.state = stateConnected
 	p.since = time.Now().UTC()
@@ -466,7 +485,6 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	p.mu.Unlock()
 
 	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
-
 	m.spawn(func() { m.serveLink(ctx, p, c, reader, key, direction) })
 }
 
