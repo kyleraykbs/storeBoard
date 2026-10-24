@@ -109,36 +109,20 @@ rec {
     description = "Groups of peers that share stores.";
   };
 
-  # One flat store declaration. Links reference another top-level store by id.
   storeModule =
     { name, ... }:
     {
       options = {
-        group = lib.mkOption {
+        renamedFrom = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
           default = null;
-          description = "Group that shares this store; required for top-level declarations.";
+          description = "Previous store id whose durable state this declaration adopts.";
         };
-        sync = lib.mkOption {
-          type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]);
-          default = null;
-          description = "Whether this store is local or remote.";
-        };
-        symlinks = lib.mkOption {
-          type = lib.types.listOf lib.types.str;
-          default = [ ];
-          description = "Absolute paths linked to this store's canonical directory.";
-        };
-        permissions = lib.mkOption {
-          type = lib.types.nullOr permSubmodule;
-          default = null;
-          description = "Ownership and mode for this store.";
-        };
-        links = lib.mkOption {
-          type = lib.types.attrsOf lib.types.str;
-          default = { };
-          description = "Referenced store id to relative presentation path.";
-        };
+        group = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+        sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]); default = null; };
+        symlinks = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
+        permissions = lib.mkOption { type = lib.types.nullOr permSubmodule; default = null; };
+        links = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
       };
     };
 
@@ -233,15 +217,16 @@ rec {
   storesJSON =
     stores:
     lib.mapAttrs (
-      _: s:
-      lib.optionalAttrs (s.group != null) { group = s.group; }
-      // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
-      // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
-      // lib.optionalAttrs (s.links != { }) { links = s.links; }
-      // lib.optionalAttrs (s.permissions != null) {
-        permissions = lib.filterAttrs (_: v: v != null) s.permissions;
-      }
-    ) stores;
+	  _: s:
+	  lib.optionalAttrs (s.renamedFrom != null) { renamedFrom = s.renamedFrom; }
+	  // lib.optionalAttrs (s.group != null) { group = s.group; }
+	  // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
+	  // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
+	  // lib.optionalAttrs (s.links != { }) { links = s.links; }
+	  // lib.optionalAttrs (s.permissions != null) {
+	    permissions = lib.filterAttrs (_: v: v != null) s.permissions;
+	  }
+	) stores;
 
   # The configuration file both binaries read: strict JSON, configVersion 2,
   # unknown keys an error. Sections appear only when the calling scope has the
