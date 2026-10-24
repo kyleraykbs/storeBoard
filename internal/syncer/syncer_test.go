@@ -745,6 +745,23 @@ func TestEqualEntryWithMissingBytesRequestsBlob(t *testing.T) {
 }
 
 // The stale-dirent repair: an entry whose recorded size contradicts the file
+
+func TestSnapshotExcludesTombstonesFromPending(t *testing.T) {
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	if err := fs.db.Put(&Entry{Path: "live.txt", Blob: strings.Repeat("ab", 32), VV: map[string]uint64{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "gone.txt", Deleted: true, VV: map[string]uint64{"a": 2}}); err != nil {
+		t.Fatal(err)
+	}
+	fs.setLocal(1)
+	got := n.eng.Snapshot()[0]
+	if got.Entries != 1 || got.Local != 1 || got.Pending != 0 {
+		t.Fatalf("status counts = entries %d local %d pending %d, want 1/1/0", got.Entries, got.Local, got.Pending)
+	}
+}
 // on disk must be corrected in place, without a version bump.
 func TestScanRepairsAStaleSizeWithoutNewVersion(t *testing.T) {
 	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")

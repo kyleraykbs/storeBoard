@@ -109,7 +109,7 @@ func (fs *StoreState) publish() api.StoreSync {
 	out.Symlinks = links
 	fs.metaMu.Unlock()
 	out.Store = fs.name
-	out.Entries = fs.db.Count()
+	out.Entries = fs.db.LiveCount()
 	out.Conflicts = fs.conflicts
 	out.LastScan = fs.lastScan
 	out.Local = fs.local

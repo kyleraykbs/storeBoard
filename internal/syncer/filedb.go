@@ -195,6 +195,21 @@ func (d *FileDB) Count() int {
 	return len(d.entries)
 }
 
+// LiveCount returns the number of non-deleted paths currently known. Tombstones
+// remain in Count for conflict ordering and history, but are not files that a
+// replica can materialise.
+func (d *FileDB) LiveCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := 0
+	for _, ent := range d.entries {
+		if !ent.Deleted {
+			count++
+		}
+	}
+	return count
+}
+
 // Sync flushes the journal to disk; the scanner calls it once per batch.
 func (d *FileDB) Sync() error {
 	d.mu.Lock()

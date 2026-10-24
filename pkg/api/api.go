@@ -106,9 +106,10 @@ type StoreSymlink struct {
 // canonical dir stays visible, it simply is not live). Busy carries why a
 // declared symlink is not linked; empty otherwise.
 //
-// The counts describe the work in progress: Entries is what the store knows,
-// Local how much of it exists here, Pending the difference, Scanning whether
-// a walk is running right now, and Receiving how many blobs are arriving.
+// The counts describe the work in progress: Entries is the number of live
+// paths the store knows (tombstones are retained in the journal but excluded),
+// Local how much of it exists here, Pending the difference, Scanning whether a
+// walk is running right now, and Receiving how many blobs are arriving.
 type StoreSync struct {
 	Store       string         `json:"store"`
 	Root        string         `json:"root"`
