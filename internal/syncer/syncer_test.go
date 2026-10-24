@@ -718,6 +718,32 @@ func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 	fs.scanMu.Unlock()
 }
 
+func TestEqualEntryWithMissingBytesRequestsBlob(t *testing.T) {
+	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	entry := &Entry{
+		Path:  "missing.txt",
+		Blob:  strings.Repeat("ab", 32),
+		Size:  7,
+		MTime: time.Now().UnixNano(),
+		VV:    map[string]uint64{"a": 1},
+	}
+	if err := fs.db.Put(entry); err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(frame{Type: "index", Store: "docs", Entries: []*Entry{entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.eng.OnPeerFrame("a", line)
+	waitFor(t, 2*time.Second, "want for equal entry with missing bytes", func() bool {
+		n.eng.mu.Lock()
+		defer n.eng.mu.Unlock()
+		return n.eng.wants[wantKey("docs", "missing.txt")] != nil
+	})
+}
+
 // The stale-dirent repair: an entry whose recorded size contradicts the file
 // on disk must be corrected in place, without a version bump.
 func TestScanRepairsAStaleSizeWithoutNewVersion(t *testing.T) {

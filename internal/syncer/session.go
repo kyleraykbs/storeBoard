@@ -77,6 +77,19 @@ func (e *Engine) sendIndexTo(peer string, fs *StoreState, entries []*Entry) erro
 
 // --- receiving -------------------------------------------------------------
 
+func (e *Engine) needsMaterialization(fs *StoreState, ent *Entry) bool {
+	if ent.Deleted {
+		return false
+	}
+	if ent.Blob == "" || !e.store.Has(ent.Blob) {
+		return true
+	}
+	path := filepath.Join(fs.root, ent.Path)
+	info, err := os.Stat(path)
+	return err != nil || !info.Mode().IsRegular() || info.Size() != ent.Size || info.ModTime().UnixNano() != ent.MTime
+}
+
+// --- receiving -------------------------------------------------------------
 // handleIndex folds a peer's entries into the journal. The version-vector
 // rules are the whole sync contract:
 //
@@ -133,10 +146,16 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			}
 
 		default:
-			// Concurrent modifications (or an identical version vector on
-			// different content — a hash collision of histories, treated
-			// the same way: it converges).
+			// Equal journal entries can still be unmaterialised locally: an
+			// index may have arrived before its blob, or a previous collector
+			// may have removed content while the journal remained. Status counts
+			// filesystem entries, so request the bytes whenever the canonical
+			// file or content-store blob is absent/stale.
 			if loc.Blob == rem.Blob {
+				if e.needsMaterialization(fs, rem) {
+					e.request(peer, fs, rem, &pending{entry: rem})
+					continue
+				}
 				merged := MergeVV(loc.VV, rem.VV)
 				upd := loc.clone()
 				upd.VV = merged
