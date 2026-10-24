@@ -3,11 +3,11 @@
 #
 # Storeboard has exactly one strict JSON config file, but which keys it
 # carries depends on the scope: the daemon's file carries the whole model —
-# this machine's peer name, declared peers, groups, local mount overrides —
+# this machine's root, peer name, declared peers, groups and store tree —
 # while a CLI file needs only the socket it should dial. `checkedConfig`
-# generates either and runs it through the real `storeboard config check`
-# at build time, so a bad option value fails nixos-rebuild instead of
-# failing at daemon startup.
+# generates either and runs it through the real `storeboard config check` at
+# build time, so a bad option value fails nixos-rebuild instead of failing at
+# daemon startup.
 { lib, pkgs }:
 rec {
   # The socket the generated configs point at. The service owns this path
@@ -26,7 +26,18 @@ rec {
     type = lib.types.str;
     default = "/var/lib/storeboard";
     example = "/var/lib/storeboard";
-    description = "The one storage directory: store, journal, index, default mounts.";
+    description = "The one storage directory for daemon state: blobs, journals, history.";
+  };
+
+  root = lib.mkOption {
+    type = lib.types.str;
+    default = "/srv/storeboard";
+    example = "/home/kyle/Storeboard";
+    description = ''
+      The one directory the bytes live in. Every store's canonical dir is
+      `<root>/<store>`, and the tree below it is made of symlinks. A plain
+      container, not a store.
+    '';
   };
 
   peer = lib.mkOption {
@@ -34,9 +45,9 @@ rec {
     default = "";
     example = "laptop";
     description = ''
-      This machine's own peer name: must be a key of `peers` and a member
-      of every group. Empty lets the daemon fall back to the hostname,
-      which only works while no groups are declared.
+      This machine's own peer name: must be a key of `peers` and a member of
+      every group. Empty lets the daemon fall back to the hostname, which only
+      works while no groups are declared.
     '';
   };
 
@@ -70,29 +81,6 @@ rec {
             description = "Member peers; must include this machine's `peer`.";
           };
 
-          folders = lib.mkOption {
-            type = lib.types.attrsOf (
-              lib.types.submodule {
-                options = {
-                  mount = lib.mkOption {
-                    type = lib.types.nullOr lib.types.str;
-                    default = null;
-                    example = "/srv/photos";
-                    description = ''
-                      Default mount point for this folder on every peer;
-                      each peer overrides it locally through `mounts`.
-                    '';
-                  };
-                };
-              }
-            );
-            default = { };
-            example = {
-              photos.mount = "/srv/photos";
-            };
-            description = "Folders shared by the group; names are global across groups.";
-          };
-
           permissions = lib.mkOption {
             type = lib.types.nullOr permSubmodule;
             default = null;
@@ -101,21 +89,9 @@ rec {
               mode = "0755";
             };
             description = ''
-              Default ownership and mode for this group's folders on every
-              peer; each machine's `permissions` overrides it field by
-              field, and what neither declares is inherited from the
-              directory the mount lives in.
-            '';
-          };
-
-          storageDir = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            example = "/mainpool";
-            description = ''
-              Storage directory for this group's folders, overriding the
-              top-level `storageDir`. Content lives in
-              `<storageDir>/<folder>` and the mount path is a symlink to it.
+              Default ownership and mode for this group's stores; a store's
+              own declaration overrides it field by field, and what nobody
+              declares is inherited from the directory the root lives in.
             '';
           };
         };
@@ -128,53 +104,87 @@ rec {
           "laptop"
           "desktop"
         ];
-        folders.photos.mount = "/srv/photos";
       };
     };
-    description = "Groups of peers that share folders.";
+    description = "Groups of peers that share stores.";
   };
 
-  mounts = lib.mkOption {
-    type = lib.types.attrsOf lib.types.str;
+  # One store's declaration. Everything but `path` and `symlinks` is
+  # inherited from the parent when unset: a child only says what makes it
+  # different (its group, its mount type, its permissions).
+  storeModule =
+    { name, ... }:
+    {
+      options = {
+        path = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "Bulk";
+          description = ''
+            Relpath inside the parent, and the name it appears under there.
+            Null means the store's key, at the parent's top level. A
+            top-level store's canonical dir is its key, so this is
+            meaningless at the top level.
+          '';
+        };
+        group = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "family";
+          description = "Group that shares this store. Null inherits the parent's; a top-level store must declare one.";
+        };
+        sync = lib.mkOption {
+          type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]);
+          default = null;
+          example = "remote";
+          description = ''
+            `local` holds a replica that works offline; `remote` streams the
+            store from a holder. Null inherits the parent's; the top-level
+            default is local.
+          '';
+        };
+        symlinks = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [ "/home/kyle/Documents" ];
+          description = ''
+            Absolute paths that become symlinks to this store's canonical
+            dir. Never inherited: a path belongs to one machine.
+          '';
+        };
+        permissions = lib.mkOption {
+          type = lib.types.nullOr permSubmodule;
+          default = null;
+          example = {
+            user = "kyle";
+          };
+          description = "Ownership and mode for this store; overrides the parent field by field.";
+        };
+        stores = lib.mkOption {
+          type = lib.types.attrsOf (lib.types.submodule storeModule);
+          default = { };
+          description = "Child stores, presented as symlinks inside this one.";
+        };
+      };
+    };
+
+  stores = lib.mkOption {
+    type = lib.types.attrsOf (lib.types.submodule storeModule);
     default = { };
     example = {
-      photos = "/mnt/photos";
+      pictures = {
+        group = "family";
+        stores.bulk = {
+          group = "media";
+          sync = "remote";
+        };
+      };
+      documents = {
+        group = "family";
+        symlinks = [ "/home/kyle/Documents" ];
+      };
     };
-    description = ''
-      This machine's mount-point overrides for group folders. Effective
-      mount: local override, else the group's default, else inside dataDir.
-    '';
-  };
-
-  keepOffline = lib.mkOption {
-    type = lib.types.attrsOf lib.types.bool;
-    default = { };
-    example = {
-      projectStorage = false;
-    };
-    description = ''
-      Per-folder switch on THIS machine: true (default for anything
-      undeclared) keeps a full local replica that works offline; false
-      streams the folder from a holder — mounted live while a holder is
-      reachable, an empty dummy dir when none is, remerged on reconnect.
-    '';
-  };
-
-  storageDir = lib.mkOption {
-    type = lib.types.nullOr lib.types.str;
-    default = null;
-    example = "/srv/storeboard";
-    description = ''
-      Where folder content lives on this machine: each folder's root becomes
-      `<storageDir>/<folder>` and its mount path is a symlink to it, so
-      content and mount point are independent — the mount may sit anywhere
-      and no two folders can index the same bytes. Null (the default) means
-      `<dataDir>/storage`; the empty string restores the original layout
-      (a replica's content at the mount path itself, a streamed folder's
-      under the data directory). Content already at a mount path is migrated
-      into the storage directory on the next transition. A group may override
-      it with `groups.<name>.storageDir`.
-    '';
+    description = "The store tree, by id. Ids are globally unique and name the canonical dir under `root`.";
   };
 
   backup = lib.mkOption {
@@ -196,29 +206,29 @@ rec {
               than this is ever kept.
             '';
           };
-          folders = lib.mkOption {
+          stores = lib.mkOption {
             type = lib.types.attrsOf lib.types.bool;
             default = { };
             example = {
               Videos = false;
             };
-            description = "Per-folder opt-out by name: false keeps no history for that folder.";
+            description = "Per-store opt-out by id: false keeps no history for that store.";
           };
         };
       }
     );
     default = null;
     description = ''
-      Version history for this machine's folders, thinned the standard way:
+      Version history for this machine's stores, thinned the standard way:
       the newest version of each hour for a day, of each day for a week, of
       each week for a month, of each month for a year — and nothing older
-      than `keep`. The current version of a file is never dropped, and the
-      retention policy is the only thing the daemon ever deletes on its own.
+      than `keep`. The current version of a file is never dropped. A store
+      that is `remote` on this machine keeps no history.
     '';
   };
 
-  # One Permissions block, shared by the group default and the per-folder
-  # override, so the two can never drift apart.
+  # One Permissions block, shared by the group default, the store
+  # declaration and the per-machine override, so they cannot drift apart.
   permSubmodule = lib.types.submodule {
     options = {
       user = lib.mkOption {
@@ -249,25 +259,40 @@ rec {
       photos.user = "kyle";
     };
     description = ''
-      Per-folder ownership and mode for the entries the daemon creates on
-      THIS machine; a set field beats the group's `permissions`, and
-      anything neither declares is inherited from the directory the mount
-      lives in — so by default a folder is permissioned exactly like the
-      directory containing it. Directory modes only: files keep the mode
-      they were synced with.
+      Per-store ownership and mode for the entries the daemon creates on THIS
+      machine; a set field beats the store's declaration and its group's
+      default, and anything nobody declares is inherited from the directory
+      the root lives in. Directory modes only: files keep the mode they were
+      synced with.
     '';
   };
 
-  # The configuration file both binaries read: strict JSON, configVersion 1,
-  # unknown keys an error. Sections appear only when the calling scope has
-  # the options — a CLI file carries the socket, the daemon file the model.
+  # The store tree as it goes into the JSON file: only what is declared.
+  storesJSON =
+    tree:
+    lib.mapAttrs (
+      _: s:
+      lib.optionalAttrs (s.path != null) { path = s.path; }
+      // lib.optionalAttrs (s.group != null) { group = s.group; }
+      // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
+      // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
+      // lib.optionalAttrs (s.permissions != null) {
+        permissions = lib.filterAttrs (_: v: v != null) s.permissions;
+      }
+      // lib.optionalAttrs (s.stores != { }) { stores = storesJSON s.stores; }
+    ) tree;
+
+  # The configuration file both binaries read: strict JSON, configVersion 2,
+  # unknown keys an error. Sections appear only when the calling scope has the
+  # options — a CLI file carries the socket, the daemon file the model.
   configJSON =
     cfg:
     {
-      configVersion = 1;
+      configVersion = 2;
     }
     // lib.optionalAttrs (cfg ? socket) { socket = cfg.socket; }
     // lib.optionalAttrs (cfg ? dataDir) { dataDir = cfg.dataDir; }
+    // lib.optionalAttrs (cfg ? root) { root = cfg.root; }
     // lib.optionalAttrs (cfg ? peer && cfg.peer != "") { peer = cfg.peer; }
     // lib.optionalAttrs (cfg ? peers) {
       peers = lib.mapAttrs (_: p: { endpoints = p.endpoints; }) cfg.peers;
@@ -275,30 +300,20 @@ rec {
     // lib.optionalAttrs (cfg ? groups) {
       groups = lib.mapAttrs (
         _: g:
-        {
-          peers = g.peers;
-          folders = lib.mapAttrs (_: f: lib.optionalAttrs (f.mount != null) { mount = f.mount; }) g.folders;
-        }
+        { peers = g.peers; }
         // lib.optionalAttrs (g.permissions != null) {
           permissions = lib.filterAttrs (_: v: v != null) g.permissions;
         }
-        // lib.optionalAttrs (g.storageDir != null) { storageDir = g.storageDir; }
       ) cfg.groups;
     }
-    // lib.optionalAttrs (cfg ? mounts) { mounts = cfg.mounts; }
-    // lib.optionalAttrs (cfg ? keepOffline) { keepOffline = cfg.keepOffline; }
+    // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; }
     // lib.optionalAttrs (cfg ? permissions && cfg.permissions != { }) {
       permissions = lib.mapAttrs (_: p: lib.filterAttrs (_: v: v != null) p) cfg.permissions;
     }
-    // lib.optionalAttrs (cfg ? storageDir && cfg.storageDir != null) {
-      storageDir = cfg.storageDir;
-    }
     // lib.optionalAttrs (cfg ? backup && cfg.backup != null) {
-      backup = {
-        enable = cfg.backup.enable;
-      }
+      backup = { enable = cfg.backup.enable; }
       // lib.optionalAttrs (cfg.backup.keep != null) { keep = cfg.backup.keep; }
-      // lib.optionalAttrs (cfg.backup.folders != { }) { folders = cfg.backup.folders; };
+      // lib.optionalAttrs (cfg.backup.stores != { }) { stores = cfg.backup.stores; };
     };
 
   # The config file, validated by the real `storeboard config check` during

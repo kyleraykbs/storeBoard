@@ -19,7 +19,7 @@ and its own history.
 - `MainActivity.kt` — one screen: engine state, the status document
   rendered, the config it reads, the log tail, a file picker, and the share
   sheet. A file shared into storeboard is copied in and sent into the camera
-  folder.
+  store.
 
 ## Building
 
@@ -49,7 +49,7 @@ Maven into `~/.gradle` on first run.
 
 ## First run
 
-The app writes a config with two folders — `camera` (the roll, kept local,
+The app writes a config with two stores — `camera` (the roll, kept local,
 syncing out) and `photos` (the library, syncing down, kept readable offline)
 — and starts the engine. Two lines to edit before it is useful, and they are
 the same line on both sides:
@@ -68,12 +68,12 @@ or emulator will take it.
 
 ## Deliberate gaps
 
-- The folders are app-private (`/data/data/dev.kyle.storeboard/files`), so no
+- The root and its stores are app-private (`/data/data/dev.kyle.storeboard/files`), so no
   storage permission is needed and nothing else on the phone can read or
   corrupt the store. Adopting the real `DCIM/` camera roll is the next step
-  and needs a decision: a plain directory mount there requires
+  and needs a decision: a store rooted there (or a declared symlink) requires
   `MANAGE_EXTERNAL_STORAGE` (sideload-only, which this app is), or a
-  MediaStore-based importer that copies rather than mounts.
+  MediaStore-based importer that copies rather than links.
 - Restore is wired to the engine but not yet to a screen; the version list is
   one dialog away.
 - The status view renders the document's fields tolerantly, so a daemon that

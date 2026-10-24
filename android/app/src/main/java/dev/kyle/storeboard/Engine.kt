@@ -65,17 +65,18 @@ object Engine {
     fun configFile(context: Context): File = File(dataDir(context), "config.json")
 
     /**
-     * What the config editor opens with: this phone and the two folders a
+     * What the config editor opens with: this phone and the two stores a
      * phone usually wants — the camera roll, which lives here and syncs out,
      * and the photo library, which comes down from the pool and stays
      * readable offline.
      *
-     * The peer list must name this phone exactly as the pool's config
-     * declares it, and must carry the pool's own name and a dialable
-     * endpoint — the phone dials out, so the endpoint is what makes the pool
-     * reachable. The pool needs the matching line on its side: this phone
-     * listed in its group, no endpoint needed, because a declared but
-     * unaddressed peer simply waits to be dialled.
+     * The root is the one place the phone's bytes live: every store is a
+     * directory directly under it. The peer list must name this phone exactly
+     * as the pool's config declares it, and must carry the pool's own name
+     * and a dialable endpoint — the phone dials out, so the endpoint is what
+     * makes the pool reachable. The pool needs the matching line on its side:
+     * this phone listed in its group, no endpoint needed, because a declared
+     * but unaddressed peer simply waits to be dialled.
      *
      * This document is pinned by TestAppDefaultConfigIsValid in mobile/ —
      * the config is strict (an unknown key is an error), so the two have to
@@ -83,14 +84,14 @@ object Engine {
      */
     fun defaultConfig(context: Context): String {
         val data = dataDir(context)
-        // Mounts live beside the data directory, never inside it: that tree
-        // is the daemon's own (store, journals, storage) and a folder mounted
-        // in there would be indexing the daemon's state.
-        val files = context.filesDir
-        val mount = { name: String -> File(files, name).absolutePath }
+        // The root lives beside the data directory, never inside it: that
+        // tree is the daemon's own (blobs, journals, history) and a store
+        // rooted in there would index the daemon's state.
+        val root = File(context.filesDir, "Storeboard").absolutePath
         return """
         {
-          "configVersion": 1,
+          "configVersion": 2,
+          "root": "$root",
           "peer": "phone",
           "dataDir": "${data.absolutePath}",
           "socket": "${File(data, "storeboard.sock").absolutePath}",
@@ -100,13 +101,11 @@ object Engine {
             "pool": { "endpoints": ["192.168.1.10:4242"] }
           },
           "groups": {
-            "kyle": {
-              "peers": ["phone", "pool"],
-              "folders": {
-                "camera": { "mount": "${mount("camera")}" },
-                "photos": { "mount": "${mount("photos")}" }
-              }
-            }
+            "kyle": { "peers": ["phone", "pool"] }
+          },
+          "stores": {
+            "camera": { "group": "kyle" },
+            "photos": { "group": "kyle" }
           }
         }
         """.trimIndent()

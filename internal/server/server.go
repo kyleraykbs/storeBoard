@@ -88,9 +88,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		ln.Close()
 		return nil, fmt.Errorf("sync engine: %w", err)
 	}
-	for _, w := range cfg.Warnings() {
-		logger.Warn("config warning", "detail", w)
-	}
 
 	s := &Server{
 		cfg:       cfg,
@@ -131,24 +128,24 @@ func requestUID(r *http.Request) (int, bool) {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
-	mux.HandleFunc("/v1/folders/", s.handleFolder)
+	mux.HandleFunc("/v1/stores/", s.handleStore)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
 	})
 	return mux
 }
 
-// handleFolder serves the folder verbs:
+// handleStore serves the store verbs:
 //
-//	GET  /v1/folders/<name>/versions?path=<p>
-//	POST /v1/folders/<name>/takeover
-//	POST /v1/folders/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
-//	POST /v1/folders/<name>/send      {"source": …, "path"?: …}
-func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/v1/folders/")
+//	GET  /v1/stores/<name>/versions?path=<p>
+//	POST /v1/stores/<name>/takeover
+//	POST /v1/stores/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
+//	POST /v1/stores/<name>/send      {"source": …, "path"?: …}
+func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/stores/")
 	name, verb, ok := strings.Cut(rest, "/")
 	if !ok || name == "" || strings.Contains(verb, "/") {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint; want /v1/folders/<name>/<verb>"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint; want /v1/stores/<name>/<verb>"})
 		return
 	}
 	switch verb {
@@ -161,11 +158,11 @@ func (s *Server) handleFolder(w http.ResponseWriter, r *http.Request) {
 	case "send":
 		s.handleSend(w, r, name)
 	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such folder verb %q", verb)})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such store verb %q", verb)})
 	}
 }
 
-// handleSend copies a local file into a folder: the share sheet's path onto
+// handleSend copies a local file into a store: the share sheet's path onto
 // the mesh, and the same verb the app's engine offers directly. The file the
 // caller names is read by the daemon, so it must be a path this machine can
 // see — the CLI's own host, which is also the one the daemon runs on.
@@ -209,7 +206,13 @@ func (s *Server) handleTakeover(w http.ResponseWriter, r *http.Request, name str
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
 		return
 	}
-	res, err := s.engine.Takeover(name, uid)
+	var req struct {
+		Path string `json:"path"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	res, err := s.engine.Takeover(name, req.Path, uid)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
 		return
@@ -281,7 +284,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// The config's view builders sort and return non-nil slices: the
 	// contract says arrays, never null — a nil slice would marshal to null
-	// and break `.folders[]` in jq.
+	// and break `.stores[]` in jq.
 	writeJSON(w, http.StatusOK, api.Status{
 		APIVersion:    api.Version,
 		Version:       version.Version,
@@ -289,10 +292,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
 		Socket:        s.cfg.Socket,
 		DataDir:       s.cfg.DataDir,
+		Root:          s.cfg.Root,
 		Peer:          s.cfg.Peer,
 		Peers:         s.cfg.PeerList(),
 		Groups:        s.cfg.GroupList(),
-		Folders:       s.cfg.Folders(),
+		Stores:        s.cfg.Stores(),
 		Connections:   s.transport.Snapshot(),
 		Sync:          s.engine.Snapshot(),
 	})
@@ -314,7 +318,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("storeboardd listening",
 		"socket", s.cfg.Socket,
 		"version", version.Version,
-		"folders", len(s.cfg.Folders()),
+		"stores", len(s.cfg.Stores()),
 	)
 
 	select {

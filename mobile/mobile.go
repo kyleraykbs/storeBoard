@@ -38,9 +38,9 @@ type Daemon struct {
 }
 
 // Start launches the engine with a configuration (JSON text, exactly the
-// file the CLI would read: peer, peers, groups, folders, mounts, backup) and
-// begins syncing. logPath, when non-empty, receives the daemon's log lines —
-// the app can show them or attach them to a report.
+// file the CLI would read: root, peers, groups, stores, backup) and begins
+// syncing. logPath, when non-empty, receives the daemon's log lines — the
+// app can show them or attach them to a report.
 func Start(configJSON, logPath string) (*Daemon, error) {
 	cfg, err := config.Parse([]byte(configJSON))
 	if err != nil {
@@ -82,7 +82,7 @@ func Start(configJSON, logPath string) (*Daemon, error) {
 	}
 	go eng.Run(ctx)
 	go mgr.Run(ctx)
-	logger.Info("storeboard started", "peer", cfg.Peer, "dataDir", cfg.DataDir, "folders", len(cfg.Folders()))
+	logger.Info("storeboard started", "peer", cfg.Peer, "dataDir", cfg.DataDir, "stores", len(cfg.Stores()))
 	return d, nil
 }
 
@@ -112,10 +112,11 @@ func (d *Daemon) Status() (string, error) {
 		UptimeSeconds: int64(time.Since(d.startedAt).Seconds()),
 		Socket:        d.cfg.Socket,
 		DataDir:       d.cfg.DataDir,
+		Root:          d.cfg.Root,
 		Peer:          d.cfg.Peer,
 		Peers:         d.cfg.PeerList(),
 		Groups:        d.cfg.GroupList(),
-		Folders:       d.cfg.Folders(),
+		Stores:        d.cfg.Stores(),
 		Connections:   d.mgr.Snapshot(),
 		Sync:          d.eng.Snapshot(),
 	}
@@ -124,9 +125,9 @@ func (d *Daemon) Status() (string, error) {
 }
 
 // Versions lists a file's recorded versions, newest first (JSON api.Versions).
-// An empty path lists every file the folder's history knows.
-func (d *Daemon) Versions(folder, path string) (string, error) {
-	vs, err := d.eng.Versions(folder, path)
+// An empty path lists every file the store's history knows.
+func (d *Daemon) Versions(store, path string) (string, error) {
+	vs, err := d.eng.Versions(store, path)
 	if err != nil {
 		return "", err
 	}
@@ -136,8 +137,8 @@ func (d *Daemon) Versions(folder, path string) (string, error) {
 
 // Restore writes a recorded version back: at is RFC3339 or empty for the
 // newest, blob picks an exact version or empty, to writes a copy there
-// instead of restoring into the folder (JSON api.RestoreResult).
-func (d *Daemon) Restore(folder, path, blob, at, to string) (string, error) {
+// instead of restoring into the store (JSON api.RestoreResult).
+func (d *Daemon) Restore(store, path, blob, at, to string) (string, error) {
 	var when time.Time
 	if at != "" {
 		parsed, err := time.Parse(time.RFC3339, at)
@@ -146,7 +147,7 @@ func (d *Daemon) Restore(folder, path, blob, at, to string) (string, error) {
 		}
 		when = parsed
 	}
-	res, err := d.eng.Restore(folder, os.Getuid(), path, blob, when, to)
+	res, err := d.eng.Restore(store, os.Getuid(), path, blob, when, to)
 	if err != nil {
 		return "", err
 	}
@@ -154,15 +155,15 @@ func (d *Daemon) Restore(folder, path, blob, at, to string) (string, error) {
 	return string(b), err
 }
 
-// Send copies a file into one of this machine's folders — the share sheet's
-// path onto the mesh. dst is relative inside the folder; empty uses the
+// Send copies a file into one of this machine's stores — the share sheet's
+// path onto the mesh. dst is relative inside the store; empty uses the
 // source's name (JSON api.SendResult). The copy is an ordinary local change:
 // it is indexed at once, recorded in the history and synced onwards.
 //
 // The acting verbs authorize per caller, and in an app the caller is the app:
-// its own uid, which is the owner of the folders it created.
-func (d *Daemon) Send(folder, src, dst string) (string, error) {
-	res, err := d.eng.Send(folder, os.Getuid(), src, dst)
+// its own uid, which is the owner of the stores it created.
+func (d *Daemon) Send(store, src, dst string) (string, error) {
+	res, err := d.eng.Send(store, os.Getuid(), src, dst)
 	if err != nil {
 		return "", err
 	}

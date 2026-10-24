@@ -130,7 +130,7 @@ type Manager struct {
 
 	// wg counts every goroutine that can still be inside a frame handler.
 	// Close waits on it: a link being torn down may be mid-apply, writing a
-	// blob into the store or a file into a folder, and returning from Close
+	// blob into the store or a file into a store, and returning from Close
 	// while that write is in flight races whatever removes those paths next
 	// (tests do exactly that, and a restart does it for real).
 	wg sync.WaitGroup
@@ -477,6 +477,17 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 
 	w := &linkWriter{c: c}
 	handler := m.getHandler()
+	// A connection can be replaced between its goroutine starting and this
+	// point (both sides dial at once; the tie-break keeps one). Calling the
+	// handler for the replaced link would leave the engine with a writer to a
+	// closed socket and no disconnect event, because dropLink correctly
+	// ignores a stale connection — the mesh then talks into the void.
+	p.mu.Lock()
+	current := p.conn == c
+	p.mu.Unlock()
+	if !current {
+		return
+	}
 	if handler != nil {
 		handler.OnPeerConnected(p.name, w.write)
 	}

@@ -7,11 +7,15 @@
 #       laptop.endpoints = [ "192.168.1.10:4242" ];
 #       desktop.endpoints = [ "192.168.1.11:4242" ];
 #     };
-#     groups.family = {
-#       peers = [ "laptop" "desktop" ];
-#       folders.photos.mount = "/home/kyle/Pictures";
+#     groups.family.peers = [ "laptop" "desktop" ];
+#     stores.pictures = {
+#       group = "family";
+#       stores.bulk = { group = "media"; sync = "remote"; };
 #     };
-#     mounts = { };   # this machine's local mount overrides
+#     stores.documents = {
+#       group = "family";
+#       symlinks = [ "/home/kyle/Documents" ];
+#     };
 #   };
 #
 # Enabling it runs the daemon and installs `storeboard` for every user, with
@@ -42,68 +46,20 @@ let
 
   configFile = if cfg.configFile != null then cfg.configFile else generatedConfig;
 
-  # Folder name → effective mount, resolved exactly like the engine does:
-  # local override, else the group's default, else inside dataDir.
-  folderMounts = lib.concatMapAttrs (
-    _: g:
-    lib.mapAttrs (
-      fname: f:
-      if cfg.mounts ? ${fname} then
-        cfg.mounts.${fname}
-      else if f.mount != null then
-        f.mount
-      else
-        "${cfg.dataDir}/mounts/${fname}"
-    ) g.folders
-  ) cfg.groups;
+  # Every store in the tree, flattened: the ids are global, the placement is
+  # a tree. Used only to collect the paths the service may write.
+  flattenStores =
+    tree: lib.concatLists (lib.mapAttrsToList (_: s: [ s ] ++ flattenStores (s.stores or { })) tree);
 
-  # Folder name → storage directory: the group's override, else the
-  # machine's, else the default under dataDir — the same resolution the
-  # daemon applies, so the sandbox grants exactly what it writes. An
-  # explicit empty string is the original layout (content at the mount).
-  storageDirs = lib.concatMapAttrs (
-    _: g:
-    lib.mapAttrs (
-      fname: _:
-      let
-        group = g.storageDir;
-        machine = cfg.storageDir;
-      in
-      if group != null then
-        (if group == "" then "" else "${group}/${fname}")
-      else if machine != null then
-        (if machine == "" then "" else "${machine}/${fname}")
-      else
-        "${cfg.dataDir}/storage/${fname}"
-    ) g.folders
-  ) cfg.groups;
+  allStores = flattenStores cfg.stores;
 
-  # What the engine may write: content roots and the paths it swaps, mount
-  # points included — a storage-backed folder writes into its storage
-  # directory and creates the symlink at the mount, so both, and the
-  # mount's parent, have to be writable. "-" tolerates a path that does not
-  # exist yet rather than failing the unit.
-  folderReadWrite = lib.concatMap (
-    fname:
-    let
-      m = folderMounts.${fname};
-      s = storageDirs.${fname};
-    in
-    if s != "" then
-      [
-        "-${s}"
-        "-${builtins.dirOf s}"
-        "-${m}"
-        "-${builtins.dirOf m}"
-      ]
-    else if cfg.keepOffline.${fname} or true then
-      [ "-${m}" ]
-    else
-      [
-        "-${m}"
-        "-${builtins.dirOf m}"
-      ]
-  ) (lib.attrNames folderMounts);
+  # What the engine may write: the root, the data directory, and every
+  # declared symlink path (and its parent — a store's link is created where
+  # the user asked for it). "-" tolerates a path that does not exist yet
+  # rather than failing the unit.
+  storeReadWrite = lib.concatMap (
+    s: lib.concatMap (p: [ "-${p}" "-${builtins.dirOf p}" ]) s.symlinks
+  ) allStores;
 in
 {
   options.services.storeboard = {
@@ -121,7 +77,7 @@ in
       default = "root";
       description = ''
         User the service runs as. Defaults to root because the engine writes
-        into people's home folders and materialises mounts there; the
+        into people's home directories and materialises symlinks there; the
         syncthing tag made the same call for the same reason.
       '';
     };
@@ -158,13 +114,12 @@ in
     inherit (opts)
       socket
       dataDir
+      root
       peer
       peers
       groups
-      mounts
-      keepOffline
+      stores
       permissions
-      storageDir
       backup
       ;
   };
@@ -178,24 +133,6 @@ in
       {
         assertion = cfg.peer == "" || lib.all (g: lib.elem cfg.peer g.peers) (lib.attrValues cfg.groups);
         message = "services.storeboard.peer must be a member of every group";
-      }
-      {
-        assertion =
-          let
-            names = lib.concatMap (g: lib.attrNames g.folders) (lib.attrValues cfg.groups);
-          in
-          names == lib.unique names;
-        message = "services.storeboard.groups: folder names must be unique across groups";
-      }
-      {
-        assertion =
-          let
-            groupMounts = lib.concatMap (g: lib.mapAttrsToList (_: f: f.mount) g.folders) (
-              lib.attrValues cfg.groups
-            );
-          in
-          lib.all (m: m == null || lib.hasPrefix "/" m) (groupMounts ++ lib.attrValues cfg.mounts);
-        message = "services.storeboard: mount points must be absolute";
       }
     ];
 
@@ -238,8 +175,11 @@ in
         RuntimeDirectory = "storeboard";
         RuntimeDirectoryMode = "0755";
         WorkingDirectory = cfg.dataDir;
-        # Folders live in people's homes.
-        ReadWritePaths = [ cfg.dataDir ] ++ folderReadWrite;
+        # Stores live in the root; symlinks can be declared anywhere.
+        ReadWritePaths = [
+          cfg.dataDir
+          cfg.root
+        ] ++ storeReadWrite;
         # Content has to land owned by the human, not by root.
         AmbientCapabilities = [
           "CAP_CHOWN"

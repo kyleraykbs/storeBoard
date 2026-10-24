@@ -24,39 +24,30 @@ func TestKeepMaskThinsBySchedule(t *testing.T) {
 		at(400 * d), // older than the default year: dropped
 		at(370 * d), // dropped (past 1y)
 		at(300 * d), // the newest in its year bucket: kept
-		at(200 * d), // dropped: another year bucket, but 200d is in the same
-		// calendar year bucket as 300d? no — y0 vs y0: both floor(age/365d)=0
-		at(60 * d), // month bucket m2: kept
-		at(40 * d), // m1: kept
-		at(20 * d), // w2: kept
-		at(10 * d), // w1: kept
-		at(6 * d),  // d6: kept
-		at(3 * d),  // d3: kept
-		at(30 * h), // d1: kept
-		at(5 * h),  // h5: kept
-		at(5 * h),  // h5 again: same hour bucket, newer kept above
-		at(1 * h),  // h1: kept
-		at(0),      // the current version: always kept
+		at(200 * d), // dropped: same year bucket as 300d, older
+		at(60 * d),  // month bucket m2: kept
+		at(40 * d),  // m1: kept
+		at(20 * d),  // w2: kept
+		at(10 * d),  // w1: kept
+		at(6 * d),   // d6: kept
+		at(3 * d),   // d3: kept
+		at(30 * h),  // d1: kept
+		at(5 * h),   // h5: kept
+		at(5 * h),   // h5 again: same hour bucket, newer kept above
+		at(1 * h),   // h1: kept
+		at(0),       // the current version: always kept
 	}
 	mask := keepMask(versions, now, DefaultKeep)
 
-	keptPaths := map[int]bool{}
-	for i, keep := range mask {
-		if keep {
-			keptPaths[i] = true
-		}
-	}
 	if !mask[len(versions)-1] {
 		t.Fatal("the current version must always be kept")
 	}
 	if mask[0] || mask[1] {
 		t.Fatal("versions past the deadline must be dropped")
 	}
-	// The two 5-hour-old versions are the same bucket: exactly one survives.
 	if mask[11] && mask[12] {
 		t.Fatal("two versions from the same hour bucket were both kept")
 	}
-	// Every bucket boundary that should produce a keeper did.
 	for _, i := range []int{2, 4, 5, 6, 7, 8, 9, 10, 13, 14} {
 		if !mask[i] {
 			t.Errorf("version %d (age %v) should be kept", i, time.Duration(now.UnixNano()-versions[i].Time))
@@ -83,21 +74,24 @@ func TestKeepMaskHonoursTheDeadline(t *testing.T) {
 	}
 }
 
+// mkBackupNode builds a node whose engine was constructed with history on.
+func mkBackupNode(t *testing.T, syncType, keep string) *node {
+	t.Helper()
+	n := newNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: syncType},
+	})
+	n.eng.Close()
+	n.cfg.Backup = &config.Backup{Enable: true, Keep: keep}
+	n.eng = newEngine(t, n.cfg, n.log)
+	n.prepareAll()
+	return n
+}
+
 // The whole point of a version log: a file's history survives its changes and
 // its deletion, and a restore brings any of it back.
 func TestHistoryRestoreRoundTrip(t *testing.T) {
-	storage := t.TempDir()
-	mount := filepath.Join(t.TempDir(), "docs")
-	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
-	n.cfg.Backup = &config.Backup{Enable: true}
-	// Re-open with the config in place: the history belongs to the engine's
-	// construction, like the journal.
-	eng, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs := eng.folders[0]
-	eng.prepare(fs)
+	n := mkBackupNode(t, config.SyncLocal, "")
+	eng, fs := n.eng, n.store("docs")
 
 	// v1, then v2: two versions, and the first is recoverable.
 	writeFile(t, filepath.Join(fs.root, "note.txt"), "first", time.Now().Add(-2*time.Hour))
@@ -124,7 +118,6 @@ func TestHistoryRestoreRoundTrip(t *testing.T) {
 	if got := readFile(t, filepath.Join(fs.root, "note.txt")); got != "first" {
 		t.Fatalf("content after restore = %q, want the first version", got)
 	}
-	// The restore is itself a version, so nothing it replaced is lost.
 	if v := fs.hist.Versions("note.txt"); len(v) < 3 {
 		t.Fatalf("restore did not add a version: %+v", v)
 	}
@@ -150,7 +143,7 @@ func TestHistoryRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("restored entry still tombstoned: %+v", e)
 	}
 
-	// --to writes beside the folder and leaves it alone.
+	// --to writes beside the store and leaves it alone.
 	out := filepath.Join(t.TempDir(), "copy.txt")
 	res, err := eng.Restore(fs.name, os.Getuid(), "note.txt", firstBlob, time.Time{}, out)
 	if err != nil || !res.Copied {
@@ -165,16 +158,8 @@ func TestHistoryRestoreRoundTrip(t *testing.T) {
 // A scan that re-observes an unchanged file must not grow the log: the
 // history records transitions, not passes.
 func TestHistoryRecordsTransitionsOnly(t *testing.T) {
-	storage := t.TempDir()
-	mount := filepath.Join(t.TempDir(), "docs")
-	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
-	n.cfg.Backup = &config.Backup{Enable: true}
-	eng, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs := eng.folders[0]
-	eng.prepare(fs)
+	n := mkBackupNode(t, config.SyncLocal, "")
+	eng, fs := n.eng, n.store("docs")
 
 	writeFile(t, filepath.Join(fs.root, "note.txt"), "steady", time.Now())
 	for range 4 {
@@ -188,24 +173,16 @@ func TestHistoryRecordsTransitionsOnly(t *testing.T) {
 	eng.Close()
 }
 
-// Retention drops old versions from the log, and the collector then frees
-// the content only if nothing else references it — never a journal's, never
-// an orphan journal's, never something a peer may be mid-transfer with.
+// Retention drops old versions from the log, and the collector then frees the
+// content only if nothing else references it — never a journal's, never an
+// orphan journal's, never something a peer may be mid-transfer with.
 func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	old := recentBlob
 	recentBlob = 0
 	defer func() { recentBlob = old }()
 
-	storage := t.TempDir()
-	mount := filepath.Join(t.TempDir(), "docs")
-	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
-	n.cfg.Backup = &config.Backup{Enable: true, Keep: "1h"}
-	eng, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs := eng.folders[0]
-	eng.prepare(fs)
+	n := mkBackupNode(t, config.SyncLocal, "1h")
+	eng, fs := n.eng, n.store("docs")
 
 	// One version, aged past the window, with its content in the store.
 	writeFile(t, filepath.Join(fs.root, "old.txt"), "ancient", time.Now().Add(-10*time.Hour))
@@ -223,7 +200,7 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	fs.hist.byPath["old.txt"] = vs
 	fs.hist.mu.Unlock()
 
-	// A blob only an orphan journal references (a folder's data outliving its
+	// A blob only an orphan journal references (a store's data outliving its
 	// config entry) must survive.
 	orphan := strings.Repeat("cd", 32)
 	if err := writeFakeJournal(filepath.Join(eng.dataDir, "journal", "gone.ndjson"), "keep.txt", orphan); err != nil {
@@ -233,10 +210,8 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The version's own file content is still a live journal entry: it must
-	// survive too. Only the aged-out *version* loses its claim.
 	eng.pruneOnce(time.Now())
-	removed, _ := eng.Collect()
+	eng.Collect()
 
 	if !eng.store.Has(orphan) {
 		t.Fatal("collector freed a blob an orphan journal references")
@@ -253,8 +228,7 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	if err := eng.store.Adopt(mkBlob(t, eng, "nobody wants this"), stranded); err != nil {
 		t.Fatal(err)
 	}
-	removed, _ = eng.Collect()
-	if removed == 0 {
+	if removed, _ := eng.Collect(); removed == 0 {
 		t.Fatal("collector freed nothing, though a blob was unreferenced")
 	}
 	if eng.store.Has(stranded) {
@@ -291,20 +265,10 @@ func writeFakeJournal(path, entry, blob string) error {
 	return os.WriteFile(path, []byte(line), 0o600)
 }
 
-// The deadline applies to what deletes left behind, too: a trashed file lives
-// as long as retention allows, and a trashed path whose history is gone is
-// dropped with it (nothing would ever restore it).
+// The deadline applies to what deletes left behind, too.
 func TestTrashObeysTheDeadline(t *testing.T) {
-	storage := t.TempDir()
-	mount := filepath.Join(t.TempDir(), "docs")
-	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, true)
-	n.cfg.Backup = &config.Backup{Enable: true, Keep: "1h"}
-	eng, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs := eng.folders[0]
-	eng.prepare(fs)
+	n := mkBackupNode(t, config.SyncLocal, "1h")
+	eng, fs := n.eng, n.store("docs")
 
 	trash := filepath.Join(eng.dataDir, "trash", fs.name)
 	writeFile(t, filepath.Join(trash, "old.txt"), "long gone", time.Now().Add(-2*time.Hour))
@@ -321,33 +285,19 @@ func TestTrashObeysTheDeadline(t *testing.T) {
 	eng.Close()
 }
 
-// A machine that streams a folder keeps no versions of it: the history
+// A machine that keeps a remote store keeps no versions of it: the history
 // belongs to whoever holds the content. This is what makes one group-level
 // backup declaration correct on every machine.
-func TestStreamedFoldersIgnoreBackup(t *testing.T) {
-	storage := t.TempDir()
-	mount := filepath.Join(t.TempDir(), "remote-docs")
-	n := mkStorageNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", mount, storage, false) // streamed
-	n.cfg.Backup = &config.Backup{Enable: true}
-	n.cfg.KeepOffline = map[string]bool{"docs": false}
+func TestRemoteStoreIgnoresBackup(t *testing.T) {
+	remote := mkBackupNode(t, config.SyncRemote, "")
+	if fs := remote.store("docs"); fs.hist != nil {
+		t.Fatal("a remote store kept a history")
+	}
+	remote.eng.Close()
 
-	eng, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
+	local := mkBackupNode(t, config.SyncLocal, "")
+	if fs := local.store("docs"); fs.hist == nil {
+		t.Fatal("a local store kept no history")
 	}
-	if fs := eng.folders[0]; fs.hist != nil {
-		t.Fatal("a streamed folder kept a history")
-	}
-
-	// The same config with the folder held: history exists.
-	n.cfg.KeepOffline = map[string]bool{"docs": true}
-	eng2, err := New(n.cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fs := eng2.folders[0]; fs.hist == nil {
-		t.Fatal("a held folder kept no history")
-	}
-	eng.Close()
-	eng2.Close()
+	local.eng.Close()
 }

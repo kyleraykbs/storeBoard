@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Smoke test for the storeboard foundation: every CLI verb, two daemons
-# connecting over the wire, a replica folder syncing, and a streamed folder
-# mounting, detaching, and merging offline work back in. Needs `nix build`
-# (./result) and jq on PATH.
+# Smoke test for storeboard: every CLI verb, two daemons connecting over the
+# wire, a replica store syncing, a remote store staying visible while its
+# holder is gone, the tree's symlinks, and takeover of a path that already
+# holds files. Needs `nix build` (./result) and jq on PATH.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -40,20 +40,20 @@ wait_for() {
 
 echo "== version"
 "$CLI" version
-"$CLI" version --json | jq -e '.name == "storeboard" and .apiVersion == 1' >/dev/null
+"$CLI" version --json | jq -e '.name == "storeboard" and .apiVersion == 2' >/dev/null
 
 echo "== config check: valid example"
 "$CLI" --config config.example.json config check | grep -q "config OK"
 "$CLI" --config config.example.json config check --json |
-	jq -e '.valid and (.folders | length == 3)' >/dev/null
+	jq -e '.valid and (.stores | length == 4)' >/dev/null
 
 echo "== config check: typo rejected, reported as JSON"
-echo '{"configVersion": 1, "folars": []}' >"$work/bad.json"
+echo '{"configVersion": 2, "strs": []}' >"$work/bad.json"
 if "$CLI" --config "$work/bad.json" config check --json >"$work/bad-report.json" 2>/dev/null; then
 	echo "FAIL: typo accepted" >&2
 	exit 1
 fi
-jq -e '.valid == false and (.error | contains("folars"))' "$work/bad-report.json" >/dev/null
+jq -e '.valid == false and (.error | contains("strs"))' "$work/bad-report.json" >/dev/null
 
 echo "== config check: missing file is a failure"
 if "$CLI" --config "$work/absent.json" config check >/dev/null 2>&1; then
@@ -62,33 +62,29 @@ if "$CLI" --config "$work/absent.json" config check >/dev/null 2>&1; then
 fi
 
 echo "== daemon up"
-mkdir -p "$work/Pictures"
 cat >"$config" <<EOF
 {
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "$work/laptop",
   "dataDir": "$work/data",
   "socket": "$socket",
-  "storageDir": "",
   "peer": "laptop",
   "peers": {
     "laptop": { "endpoints": ["127.0.0.1:42421"] },
     "desktop": { "endpoints": ["127.0.0.1:42422"] }
   },
   "groups": {
-    "family": {
-      "peers": ["laptop", "desktop"],
-      "folders": {
-        "photos": { "mount": "$work/Pictures" },
-        "documents": { "mount": "$work/docs" },
-        "archive": { "mount": "$work/archive" }
-      }
-    },
-    "pool": {
-      "peers": ["laptop", "desktop"],
-      "folders": { "store": { "mount": "$work/storage-store-view" } }
-    }
+    "family": { "peers": ["laptop", "desktop"] }
   },
-  "mounts": { "photos": "$work/Pictures", "documents": "$work/docs", "archive": "$work/archive", "store": "$work/storage-store-view" },
+  "stores": {
+    "photos": {
+      "group": "family",
+      "symlinks": ["$work/Pictures"],
+      "stores": { "bulk": { "group": "family", "path": "Bulk" } }
+    },
+    "documents": { "group": "family", "symlinks": ["$work/docs"] },
+    "archive": { "group": "family", "symlinks": ["$work/archive"] }
+  },
   "backup": { "enable": true, "keep": "7d" }
 }
 EOF
@@ -102,26 +98,48 @@ for _ in $(seq 1 100); do
 done
 [ -S "$socket" ] || { echo "FAIL: daemon socket never appeared" >&2; exit 1; }
 
-echo "== status, both modes"
-wait_for 10 "every folder is prepared" bash -c '
+echo "== status, the tree, and the canonical dirs"
+wait_for 10 "every store is prepared" bash -c '
   "$0" --config "$1" status --json 2>/dev/null |
-    jq -e "(.folders | length == 4) and ([.sync[].state] | all(. != \"\"))" >/dev/null
+    jq -e "(.stores | length == 4) and ([.sync[].state] | all(. != \"\"))" >/dev/null
 ' "$CLI" "$config"
 "$CLI" --config "$config" status | grep -q "photos"
 status_json=$("$CLI" --config "$config" status --json)
 echo "$status_json" |
 	jq -e --arg s "$socket" --arg w "$work" '
-		.apiVersion == 1 and .socket == $s and .peer == "laptop" and
-		(.groups | length == 2) and (.folders | length == 4) and
-		([.folders[] | select(.name == "documents")][0].mount == ($w + "/docs")) and
-		([.folders[].keepOffline] | all) and
+		.apiVersion == 2 and .socket == $s and .peer == "laptop" and
+		.root == ($w + "/laptop") and
+		(.groups | length == 1) and (.stores | length == 4) and
+		([.stores[] | select(.name == "documents")][0].root == ($w + "/laptop/documents")) and
+		([.stores[] | select(.name == "bulk")][0].parent == "photos") and
 		([.sync[].state] | all(. == "replica"))' >/dev/null || {
 	echo "FAIL: the status document is not what this test expects:" >&2
 	echo "$status_json" | jq -c '{
-		apiVersion, socket, peer,
-		groups: (.groups | length), folders: (.folders | length),
-		keepOffline: [.folders[].keepOffline], states: [.sync[] | {folder, state}]
+		apiVersion, socket, peer, root,
+		groups: (.groups | length), stores: (.stores | length),
+		states: [.sync[] | {store, state}]
 	}' >&2
+	exit 1
+}
+
+# The tree is symlinks: a declared path points at the canonical dir, and a
+# child store appears inside its parent without the parent owning its bytes.
+[ -L "$work/Pictures" ] || { echo "FAIL: declared symlink missing" >&2; exit 1; }
+[ "$(readlink "$work/Pictures")" = "$work/laptop/photos" ] || {
+	echo "FAIL: symlink target is $(readlink "$work/Pictures")" >&2
+	exit 1
+}
+[ -L "$work/laptop/photos/Bulk" ] || { echo "FAIL: child store link missing" >&2; exit 1; }
+[ "$(readlink "$work/laptop/photos/Bulk")" = "$work/laptop/bulk" ] || {
+	echo "FAIL: child link target is $(readlink "$work/laptop/photos/Bulk")" >&2
+	exit 1
+}
+
+# Nothing declared: the store root is permissioned like the root's container.
+container_mode=$(stat -c %a "$work")
+store_mode=$(stat -c %a "$work/laptop/photos")
+[ "$store_mode" = "$container_mode" ] || {
+	echo "FAIL: store root mode $store_mode, want the container's $container_mode" >&2
 	exit 1
 }
 
@@ -132,48 +150,38 @@ if "$DAEMON" --config "$config" 2>/dev/null; then
 fi
 
 echo "== two daemons connect over the wire"
-mkdir -p "$work/PicturesB"
 mkdir -p "$work/remoteArchive"
 echo "local file, kept by takeover" >"$work/remoteArchive/local.txt"
-# A folder whose content still sits at the mount path: the daemon moves it
-# into the storage directory and mounts over the path.
-mkdir -p "$work/relocated"
-echo "content from before the storage directory" >"$work/relocated/pre-migration.txt"
 cat >"$config2" <<EOF
 {
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "$work/desktop",
   "dataDir": "$work/data2",
   "socket": "$socket2",
-  "storageDir": "",
   "peer": "desktop",
   "peers": {
     "laptop": { "endpoints": ["127.0.0.1:42421"] },
     "desktop": { "endpoints": ["127.0.0.1:42422"] }
   },
   "groups": {
-    "family": {
-      "peers": ["laptop", "desktop"],
-      "folders": {
-        "photos": { "mount": "$work/PicturesB" },
-        "documents": { "mount": "$work/remoteDocs" },
-        "archive": { "mount": "$work/remoteArchive" }
-      }
-    },
-    "pool": {
-      "peers": ["laptop", "desktop"],
-      "storageDir": "$work/storage",
-      "folders": { "store": { "mount": "$work/relocated" } }
-    }
+    "family": { "peers": ["laptop", "desktop"] }
   },
-  "mounts": { "photos": "$work/PicturesB", "documents": "$work/remoteDocs", "archive": "$work/remoteArchive", "store": "$work/relocated" },
-  "keepOffline": { "documents": false, "archive": false }
+  "stores": {
+    "photos": {
+      "group": "family",
+      "symlinks": ["$work/PicturesB"],
+      "stores": { "bulk": { "group": "family", "sync": "remote", "path": "Bulk" } }
+    },
+    "documents": { "group": "family", "sync": "remote", "symlinks": ["$work/remoteDocs"] },
+    "archive": { "group": "family", "sync": "remote", "symlinks": ["$work/remoteArchive"] }
+  }
 }
 EOF
 
 "$DAEMON" --config "$config2" &
 pid2=$!
 
-for _ in $(seq 1 20); do
+for _ in $(seq 1 100); do
 	[ -S "$socket2" ] && break
 	sleep 0.05
 done
@@ -186,10 +194,10 @@ connected() {
 wait_for 10 "laptop sees desktop" connected "$config"
 wait_for 10 "desktop sees laptop" connected "$config2"
 
-echo "== replica folder syncs"
+echo "== replica store syncs"
 echo "hello from laptop" >"$work/Pictures/a.txt"
-wait_for 10 "file replicated to desktop (replica)" test -f "$work/PicturesB/a.txt"
-grep -q "hello from laptop" "$work/PicturesB/a.txt"
+wait_for 10 "file replicated to desktop" test -f "$work/desktop/photos/a.txt"
+grep -q "hello from laptop" "$work/desktop/photos/a.txt"
 
 echo "== backup lists versions and restores one"
 wait_for 10 "the first version is recorded" bash -c '
@@ -205,30 +213,31 @@ grep -q "hello from laptop" "$work/Pictures/a.txt" || {
 	echo "FAIL: restore did not bring the first version back" >&2
 	exit 1
 }
+
 echo "== a deleted file comes back from its history"
 rm "$work/Pictures/a.txt"
 wait_for 10 "the delete is recorded" bash -c '
   "$0" --config "$1" backup list photos a.txt --json 2>/dev/null | jq -e "[.versions[] | select(.deleted)] | length >= 1" >/dev/null
 ' "$CLI" "$config"
 "$CLI" --config "$config" backup restore photos a.txt >/dev/null
-test -f "$work/Pictures/a.txt" || {
-	echo "FAIL: a deleted file was not restored" >&2
-	exit 1
-}
+test -f "$work/Pictures/a.txt" || { echo "FAIL: deleted file not restored" >&2; exit 1; }
 
+echo "== remote store is live and visible"
+wait_for 10 "desktop documents attached" bash -c '
+  "$0" --config "$1" status --json |
+    jq -e "[.sync[] | select(.store == \"documents\")][0].state == \"attached\"" >/dev/null
+' "$CLI" "$config2"
+echo "holder content" >"$work/docs/from-laptop.txt"
+wait_for 10 "holder content visible on desktop" test -f "$work/desktop/documents/from-laptop.txt"
+grep -q "holder content" "$work/remoteDocs/from-laptop.txt"
 
-echo "== streamed folder attaches"
-wait_for 10 "desktop mount attached" bash -c "[ -L '$work/remoteDocs' ]"
-"$CLI" --config "$config2" status --json |
-	jq -e '[.sync[] | select(.folder == "documents")][0].state == "attached"' >/dev/null
-
-echo "== send puts a file into a folder, and a taken name is parked, not lost"
+echo "== send puts a file into a store, and a taken name is parked, not lost"
 echo "from the share sheet" >"$work/send-me.txt"
 "$CLI" --config "$config" send photos "$work/send-me.txt" --as "sent/holiday.txt" --json |
-	jq -e '.folder == "photos" and .path == "sent/holiday.txt" and (.parked // "") == ""' >/dev/null
+	jq -e '.store == "photos" and .path == "sent/holiday.txt" and (.parked // "") == ""' >/dev/null
 grep -q "from the share sheet" "$work/Pictures/sent/holiday.txt"
-wait_for 10 "the sent file reached the peer" test -f "$work/PicturesB/sent/holiday.txt"
-grep -q "from the share sheet" "$work/PicturesB/sent/holiday.txt"
+wait_for 10 "the sent file reached the peer" test -f "$work/desktop/photos/sent/holiday.txt"
+grep -q "from the share sheet" "$work/desktop/photos/sent/holiday.txt"
 echo "second take" >"$work/send-me2.txt"
 parked=$("$CLI" --config "$config" send photos "$work/send-me2.txt" --as "sent/holiday.txt" --json | jq -r '.parked')
 [ -n "$parked" ] && [ "$parked" != "null" ] || {
@@ -238,64 +247,33 @@ parked=$("$CLI" --config "$config" send photos "$work/send-me2.txt" --as "sent/h
 grep -q "from the share sheet" "$work/Pictures/$parked"
 grep -q "second take" "$work/Pictures/sent/holiday.txt"
 
-echo "== a path with content says why, and takeover mounts it without losing anything"
-"$CLI" --config "$config2" status |
-	grep -q "not managed: path has content"
+echo "== a path with content says why, and takeover links it without losing anything"
+"$CLI" --config "$config2" status | grep -q "(path has content)"
 "$CLI" --config "$config2" status --json |
-	jq -e '[.sync[] | select(.folder == "archive")][0].state == "busy"' >/dev/null
-"$CLI" --config "$config2" folder takeover archive --json |
+	jq -e '[.sync[] | select(.store == "archive")][0].symlinks[0].state == "busy"' >/dev/null
+"$CLI" --config "$config2" store takeover archive --path "$work/remoteArchive" --json |
 	jq -e '.state == "attached" and .moved == 1' >/dev/null
-[ -L "$work/remoteArchive" ] || {
-	echo "FAIL: archive is not a mount after takeover" >&2
-	exit 1
-}
+[ -L "$work/remoteArchive" ] || { echo "FAIL: takeover did not link the path" >&2; exit 1; }
 grep -q "local file, kept by takeover" "$work/remoteArchive/local.txt"
-wait_for 10 "taken-over content reached the holder" test -f "$work/archive/local.txt"
-grep -q "local file, kept by takeover" "$work/archive/local.txt"
+wait_for 10 "taken-over content reached the holder" test -f "$work/laptop/archive/local.txt"
+grep -q "local file, kept by takeover" "$work/laptop/archive/local.txt"
 
-echo "== a storage directory moves content off the mount path and mounts over it"
-[ -L "$work/relocated" ] || {
-	echo "FAIL: the storage-backed mount is not a symlink" >&2
-	exit 1
-}
-[ "$(readlink "$work/relocated")" = "$work/storage/store" ] || {
-	echo "FAIL: mount points at $(readlink "$work/relocated"), want the storage dir" >&2
-	exit 1
-}
-grep -q "content from before the storage directory" "$work/storage/store/pre-migration.txt"
-grep -q "content from before the storage directory" "$work/relocated/pre-migration.txt"
-"$CLI" --config "$config2" status --json |
-	jq -e '[.sync[] | select(.folder == "store")][0].root == "'"$work"'/storage/store"' >/dev/null
-echo "holder content" >"$work/docs/from-laptop.txt"
-wait_for 10 "holder content visible through the mount" test -f "$work/remoteDocs/from-laptop.txt"
-grep -q "holder content" "$work/remoteDocs/from-laptop.txt"
-
-echo "== mount target inherits its parent's permissions"
-parent_mode=$(stat -c %a "$work")
-target_mode=$(stat -Lc %a "$work/remoteDocs")
-[ "$target_mode" = "$parent_mode" ] || {
-	echo "FAIL: mount mode $target_mode, parent $parent_mode" >&2
-	exit 1
-}
-"$CLI" --config "$config2" status --json |
-	jq -e --arg m "$parent_mode" '([.sync[] | select(.folder == "documents")][0].permissions.mode | ltrimstr("0")) == $m' >/dev/null
-
-echo "== streamed folder detaches when the holder is gone"
+echo "== a remote store keeps its content when the holder goes away"
 kill "$pid"
 wait "$pid" 2>/dev/null || true
 pid=""
 
-stream_state() {
+detached() {
 	"$CLI" --config "$config2" status --json |
-		jq -r '[.sync[] | select(.folder == "documents")][0].state' 2>/dev/null
+		jq -e '[.sync[] | select(.store == "documents")][0].state == "detached"' >/dev/null 2>&1
 }
-detached() { [ "$(stream_state)" = "detached" ]; }
-mount_empty() { [ -z "$(ls -A "$work/remoteDocs" 2>/dev/null)" ]; }
-
 wait_for 20 "detached state" detached
-wait_for 10 "mount replaced by an empty dir" mount_empty
+grep -q "holder content" "$work/remoteDocs/from-laptop.txt" || {
+	echo "FAIL: the remote store lost its content when the holder left" >&2
+	exit 1
+}
 
-echo "== offline work merges back in"
+echo "== offline work syncs when the holder returns"
 echo "written offline" >"$work/remoteDocs/offline.txt"
 
 "$DAEMON" --config "$config" &
@@ -304,16 +282,17 @@ for _ in $(seq 1 100); do
 	[ -S "$socket" ] && break
 	sleep 0.05
 done
+[ -S "$socket" ] || { echo "FAIL: holder socket never came back" >&2; exit 1; }
 
 wait_for 20 "holder received the offline file" test -f "$work/docs/offline.txt"
 grep -q "written offline" "$work/docs/offline.txt"
-wait_for 10 "mount reattached with both files" test -f "$work/remoteDocs/from-laptop.txt"
-test -f "$work/remoteDocs/offline.txt"
+wait_for 10 "the remote link shows both files" test -f "$work/remoteDocs/offline.txt"
+test -f "$work/remoteDocs/from-laptop.txt"
 
 echo "== clean shutdown removes the socket"
 kill "$pid" "$pid2"
 if wait "$pid" && wait "$pid2"; then pid=""; pid2=""; else
-	echo "FAIL: daemon exited nonzero on SIGTERM" >&2
+	echo "FAIL: a daemon exited non-zero" >&2
 	exit 1
 fi
 [ ! -e "$socket" ] || { echo "FAIL: socket left behind" >&2; exit 1; }

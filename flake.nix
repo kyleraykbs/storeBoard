@@ -1,5 +1,5 @@
 {
-  description = "Storeboard — replicated folders across your own devices";
+  description = "Storeboard — replicated stores across your own devices";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -70,7 +70,7 @@
             # import (mobile/tools.go keeps the requirement tidy-clean).
             # Nothing in a normal build imports it — hence a vendor hash
             # rather than a committed vendor tree.
-            vendorHash = "sha256-4IqTxmSbAc/0J7nkIaDjR5lqk/heGaM1ZtRa5YBBUiY=";
+            vendorHash = "sha256-k4bJn1ggVnYW4boipdt4p94ZIHlkxFRz+zfIsPTY6BU=";
             subPackages = [
               "cmd/storeboard"
               "cmd/storeboardd"
@@ -88,7 +88,7 @@
               runHook postCheck
             '';
             meta = {
-              description = "Replicated folders across your own devices";
+              description = "Replicated stores across your own devices";
               homepage = "https://codeberg.org/kyleraykbs/storeboard";
               mainProgram = "storeboard";
             };
@@ -186,22 +186,26 @@
                       config.services.storeboard = {
                         enable = true;
                         peer = "laptop";
+                        root = "/srv/storeboard";
                         peers = {
                           laptop.endpoints = [ "192.168.1.10:4242" ];
                           desktop.endpoints = [ "192.168.1.11:4242" ];
                         };
-                        groups.family = {
-                          peers = [
-                            "laptop"
-                            "desktop"
-                          ];
-                          folders = {
-                            photos.mount = "/srv/photos";
-                            archive = { };
+                        groups.family.peers = [
+                          "laptop"
+                          "desktop"
+                        ];
+                        stores = {
+                          photos = {
+                            group = "family";
+                            symlinks = [ "/home/kyle/Pictures" ];
+                          };
+                          # Stream one store instead of replicating it.
+                          archive = {
+                            group = "family";
+                            sync = "remote";
                           };
                         };
-                        # Stream one folder instead of replicating it.
-                        keepOffline.archive = false;
                       };
                     }
                   ];

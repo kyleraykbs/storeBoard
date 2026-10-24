@@ -4,12 +4,12 @@
 // silently ignored. Absent keys keep their defaults, which makes an empty
 // object a valid configuration for a fresh install. The schema is versioned
 // like every other JSON surface (configVersion); this build reads exactly
-// version 1.
+// version 2.
 //
-// The model: this machine is a peer (named by `peer`), other devices are
-// `peers` with declared endpoints, `groups` bind peers together around
-// `folders`, and `mounts` is this machine's local override of a group
-// folder's default mount point. All daemon state lives under one dataDir.
+// The model: one `root` directory holds the bytes, a tree of `stores` below
+// it, and `symlinks` pointing at a store from anywhere else. A store declares
+// its group, mount type, permissions and children; anything undeclared is
+// inherited from its parent, so a child only says what makes it different.
 package config
 
 import (
@@ -17,10 +17,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +28,7 @@ import (
 )
 
 // ConfigVersion is the only config schema version this build reads.
-const ConfigVersion = 1
+const ConfigVersion = 2
 
 // ConfigEnvVar points at a configuration file, for deployments that install
 // one system-wide (the NixOS module does). An explicit --config still wins,
@@ -40,36 +38,38 @@ const ConfigEnvVar = "STOREBOARD_CONFIG"
 // appName is the directory storeboard keeps its files in under each XDG base.
 const appName = "storeboard"
 
+// Sync types. Local holds a full replica that works offline; remote streams
+// the store from a holder. Empty in a declaration means inherit.
+const (
+	SyncLocal  = "local"
+	SyncRemote = "remote"
+)
+
 // Peer is a declared device: name lives in its map key, endpoints are the
 // host:port addresses other peers dial.
 type Peer struct {
 	Endpoints []string `json:"endpoints"`
 }
 
-// Group is a set of peers sharing folders. Every group must include this
-// peer; folder names are unique across the whole config so a local mount
-// override can name a folder without qualifying its group.
+// Group is a set of peers that share stores. Every group must include this
+// peer.
 type Group struct {
-	Peers   []string               `json:"peers"`
-	Folders map[string]GroupFolder `json:"folders"`
-	// Permissions is the group's default ownership and mode for its
-	// folders; a per-folder entry on a machine overrides it field by field.
+	Peers []string `json:"peers"`
+	// Permissions is the group default for its stores; a store's own
+	// declaration overrides it field by field.
 	Permissions *Permissions `json:"permissions,omitempty"`
-	// StorageDir overrides the machine's storageDir for this group's
-	// folders. Absent falls back to the top-level one.
-	StorageDir *string `json:"storageDir,omitempty"`
 }
 
 // Permissions is the ownership and mode the daemon gives the entries it
-// creates for a folder. Every field is optional: an empty field falls
-// through to the next level — machine-local entry, then group default, then
-// the directory the mount lives in (its owner, its group, its mode). So a
-// folder with nothing declared is permissioned exactly like the directory
-// containing it, and inherits any change that directory sees.
+// creates for a store. Every field is optional: an empty field falls through
+// to the next level — the machine's per-store entry, the store's effective
+// declaration (own, then nearest ancestor), the group default, then the
+// directory the store's canonical dir lives in. So a store with nothing
+// declared is permissioned exactly like its parent directory.
 type Permissions struct {
-	User  string `json:"user,omitempty"`  // user name or numeric uid
-	Group string `json:"group,omitempty"` // group name or numeric gid
-	Mode  string `json:"mode,omitempty"`  // octal directory mode, e.g. "0755"
+	User  string `json:"user,omitempty"`
+	Group string `json:"group,omitempty"`
+	Mode  string `json:"mode,omitempty"`
 }
 
 // Validate checks a Permissions block's syntax. User and group names are
@@ -79,17 +79,19 @@ func (p *Permissions) Validate(where string) error {
 	if p == nil {
 		return nil
 	}
-	for _, f := range []struct{ label, v string }{{"user", p.User}, {"group", p.Group}} {
-		if f.v == "" {
-			continue
+	if p.User != "" {
+		if _, err := strconv.Atoi(p.User); err != nil && strings.ContainsAny(p.User, "/:\x00") {
+			return fmt.Errorf("%s: user %q is not a name or uid", where, p.User)
 		}
-		if strings.ContainsAny(f.v, ":,\n \t") {
-			return fmt.Errorf("%s %s %q: a name or numeric id, not a colon list", where, f.label, f.v)
+	}
+	if p.Group != "" {
+		if _, err := strconv.Atoi(p.Group); err != nil && strings.ContainsAny(p.Group, "/:\x00") {
+			return fmt.Errorf("%s: group %q is not a name or gid", where, p.Group)
 		}
 	}
 	if p.Mode != "" {
 		if _, err := ParseMode(p.Mode); err != nil {
-			return fmt.Errorf("%s mode: %w", where, err)
+			return fmt.Errorf("%s: %w", where, err)
 		}
 	}
 	return nil
@@ -97,66 +99,72 @@ func (p *Permissions) Validate(where string) error {
 
 // ParseMode parses an octal directory mode ("755", "0755").
 func ParseMode(s string) (os.FileMode, error) {
-	m, err := strconv.ParseUint(s, 8, 32)
-	if err != nil || m > 0o777 {
-		return 0, fmt.Errorf("%q: want octal 0000-0777", s)
+	v, err := strconv.ParseUint(s, 8, 32)
+	if err != nil || v > 0o777 {
+		return 0, fmt.Errorf("mode %q is not an octal permission mask", s)
 	}
-	return os.FileMode(m), nil
+	return os.FileMode(v), nil
 }
 
-// Backup is a machine's version history: which folders keep one, and how far
+// Backup is a machine's version history: which stores keep one, and how far
 // back it reaches.
 type Backup struct {
-	// Enable turns history keeping on for this machine's folders.
+	// Enable turns history keeping on for this machine's stores.
 	Enable bool `json:"enable"`
 	// Keep is how long a version may live, as a duration with h/d/w/y units
-	// ("1y", "90d", "36h"). Empty means one year. Nothing older is ever
-	// kept, whatever the thinning schedule would say.
+	// ("1y", "90d", "36h"). Empty means one year.
 	Keep string `json:"keep,omitempty"`
-	// Folders opts individual folders out by name.
-	Folders map[string]bool `json:"folders,omitempty"`
+	// Stores opts individual stores out by id.
+	Stores map[string]bool `json:"stores,omitempty"`
 }
 
 // ParseKeep parses a keep duration: the usual Go units plus d, w and y, so a
 // retention window reads the way it is spoken ("1y", "90d").
 func ParseKeep(s string) (time.Duration, error) {
 	if s == "" {
-		return 0, nil
+		return DefaultKeep, nil
 	}
-	unit := time.Duration(0)
-	digits := s
-	switch {
-	case strings.HasSuffix(s, "y"):
-		unit, digits = 365*24*time.Hour, strings.TrimSuffix(s, "y")
-	case strings.HasSuffix(s, "w"):
-		unit, digits = 7*24*time.Hour, strings.TrimSuffix(s, "w")
-	case strings.HasSuffix(s, "d"):
-		unit, digits = 24*time.Hour, strings.TrimSuffix(s, "d")
-	}
-	if unit == 0 {
-		d, err := time.ParseDuration(s)
-		if err != nil {
-			return 0, fmt.Errorf("%q: want a duration like 36h, 90d, 4w or 1y", s)
+	if strings.HasSuffix(s, "y") {
+		n, err := strconv.ParseFloat(strings.TrimSuffix(s, "y"), 64)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("keep %q: not a duration", s)
 		}
-		if d <= 0 {
-			return 0, fmt.Errorf("%q: keep must be positive", s)
+		return time.Duration(n * float64(365*24*time.Hour)), nil
+	}
+	if strings.HasSuffix(s, "w") {
+		n, err := strconv.ParseFloat(strings.TrimSuffix(s, "w"), 64)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("keep %q: not a duration", s)
 		}
-		return d, nil
+		return time.Duration(n * float64(7*24*time.Hour)), nil
 	}
-	n, err := strconv.Atoi(digits)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%q: want a positive number before %q", s, s[len(s)-1:])
+	if strings.HasSuffix(s, "d") {
+		n, err := strconv.ParseFloat(strings.TrimSuffix(s, "d"), 64)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("keep %q: not a duration", s)
+		}
+		return time.Duration(n * float64(24*time.Hour)), nil
 	}
-	return time.Duration(n) * unit, nil
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("keep %q: %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("keep %q: not a duration", s)
+	}
+	return d, nil
 }
 
-// BackupFor reports whether a folder keeps history on this machine and for
-// how long (zero duration means the default year).
-func (c *Config) BackupFor(folder string) (bool, time.Duration, error) {
+// DefaultKeep is the retention window when none is declared.
+const DefaultKeep = 365 * 24 * time.Hour
+
+// BackupFor reports whether a store keeps history on this machine and for how
+// long (zero duration means the default year).
+func (c *Config) BackupFor(store string) (bool, time.Duration, error) {
 	if c.Backup == nil || !c.Backup.Enable {
 		return false, 0, nil
 	}
-	if off, ok := c.Backup.Folders[folder]; ok && !off {
+	if off, ok := c.Backup.Stores[store]; ok && !off {
 		return false, 0, nil
 	}
 	keep, err := ParseKeep(c.Backup.Keep)
@@ -166,10 +174,26 @@ func (c *Config) BackupFor(folder string) (bool, time.Duration, error) {
 	return true, keep, nil
 }
 
-// GroupFolder is a folder's declaration inside a group. Mount is the
-// default every peer sees; each peer overrides it locally in `mounts`.
-type GroupFolder struct {
-	Mount string `json:"mount,omitempty"`
+// Store is one store's declaration inside its parent (or at the top level).
+// Everything but Path and Symlinks is inherited from the parent when empty.
+type Store struct {
+	// Path is the store's relpath inside its parent, and the name it appears
+	// under there. Absent means the store's id, at the parent's top level.
+	// A top-level store's directory is its id, so Path is meaningless there.
+	Path string `json:"path,omitempty"`
+	// Group names the peers that share this store. Empty inherits the
+	// parent's group; a top-level store must declare one.
+	Group string `json:"group,omitempty"`
+	// Sync is SyncLocal or SyncRemote. Empty inherits the parent's; the
+	// top-level default is local.
+	Sync string `json:"sync,omitempty"`
+	// Symlinks are absolute paths that become symlinks to this store's
+	// canonical directory. Never inherited: a path belongs to one machine.
+	Symlinks []string `json:"symlinks,omitempty"`
+	// Permissions overrides the parent's declaration field by field.
+	Permissions *Permissions `json:"permissions,omitempty"`
+	// Stores are this store's children, presented as symlinks inside it.
+	Stores map[string]Store `json:"stores,omitempty"`
 }
 
 // Config is the complete configuration, shared by the daemon and the CLI.
@@ -178,9 +202,13 @@ type Config struct {
 	// an error, never a best-effort parse.
 	ConfigVersion int `json:"configVersion"`
 
-	// DataDir is the one storage directory: store, journal, index — every
-	// piece of daemon state, including default mounts for folders nobody
-	// gave a path.
+	// Root is the one directory the bytes live in: every store's canonical
+	// dir is <root>/<store>, and the tree below it is made of symlinks. It
+	// is a plain container, not a store.
+	Root string `json:"root"`
+
+	// DataDir is the one storage directory for daemon state: blob store,
+	// journals, index, trash, history.
 	DataDir string `json:"dataDir"`
 
 	// Socket is the unix socket the daemon serves /v1 on and the CLI dials.
@@ -193,59 +221,58 @@ type Config struct {
 	// Peers are the declared devices, by name.
 	Peers map[string]Peer `json:"peers"`
 
-	// Groups bind peers together around folders.
+	// Groups bind peers together around stores.
 	Groups map[string]Group `json:"groups"`
 
-	// Mounts overrides a group folder's default mount on THIS machine.
-	Mounts map[string]string `json:"mounts"`
+	// StoreTree is the store tree, by id. Ids are globally unique and name
+	// the canonical directory under root.
+	StoreTree map[string]Store `json:"stores"`
 
-	// StorageDir, when set, is where folder content lives on this machine:
-	// each folder's root becomes <storageDir>/<folder> and the mount path is
-	// a symlink to it, so content and mount point are independent — the
-	// mount can sit anywhere, and no two folders can index the same bytes.
-	// Absent or null takes the default, <dataDir>/storage; an explicit empty
-	// string restores the original layout (a replica's content at the mount
-	// path itself, a streamed folder's under the data directory). A group
-	// may override it per group; a folder with content at its mount path is
-	// migrated into the storage directory on the next transition.
-	StorageDir *string `json:"storageDir,omitempty"`
-
-	// Backup, per machine, keeps a thinned history of every file's versions
-	// under the data directory: the newest version of each hour for a day,
-	// each day for a week, each week for a month, each month for a year (and
-	// each year beyond that), and nothing older than Keep. Folders opt out
-	// per name; a version is never dropped while it is the file's current
-	// one, and the retention policy is the only thing in the daemon that
-	// ever deletes anything of its own accord.
+	// Backup, per machine, keeps a thinned history of every file's versions.
+	// A store that is streamed on this machine keeps none.
 	Backup *Backup `json:"backup,omitempty"`
 
-	// Permissions overrides, per folder on THIS machine, the ownership and
-	// mode the daemon gives the folder's entries. Fields left empty fall
-	// back to the group's Permissions and then to the directory the mount
-	// lives in, so a folder with nothing declared is permissioned exactly
-	// like the directory containing it.
+	// Permissions overrides, per store on THIS machine, the ownership and
+	// mode the daemon gives the store's entries.
 	Permissions map[string]Permissions `json:"permissions,omitempty"`
+}
 
-	// KeepOffline, per folder, decides what THIS machine does with a group
-	// folder: true (the default for anything undeclared) keeps a full local
-	// replica that works offline; false streams the folder from a holder —
-	// mounted live while a holder is reachable, an empty dummy dir when
-	// none is, remerged on reconnect.
-	KeepOffline map[string]bool `json:"keepOffline"`
+// StoreView is one store resolved against its ancestors and this machine.
+type StoreView struct {
+	ID          string
+	Parent      string // "" at the top level
+	Path        string // relpath inside the parent; "" at the top level
+	Group       string
+	Sync        string // SyncLocal or SyncRemote
+	Symlinks    []string
+	Permissions *Permissions // effective declaration, nearest ancestor wins per field
+	Dir         string       // canonical directory: <root>/<id>
+}
+
+// DefaultRoot is where the store tree lives when the config does not say.
+func DefaultRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		if dir := DefaultDataDir(); dir != "" {
+			return filepath.Join(dir, "root")
+		}
+		return "Storeboard"
+	}
+	return filepath.Join(home, "Storeboard")
 }
 
 // Default returns the built-in configuration with the XDG defaults filled in.
 func Default() *Config {
-	cfg := &Config{
+	return &Config{
 		ConfigVersion: ConfigVersion,
+		Root:          DefaultRoot(),
 		DataDir:       DefaultDataDir(),
 		Socket:        DefaultSocketPath(),
+		Peers:         map[string]Peer{},
+		Groups:        map[string]Group{},
+		StoreTree:     map[string]Store{},
+		Permissions:   map[string]Permissions{},
 	}
-	if cfg.DataDir != "" {
-		def := DefaultStorageDir(cfg.DataDir)
-		cfg.StorageDir = &def
-	}
-	return cfg
 }
 
 // DefaultPath is $XDG_CONFIG_HOME/storeboard/config.json. It is empty when no
@@ -283,13 +310,6 @@ func DefaultSocketPath() string {
 		return filepath.Join(dir, appName+".sock")
 	}
 	return ""
-}
-
-// DefaultMountDir is where a folder mounts when neither the group nor this
-// machine picked a path: inside the one storage directory, so a fresh
-// install keeps everything it owns in one place.
-func (c *Config) DefaultMountDir(folder string) string {
-	return filepath.Join(c.DataDir, "mounts", folder)
 }
 
 // SystemConfigPath is the system-wide config the NixOS module installs.
@@ -348,11 +368,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	cfg, err := Parse(raw)
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	return Parse(raw)
 }
 
 // Parse reads a configuration from JSON text: the same strict decoding,
@@ -360,8 +376,8 @@ func Load(path string) (*Config, error) {
 // (the Android app, whose config arrives as a string) uses one code path.
 func Parse(raw []byte) (*Config, error) {
 	// Decode into an empty config, not Default(): every default that depends
-	// on another field (storageDir under dataDir, above all) has to be
-	// computed from what the file actually says, not from the XDG guess.
+	// on another field (root, dataDir) has to be computed from what the file
+	// actually says, not from the XDG guess.
 	cfg := &Config{ConfigVersion: ConfigVersion}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -374,18 +390,14 @@ func Parse(raw []byte) (*Config, error) {
 
 	// An explicitly blanked string falls back to the default; JSON cannot
 	// distinguish "absent" from "empty" when decoding into filled defaults.
+	if cfg.Root == "" {
+		cfg.Root = DefaultRoot()
+	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = DefaultDataDir()
 	}
 	if cfg.Socket == "" {
 		cfg.Socket = DefaultSocketPath()
-	}
-	// storageDir is a pointer so a file can distinguish three cases: absent
-	// (the default under dataDir), empty (content at the mount path), and a
-	// path.
-	if cfg.StorageDir == nil && cfg.DataDir != "" {
-		def := DefaultStorageDir(cfg.DataDir)
-		cfg.StorageDir = &def
 	}
 
 	// Maps decode into whatever the file leaves behind (or nil when absent);
@@ -396,18 +408,15 @@ func Parse(raw []byte) (*Config, error) {
 	if cfg.Groups == nil {
 		cfg.Groups = map[string]Group{}
 	}
-	if cfg.Mounts == nil {
-		cfg.Mounts = map[string]string{}
-	}
-	if cfg.KeepOffline == nil {
-		cfg.KeepOffline = map[string]bool{}
+	if cfg.StoreTree == nil {
+		cfg.StoreTree = map[string]Store{}
 	}
 	if cfg.Permissions == nil {
 		cfg.Permissions = map[string]Permissions{}
 	}
 	for name, g := range cfg.Groups {
-		if g.Folders == nil {
-			g.Folders = map[string]GroupFolder{}
+		if g.Peers == nil {
+			g.Peers = []string{}
 			cfg.Groups[name] = g
 		}
 	}
@@ -434,6 +443,12 @@ func Parse(raw []byte) (*Config, error) {
 func (c *Config) Validate() error {
 	if c.ConfigVersion != ConfigVersion {
 		return fmt.Errorf("configVersion %d: this build reads version %d", c.ConfigVersion, ConfigVersion)
+	}
+	if c.Root == "" {
+		return fmt.Errorf("root is empty; cannot determine where the store tree lives")
+	}
+	if !filepath.IsAbs(c.Root) {
+		return fmt.Errorf("root %q: path must be absolute", c.Root)
 	}
 	if c.DataDir == "" {
 		return fmt.Errorf("dataDir is empty; cannot determine the XDG data directory")
@@ -468,9 +483,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Folder name → owning group, for global-uniqueness and `mounts` lookups.
-	folderGroup := map[string]string{}
-
 	for name, g := range c.Groups {
 		if err := checkName("group", name); err != nil {
 			return err
@@ -486,213 +498,193 @@ func (c *Config) Validate() error {
 		if c.Peer == "" {
 			return fmt.Errorf("groups are declared but this machine has no peer name; set peer")
 		}
-		if !slices.Contains(g.Peers, c.Peer) {
+		if !containsString(g.Peers, c.Peer) {
 			return fmt.Errorf("group %q: this peer %q is not a member", name, c.Peer)
 		}
-
-		for folder, gf := range g.Folders {
-			if err := checkName("folder", folder); err != nil {
-				return err
-			}
-			if owner, dup := folderGroup[folder]; dup {
-				return fmt.Errorf("folder %q: declared in groups %q and %q; folder names are global", folder, owner, name)
-			}
-			folderGroup[folder] = name
-			if gf.Mount != "" && !filepath.IsAbs(gf.Mount) {
-				return fmt.Errorf("group %q folder %q: mount %q must be absolute", name, folder, gf.Mount)
-			}
-		}
-	}
-
-	for folder, mount := range c.Mounts {
-		if _, ok := folderGroup[folder]; !ok {
-			return fmt.Errorf("mounts: unknown folder %q", folder)
-		}
-		if !filepath.IsAbs(mount) {
-			return fmt.Errorf("mounts[%q]: path %q must be absolute", folder, mount)
-		}
-	}
-
-	for folder := range c.KeepOffline {
-		if _, ok := folderGroup[folder]; !ok {
-			return fmt.Errorf("keepOffline: unknown folder %q", folder)
-		}
-	}
-
-	for folder, p := range c.Permissions {
-		if _, ok := folderGroup[folder]; !ok {
-			return fmt.Errorf("permissions: unknown folder %q", folder)
-		}
-		if err := p.Validate(fmt.Sprintf("permissions %s", folder)); err != nil {
-			return err
-		}
-	}
-
-	for name, g := range c.Groups {
 		if err := g.Permissions.Validate(fmt.Sprintf("group %s permissions", name)); err != nil {
 			return err
 		}
-		if g.StorageDir != nil && !filepath.IsAbs(*g.StorageDir) {
-			return fmt.Errorf("group %q storageDir %q must be absolute", name, *g.StorageDir)
+	}
+
+	views := c.StoreViews()
+	seenID := map[string]bool{}
+	for _, v := range views {
+		if seenID[v.ID] {
+			return fmt.Errorf("store %q: declared twice; ids are global", v.ID)
+		}
+		seenID[v.ID] = true
+	}
+
+	// Presentation paths must be unique among siblings, and a symlink path
+	// may not be an ancestor or descendant of root (either would make the
+	// tree point into itself).
+	var symlinks []struct{ path, store string }
+	for _, v := range views {
+		if v.Group == "" {
+			return fmt.Errorf("store %q: no group; a top-level store must declare one", v.ID)
+		}
+		if _, ok := c.Groups[v.Group]; !ok {
+			return fmt.Errorf("store %q: unknown group %q", v.ID, v.Group)
+		}
+		switch v.Sync {
+		case SyncLocal, SyncRemote:
+		default:
+			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote)
+		}
+		for _, sp := range v.Symlinks {
+			if !filepath.IsAbs(sp) {
+				return fmt.Errorf("store %q symlink %q: path must be absolute", v.ID, sp)
+			}
+			if filepath.Clean(sp) != sp {
+				return fmt.Errorf("store %q symlink %q: path must be clean", v.ID, sp)
+			}
+			if sp == c.Root || containsPath(sp, c.Root) || containsPath(c.Root, sp) {
+				return fmt.Errorf("store %q symlink %q: overlaps root %s", v.ID, sp, c.Root)
+			}
+			symlinks = append(symlinks, struct{ path, store string }{sp, v.ID})
 		}
 	}
-	if c.StorageDir != nil && *c.StorageDir != "" && !filepath.IsAbs(*c.StorageDir) {
-		return fmt.Errorf("storageDir %q must be absolute (or empty for content at the mount path)", *c.StorageDir)
+	for i, a := range symlinks {
+		for _, b := range symlinks[i+1:] {
+			switch {
+			case a.path == b.path:
+				if a.store == b.store {
+					return fmt.Errorf("store %q: symlink %q is declared twice", a.store, a.path)
+				}
+				return fmt.Errorf("stores %q and %q both claim symlink %q", a.store, b.store, a.path)
+			case containsPath(a.path, b.path), containsPath(b.path, a.path):
+				return fmt.Errorf("symlinks %q and %q nest: one path cannot be inside another", a.path, b.path)
+			}
+		}
+	}
+
+	// Sibling presentation paths are unique within their parent.
+	if err := c.checkSiblings(c.StoreTree, ""); err != nil {
+		return err
 	}
 
 	if c.Backup != nil {
 		if _, err := ParseKeep(c.Backup.Keep); err != nil {
 			return fmt.Errorf("backup keep: %w", err)
 		}
-	}
-
-	// Two folders on one identical path stay an error: there is no reading
-	// of that shape where the outcome is defined. Nested mounts, in
-	// contrast, are a deliberate tradeoff (a pool root plus the subtrees
-	// other machines stream) — those are warnings, see Warnings.
-	folders := c.Folders()
-	for i, a := range folders {
-		for _, b := range folders[i+1:] {
-			if a.Mount == b.Mount {
-				return fmt.Errorf("folders %q and %q both mount %s: one path cannot be two folders", a.Name, b.Name, a.Mount)
+		for store := range c.Backup.Stores {
+			if !seenID[store] {
+				return fmt.Errorf("backup stores: unknown store %q", store)
 			}
 		}
 	}
-	// A folder whose mount is its own storage root would ask for a symlink
-	// pointing at itself.
-	for _, f := range folders {
-		if f.Storage != "" && f.Storage == f.Mount {
-			return fmt.Errorf("folder %q: mount and storage are both %s; the mount is the storage directory's view and has to be a different path", f.Name, f.Mount)
+
+	for store, p := range c.Permissions {
+		if !seenID[store] {
+			return fmt.Errorf("permissions: unknown store %q", store)
+		}
+		if err := p.Validate(fmt.Sprintf("permissions %s", store)); err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
 
-// Warnings reports shapes that are legal but cost something: today, folders
-// whose scan roots nest. A nested mount converges — the holder's filesystem
-// mediates, every write is temp-file-then-rename, content is
-// content-addressed — but the machine that holds both indexes the same files
-// twice (two journals, two scans, two broadcasts, two writers per path) and
-// its content store takes a copy of the outer tree. Folders backed by a
-// storage directory never warn: their roots are <storageDir>/<folder>,
-// disjoint by construction.
-func (c *Config) Warnings() []string {
-	type root struct{ name, path string }
-	var roots []root
-	for groupName, g := range c.Groups {
-		for folder := range g.Folders {
-			roots = append(roots, root{folder, c.FolderRoot(folder, groupName)})
+// checkSiblings enforces unique presentation names under one parent.
+func (c *Config) checkSiblings(stores map[string]Store, parent string) error {
+	seen := map[string]string{}
+	for id, s := range stores {
+		if err := checkName("store", id); err != nil {
+			return err
 		}
-	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].name < roots[j].name })
-
-	var out []string
-	for i, a := range roots {
-		for _, b := range roots[i+1:] {
-			switch {
-			case contains(a.path, b.path):
-				out = append(out, fmt.Sprintf("folder %q is rooted at %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", a.name, a.path, b.path, b.name))
-			case contains(b.path, a.path):
-				out = append(out, fmt.Sprintf("folder %q is rooted at %s, which contains %s (folder %q): the machine holding both indexes those files twice, in two journals, and keeps a copy of the outer tree in its content store", b.name, b.path, a.path, a.name))
+		if parent == "" {
+			if s.Path != "" {
+				return fmt.Errorf("store %q: path is meaningless at the top level; the canonical dir is its name", id)
 			}
+			seen[id] = id
+		} else {
+			path := s.Path
+			if path == "" {
+				path = id
+			}
+			if err := checkRelPath(path); err != nil {
+				return fmt.Errorf("store %q path: %w", id, err)
+			}
+			if other, dup := seen[path]; dup {
+				return fmt.Errorf("stores %q and %q both appear as %q in %q", other, id, path, parent)
+			}
+			seen[path] = id
+		}
+		if err := c.checkSiblings(s.Stores, id); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// checkRelPath accepts a clean relative path inside a parent.
+func checkRelPath(p string) error {
+	if p == "" {
+		return fmt.Errorf("path is empty")
+	}
+	if filepath.IsAbs(p) {
+		return fmt.Errorf("path %q must be relative", p)
+	}
+	clean := filepath.Clean(p)
+	if clean != p || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("path %q must be a clean relative path inside the parent", p)
+	}
+	return nil
+}
+
+// StoreViews resolves every store in the tree, sorted by id. Inheritance is
+// nearest-declared-wins per field: group, sync and permissions come from the
+// store, else its nearest ancestor, else (sync) local.
+func (c *Config) StoreViews() []StoreView {
+	var out []StoreView
+	var walk func(parent string, stores map[string]Store, inherited StoreView)
+	walk = func(parent string, stores map[string]Store, inherited StoreView) {
+		for id, s := range stores {
+			v := StoreView{ID: id, Parent: parent, Dir: filepath.Join(c.Root, id)}
+			if parent != "" {
+				v.Path = s.Path
+				if v.Path == "" {
+					v.Path = id
+				}
+			}
+			v.Group = firstNonEmpty(s.Group, inherited.Group)
+			v.Sync = firstNonEmpty(s.Sync, inherited.Sync, SyncLocal)
+			v.Symlinks = append([]string(nil), s.Symlinks...)
+			v.Permissions = mergePerms(inherited.Permissions, s.Permissions)
+			out = append(out, v)
+			walk(id, s.Stores, v)
+		}
+	}
+	walk("", c.StoreTree, StoreView{})
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-// contains reports whether outer is a proper ancestor directory of inner.
-// Path-boundary aware: /srv/photos does not contain /srv/photos-old.
-func contains(outer, inner string) bool {
-	if !strings.HasPrefix(inner, outer) {
-		return false
-	}
-	return strings.HasPrefix(inner[len(outer):], "/")
-}
-
-// DefaultStorageDir is where folder content lives when nothing else says:
-// inside the one storage directory, so a fresh install keeps everything it
-// owns in one place. A config that wants the original layout (content at the
-// mount path) sets storageDir to the empty string explicitly.
-func DefaultStorageDir(dataDir string) string {
-	return filepath.Join(dataDir, "storage")
-}
-
-// StorageFor is a folder's content directory when the config puts content in
-// a storage directory: the group's storageDir if declared, else the
-// machine's, else the default under the data directory. Empty means the
-// original layout — content at the mount path (replicas) or under the data
-// directory (streamed) — which is what an explicit empty storageDir asks for.
-func (c *Config) StorageFor(folder, group string) string {
-	if g, ok := c.Groups[group]; ok && g.StorageDir != nil {
-		return *g.StorageDir
-	}
-	if c.StorageDir != nil {
-		return *c.StorageDir
-	}
-	return DefaultStorageDir(c.DataDir)
-}
-
-// FolderRoot is where a folder's content lives on this machine: under its
-// storage directory when one is configured, else at its effective mount.
-func (c *Config) FolderRoot(folder, group string) string {
-	if s := c.StorageFor(folder, group); s != "" {
-		return filepath.Join(s, folder)
-	}
-	return c.FolderMount(folder, group)
-}
-
-// FolderMount is a folder's effective mount: this machine's override, else
-// the group's default, else inside the data directory.
-func (c *Config) FolderMount(folder, group string) string {
-	mount := c.Mounts[folder]
-	if mount == "" {
-		mount = c.Groups[group].Folders[folder].Mount
-	}
-	if mount == "" {
-		mount = c.DefaultMountDir(folder)
-	}
-	return mount
-}
-
-// PermissionsFor is the declared permissions for a folder: this machine's
-// per-folder entry wins field by field over the group's default. Nil when
-// neither declares anything — the daemon then inherits from the directory
-// the mount lives in.
-func (c *Config) PermissionsFor(folder, group string) *Permissions {
-	var local *Permissions
-	if p, ok := c.Permissions[folder]; ok {
-		local = &p
-	}
-	def := c.Groups[group].Permissions
-	if local == nil && def == nil {
-		return nil
-	}
-	out := &Permissions{}
-	lu, lg, lm := "", "", ""
-	if local != nil {
-		lu, lg, lm = local.User, local.Group, local.Mode
-	}
-	du, dg, dm := "", "", ""
-	if def != nil {
-		du, dg, dm = def.User, def.Group, def.Mode
-	}
-	for _, f := range []struct {
-		dst        *string
-		local, def string
-	}{
-		{&out.User, lu, du},
-		{&out.Group, lg, dg},
-		{&out.Mode, lm, dm},
-	} {
-		if f.local != "" {
-			*f.dst = f.local
-		} else {
-			*f.dst = f.def
+// StoreView returns one resolved store by id.
+func (c *Config) StoreView(id string) (StoreView, bool) {
+	for _, v := range c.StoreViews() {
+		if v.ID == id {
+			return v, true
 		}
 	}
-	if out.User == "" && out.Group == "" && out.Mode == "" {
-		return nil
+	return StoreView{}, false
+}
+
+// PermissionsFor is the declared permissions for a store: this machine's
+// per-store entry wins field by field over the store's effective declaration
+// (own, then nearest ancestor), which wins over its group's default. Nil
+// when none of the three declares anything — the daemon then inherits from
+// the directory the canonical dir lives in.
+func (c *Config) PermissionsFor(store string) *Permissions {
+	v, ok := c.StoreView(store)
+	var declared, groupDefault *Permissions
+	if ok {
+		declared = v.Permissions
+		groupDefault = c.Groups[v.Group].Permissions
+	}
+	out := mergePerms(groupDefault, declared)
+	if local, exists := c.Permissions[store]; exists {
+		out = mergePerms(out, &local)
 	}
 	return out
 }
@@ -702,70 +694,81 @@ func (c *Config) PermissionsFor(folder, group string) *Permissions {
 func (c *Config) PeerList() []api.Peer {
 	out := make([]api.Peer, 0, len(c.Peers))
 	for name, p := range c.Peers {
-		endpoints := p.Endpoints
-		if endpoints == nil {
-			endpoints = []string{}
+		eps := append([]string(nil), p.Endpoints...)
+		if eps == nil {
+			eps = []string{}
 		}
-		out = append(out, api.Peer{Name: name, Endpoints: endpoints})
+		out = append(out, api.Peer{Name: name, Endpoints: eps})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// GroupList lists the declared groups, sorted by name; each group's folder
-// names are sorted too.
+// GroupList lists the declared groups, sorted by name; each group's stores
+// are sorted too.
 func (c *Config) GroupList() []api.Group {
+	views := c.StoreViews()
 	out := make([]api.Group, 0, len(c.Groups))
 	for name, g := range c.Groups {
-		folders := make([]string, 0, len(g.Folders))
-		for folder := range g.Folders {
-			folders = append(folders, folder)
+		stores := []string{}
+		for _, v := range views {
+			if v.Group == name {
+				stores = append(stores, v.ID)
+			}
 		}
-		sort.Strings(folders)
-		out = append(out, api.Group{Name: name, Peers: g.Peers, Folders: folders})
+		sort.Strings(stores)
+		peers := append([]string(nil), g.Peers...)
+		if peers == nil {
+			peers = []string{}
+		}
+		out = append(out, api.Group{Name: name, Peers: peers, Stores: stores})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// Folders lists every folder across all groups with its effective local
-// mount point — local override, else the group's declared default, else
-// inside the one storage directory. Sorted by (globally unique) name.
-func (c *Config) Folders() []api.Folder {
-	out := make([]api.Folder, 0, len(c.Mounts)+len(c.KeepOffline))
-	for groupName, g := range c.Groups {
-		for folder := range g.Folders {
-			// Absent from the map means keep: a replica is the conservative
-			// default, and streaming is the opt-out.
-			keepOffline := true
-			if v, ok := c.KeepOffline[folder]; ok {
-				keepOffline = v
-			}
-			f := api.Folder{
-				Name:        folder,
-				Group:       groupName,
-				Mount:       c.FolderMount(folder, groupName),
-				KeepOffline: keepOffline,
-			}
-			if s := c.StorageFor(folder, groupName); s != "" {
-				f.Storage = filepath.Join(s, folder)
-			}
-			out = append(out, f)
+// Stores lists every store with its resolved view, sorted by id.
+func (c *Config) Stores() []api.Store {
+	views := c.StoreViews()
+	out := make([]api.Store, 0, len(views))
+	for _, v := range views {
+		symlinks := append([]string(nil), v.Symlinks...)
+		if symlinks == nil {
+			symlinks = []string{}
 		}
+		out = append(out, api.Store{
+			Name:     v.ID,
+			Parent:   v.Parent,
+			Path:     v.Path,
+			Group:    v.Group,
+			Sync:     v.Sync,
+			Root:     v.Dir,
+			Symlinks: symlinks,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// checkName is the identity rule for peers, groups and folders: a name ends
+// checkName is the identity rule for peers, groups and stores: a name ends
 // up in JSON keys, journal entries and CLI output, so it is an identifier,
 // never a path.
 func checkName(kind, name string) error {
 	if name == "" {
-		return fmt.Errorf("%s with empty name", kind)
+		return fmt.Errorf("%s name is empty", kind)
 	}
-	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
-		return fmt.Errorf("%s name %q: a name is an identifier, not a path", kind, name)
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("%s name %q: not an identifier; use letters, digits, '-', '_' or '.'", kind, name)
+		}
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("%s name %q is a path element", kind, name)
+	}
+	if strings.HasPrefix(name, ".") {
+		return fmt.Errorf("%s name %q: leading '.' is reserved", kind, name)
 	}
 	return nil
 }
@@ -773,16 +776,93 @@ func checkName(kind, name string) error {
 // checkEndpoint accepts host:port — the wire format every declared endpoint
 // uses. Bare hostnames are rejected until the protocol picks a default port.
 func checkEndpoint(ep string) error {
-	host, port, err := net.SplitHostPort(ep)
+	host, port, err := cutHostPort(ep)
 	if err != nil {
-		return fmt.Errorf("want host:port: %w", err)
+		return err
 	}
-	if host == "" {
-		return fmt.Errorf("empty host")
+	if host == "" || port == "" {
+		return fmt.Errorf("want host:port")
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("port %q: want 1-65535", port)
+		return fmt.Errorf("port %q is not a number in 1-65535", port)
 	}
 	return nil
+}
+
+// cutHostPort splits host:port, including bracketed IPv6 literals.
+func cutHostPort(ep string) (string, string, error) {
+	if strings.HasPrefix(ep, "[") {
+		end := strings.Index(ep, "]")
+		if end < 0 {
+			return "", "", fmt.Errorf("unterminated IPv6 literal")
+		}
+		if end+1 >= len(ep) || ep[end+1] != ':' {
+			return "", "", fmt.Errorf("want host:port")
+		}
+		return ep[1:end], ep[end+2:], nil
+	}
+	host, port, ok := strings.Cut(ep, ":")
+	if !ok {
+		return "", "", fmt.Errorf("want host:port")
+	}
+	if strings.Contains(port, ":") {
+		return "", "", fmt.Errorf("IPv6 literals must be bracketed")
+	}
+	return host, port, nil
+}
+
+// firstNonEmpty returns the first non-empty string.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mergePerms overlays own on inherited, field by field.
+func mergePerms(inherited, own *Permissions) *Permissions {
+	if inherited == nil && own == nil {
+		return nil
+	}
+	out := &Permissions{}
+	if inherited != nil {
+		out.User, out.Group, out.Mode = inherited.User, inherited.Group, inherited.Mode
+	}
+	if own != nil {
+		if own.User != "" {
+			out.User = own.User
+		}
+		if own.Group != "" {
+			out.Group = own.Group
+		}
+		if own.Mode != "" {
+			out.Mode = own.Mode
+		}
+	}
+	if out.User == "" && out.Group == "" && out.Mode == "" {
+		return nil
+	}
+	return out
+}
+
+// containsPath reports whether outer is a proper ancestor of inner.
+// Path-boundary aware: /srv/photos does not contain /srv/photos-old.
+func containsPath(outer, inner string) bool {
+	outer, inner = filepath.Clean(outer), filepath.Clean(inner)
+	if outer == inner {
+		return false
+	}
+	return strings.HasPrefix(inner, outer+string(filepath.Separator))
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }

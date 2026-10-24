@@ -32,11 +32,11 @@ Commands:
   config check    validate the configuration file
   backup <verb>   versions and restores: list a file's recorded history,
                   restore a version, a deleted file included
-  folder takeover <name>
-                  mount a folder over a path that already holds files,
-                  keeping that content and syncing it
-  send <folder> <file>
-                  copy a file into a folder: it syncs like any other
+  store takeover <name>
+                  turn a declared symlink path that already holds files
+                  into a link to the store, keeping and syncing that content
+  send <store> <file>
+                  copy a file into a store: it syncs like any other
                   change, and a name already taken is parked, not lost
   status          show the daemon's status document
   version         print version information
@@ -71,8 +71,8 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return status(ctx, configPath, rest, stdout, stderr)
 	case "send":
 		return sendCmd(ctx, configPath, rest, stdout, stderr)
-	case "folder":
-		return folderCmd(ctx, configPath, rest, stdout, stderr)
+	case "store":
+		return storeCmd(ctx, configPath, rest, stdout, stderr)
 	case "backup":
 		return backupCmd(ctx, configPath, rest, stdout, stderr)
 	default:
@@ -120,20 +120,22 @@ func versionCmd(args []string, stdout, stderr io.Writer) error {
 // well-formed document — "valid": false plus the error — so the command is
 // scriptable in both directions.
 type checkReport struct {
-	Path     string        `json:"path"`
-	Valid    bool          `json:"valid"`
-	Error    string        `json:"error,omitempty"`
-	Warnings []string      `json:"warnings,omitempty"`
-	Socket   string        `json:"socket,omitempty"`
-	Peer     string        `json:"peer,omitempty"`
-	Peers    []string      `json:"peers,omitempty"`
-	Groups   []string      `json:"groups,omitempty"`
-	Folders  []checkFolder `json:"folders,omitempty"`
+	Path   string       `json:"path"`
+	Valid  bool         `json:"valid"`
+	Error  string       `json:"error,omitempty"`
+	Root   string       `json:"root,omitempty"`
+	Socket string       `json:"socket,omitempty"`
+	Peer   string       `json:"peer,omitempty"`
+	Peers  []string     `json:"peers,omitempty"`
+	Groups []string     `json:"groups,omitempty"`
+	Stores []checkStore `json:"stores,omitempty"`
 }
 
-type checkFolder struct {
+type checkStore struct {
 	Name  string `json:"name"`
 	Group string `json:"group"`
+	Sync  string `json:"sync"`
+	Root  string `json:"root"`
 }
 
 // configCheck validates a real file: a missing file is a failure, not
@@ -178,27 +180,24 @@ func configCheck(configPath string, args []string, stdout, stderr io.Writer) err
 	}
 
 	report.Valid = true
+	report.Root = cfg.Root
 	report.Socket = cfg.Socket
 	report.Peer = cfg.Peer
-	report.Warnings = cfg.Warnings()
 	for _, p := range cfg.PeerList() {
 		report.Peers = append(report.Peers, p.Name)
 	}
 	for _, g := range cfg.GroupList() {
 		report.Groups = append(report.Groups, g.Name)
 	}
-	folders := cfg.Folders()
-	report.Folders = make([]checkFolder, 0, len(folders))
-	for _, f := range folders {
-		report.Folders = append(report.Folders, checkFolder{Name: f.Name, Group: f.Group})
+	stores := cfg.Stores()
+	report.Stores = make([]checkStore, 0, len(stores))
+	for _, s := range stores {
+		report.Stores = append(report.Stores, checkStore{Name: s.Name, Group: s.Group, Sync: s.Sync, Root: s.Root})
 	}
 	if jsonOut {
 		return writeJSON(stdout, report)
 	}
-	fmt.Fprintf(stdout, "config OK: %s (%d folders)\n", path, len(folders))
-	for _, w := range report.Warnings {
-		fmt.Fprintf(stdout, "warning: %s\n", w)
-	}
+	fmt.Fprintf(stdout, "config OK: %s (%d stores)\n", path, len(stores))
 	return nil
 }
 
@@ -318,15 +317,15 @@ func splitFlags(args []string, command string, stderr io.Writer) (bool, []string
 }
 
 func backupList(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "backup list <folder> [path]", stderr)
+	jsonOut, positional, err := splitFlags(args, "backup list <store> [path]", stderr)
 	if err != nil {
 		return err
 	}
 	if len(positional) < 1 || len(positional) > 2 {
-		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup list <folder> [path] [--json]")
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup list <store> [path] [--json]")
 		return ErrHandled
 	}
-	folder := positional[0]
+	store := positional[0]
 	path := ""
 	if len(positional) == 2 {
 		path = positional[1]
@@ -336,13 +335,13 @@ func backupList(ctx context.Context, configPath string, args []string, stdout, s
 	if err != nil {
 		return err
 	}
-	query := "/v1/folders/" + url.PathEscape(folder) + "/versions"
+	query := "/v1/stores/" + url.PathEscape(store) + "/versions"
 	if path != "" {
 		query += "?path=" + url.QueryEscape(path)
 	}
 	body, err := fetch(ctx, cfg.Socket, query)
 	if err != nil {
-		return fmt.Errorf("backup list %s: %w", folder, err)
+		return fmt.Errorf("backup list %s: %w", store, err)
 	}
 	if jsonOut {
 		_, err := stdout.Write(body)
@@ -356,7 +355,7 @@ func backupList(ctx context.Context, configPath string, args []string, stdout, s
 	if kept == "" {
 		kept = "1y"
 	}
-	what := folder
+	what := store
 	if path != "" {
 		what += " " + path
 	}
@@ -383,12 +382,12 @@ func backupList(ctx context.Context, configPath string, args []string, stdout, s
 }
 
 func backupRestore(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "backup restore <folder> <path>", stderr)
+	jsonOut, positional, err := splitFlags(args, "backup restore <store> <path>", stderr)
 	if err != nil {
 		return err
 	}
 	if len(positional) < 2 {
-		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup restore <folder> <path> [--blob HASH] [--at RFC3339] [--to PATH] [--json]")
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup restore <store> <path> [--blob HASH] [--at RFC3339] [--to PATH] [--json]")
 		return ErrHandled
 	}
 	req := struct {
@@ -397,7 +396,7 @@ func backupRestore(ctx context.Context, configPath string, args []string, stdout
 		At   string `json:"at,omitempty"`
 		To   string `json:"to,omitempty"`
 	}{Path: positional[1]}
-	folder := positional[0]
+	store := positional[0]
 
 	// The value flags take an argument, which is why this walks by index.
 	for i := range args {
@@ -413,7 +412,7 @@ func backupRestore(ctx context.Context, configPath string, args []string, stdout
 			continue
 		}
 		if i+1 >= len(args) {
-			return usageErr(stderr, "backup restore <folder> <path>", args[i]+" needs a value")
+			return usageErr(stderr, "backup restore <store> <path>", args[i]+" needs a value")
 		}
 		switch want {
 		case "1":
@@ -429,9 +428,9 @@ func backupRestore(ctx context.Context, configPath string, args []string, stdout
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(folder)+"/restore", req)
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/restore", req)
 	if err != nil {
-		return fmt.Errorf("backup restore %s: %w", folder, err)
+		return fmt.Errorf("backup restore %s: %w", store, err)
 	}
 	if jsonOut {
 		_, err := stdout.Write(body)
@@ -442,11 +441,11 @@ func backupRestore(ctx context.Context, configPath string, args []string, stdout
 		return fmt.Errorf("parse restore result: %w", err)
 	}
 	if res.Copied {
-		fmt.Fprintf(stdout, "%s: wrote the version of %s to %s (the folder is untouched)\n", folder, positional[1], res.Path)
+		fmt.Fprintf(stdout, "%s: wrote the version of %s to %s (the store is untouched)\n", store, positional[1], res.Path)
 		return nil
 	}
 	fmt.Fprintf(stdout, "%s: restored %s from %s; it is a new version and syncs like any other change\n",
-		folder, res.Path, res.At.Format(time.RFC3339))
+		store, res.Path, res.At.Format(time.RFC3339))
 	return nil
 }
 
@@ -462,20 +461,20 @@ func shortBlob(blob string) string {
 	return blob
 }
 
-// sendCmd is the send verb: copy a local file into a folder, which is how a
+// sendCmd is the send verb: copy a local file into a store, which is how a
 // share sheet and a desktop both put a file on the mesh. The daemon does the
 // copying, so the file must be one it can see — the same machine, in
 // practice. Nothing is overwritten: a taken name is parked and reported.
 func sendCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "send <folder> <file>", stderr)
+	jsonOut, positional, err := splitFlags(args, "send <store> <file>", stderr)
 	if err != nil {
 		return err
 	}
 	if len(positional) < 2 {
-		fmt.Fprintln(stderr, "storeboard: usage: storeboard send <folder> <file> [--as PATH] [--json]")
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard send <store> <file> [--as PATH] [--json]")
 		return ErrHandled
 	}
-	folder := positional[0]
+	store := positional[0]
 	req := struct {
 		Source string `json:"source"`
 		Path   string `json:"path,omitempty"`
@@ -487,7 +486,7 @@ func sendCmd(ctx context.Context, configPath string, args []string, stdout, stde
 			continue
 		}
 		if i+1 >= len(args) {
-			return usageErr(stderr, "send <folder> <file>", "--as needs a value")
+			return usageErr(stderr, "send <store> <file>", "--as needs a value")
 		}
 		req.Path = args[i+1]
 	}
@@ -496,9 +495,9 @@ func sendCmd(ctx context.Context, configPath string, args []string, stdout, stde
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(folder)+"/send", req)
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/send", req)
 	if err != nil {
-		return fmt.Errorf("send %s: %w", folder, err)
+		return fmt.Errorf("send %s: %w", store, err)
 	}
 	if jsonOut {
 		_, err := stdout.Write(body)
@@ -510,56 +509,61 @@ func sendCmd(ctx context.Context, configPath string, args []string, stdout, stde
 	}
 	if res.Parked != "" {
 		fmt.Fprintf(stdout, "%s: sent %s (%d bytes); the file already there is parked at %s\n",
-			folder, res.Path, res.Size, res.Parked)
+			store, res.Path, res.Size, res.Parked)
 		return nil
 	}
 	fmt.Fprintf(stdout, "%s: sent %s (%d bytes); it is a new change and syncs like any other\n",
-		folder, res.Path, res.Size)
+		store, res.Path, res.Size)
 	return nil
 }
 
-// folderCmd is the folder verb group: `folder takeover <name>` converts a
-// mount path that is busy because it holds the user's own content into a
-// storeboard mount, moving that content into the folder's offline mount and
-// letting the normal merge take it from there.
-func folderCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+// storeCmd is the store verb group: `store takeover <name>` converts a
+// declared symlink path that is busy because it holds the user's own content
+// into a link to the store, moving that content into the canonical dir and
+// letting the normal scan take it from there.
+func storeCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, "storeboard: usage: storeboard folder takeover <name> [--json]\n")
+		fmt.Fprint(stderr, "storeboard: usage: storeboard store takeover <name> [--json]\n")
 		return ErrHandled
 	}
 	verb, rest := args[0], args[1:]
 	switch verb {
 	case "takeover":
-		return folderTakeover(ctx, configPath, rest, stdout, stderr)
+		return storeTakeover(ctx, configPath, rest, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "storeboard: unknown folder command %q\n\nusage: storeboard folder takeover <name> [--json]\n", verb)
+		fmt.Fprintf(stderr, "storeboard: unknown store command %q\n\nusage: storeboard store takeover <name> [--json]\n", verb)
 		return ErrHandled
 	}
 }
 
-func folderTakeover(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	// Split the positional name from the shared flags: jsonFlag rejects
-	// anything that is not a flag, so it sees only the flags.
-	var name string
+func storeTakeover(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	// Split the positional name from the flags; --path takes a value.
+	var name, linkPath string
 	var flags []string
-	for _, arg := range args {
-		switch arg {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
 		case "--json", "-h", "--help":
-			flags = append(flags, arg)
+			flags = append(flags, args[i])
+		case "--path":
+			if i+1 >= len(args) {
+				return usageErr(stderr, "store takeover <name>", "--path needs a value")
+			}
+			linkPath = args[i+1]
+			i++
 		default:
 			if name != "" {
-				fmt.Fprintf(stderr, "storeboard: folder takeover: unexpected argument %q\n", arg)
+				fmt.Fprintf(stderr, "storeboard: store takeover: unexpected argument %q\n", args[i])
 				return ErrHandled
 			}
-			name = arg
+			name = args[i]
 		}
 	}
-	jsonOut, err := jsonFlag(flags, "folder takeover <name>", stderr)
+	jsonOut, err := jsonFlag(flags, "store takeover <name>", stderr)
 	if err != nil {
 		return err
 	}
 	if name == "" {
-		fmt.Fprintln(stderr, "storeboard: usage: storeboard folder takeover <name> [--json]")
+		fmt.Fprintln(stderr, "storeboard: usage: storeboard store takeover <name> [--path PATH] [--json]")
 		return ErrHandled
 	}
 
@@ -567,7 +571,10 @@ func folderTakeover(ctx context.Context, configPath string, args []string, stdou
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/folders/"+url.PathEscape(name)+"/takeover", nil)
+	req := struct {
+		Path string `json:"path,omitempty"`
+	}{Path: linkPath}
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(name)+"/takeover", req)
 	if err != nil {
 		return fmt.Errorf("takeover %s: %w", name, err)
 	}
@@ -579,15 +586,12 @@ func folderTakeover(ctx context.Context, configPath string, args []string, stdou
 	if err := json.Unmarshal(body, &res); err != nil {
 		return fmt.Errorf("parse takeover result: %w", err)
 	}
-	switch {
-	case res.State == "attached":
-		fmt.Fprintf(stdout, "%s: moved %d entries into the view; the mesh gets them on the next scan\n", res.Folder, res.Moved)
-	case res.Moved == 0:
-		fmt.Fprintf(stdout, "%s: already mounted (%s), nothing to take over\n", res.Folder, res.State)
-	default:
-		fmt.Fprintf(stdout, "%s: moved %d entries into the offline mount (no holder reachable)\n", res.Folder, res.Moved)
-		fmt.Fprintf(stdout, "the merge happens by itself when a holder answers; run `storeboard folder takeover %s` again to retry now\n", res.Folder)
+	if res.Moved == 0 {
+		fmt.Fprintf(stdout, "%s: %s is already a link (%s), nothing to take over\n", res.Store, res.Path, res.State)
+		return nil
 	}
+	fmt.Fprintf(stdout, "%s: moved %d entries from %s into %s; the next scan syncs them\n",
+		res.Store, res.Moved, res.Path, res.Root)
 	return nil
 }
 
@@ -599,6 +603,7 @@ func renderStatus(w io.Writer, st *api.Status) {
 	}
 	fmt.Fprintf(w, "socket  %s\n", st.Socket)
 	fmt.Fprintf(w, "data    %s\n", st.DataDir)
+	fmt.Fprintf(w, "root    %s\n", st.Root)
 
 	fmt.Fprintf(w, "\npeers (%d):\n", len(st.Peers))
 	if len(st.Peers) == 0 {
@@ -617,24 +622,23 @@ func renderStatus(w io.Writer, st *api.Status) {
 		fmt.Fprintln(w, "  (none)")
 	}
 	for _, g := range st.Groups {
-		fmt.Fprintf(w, "  %s\n    peers   %s\n    folders %s\n",
-			g.Name, strings.Join(g.Peers, ", "), strings.Join(g.Folders, ", "))
+		fmt.Fprintf(w, "  %s\n    peers  %s\n    stores %s\n",
+			g.Name, strings.Join(g.Peers, ", "), strings.Join(g.Stores, ", "))
 	}
 
-	fmt.Fprintf(w, "\nfolders (%d):\n", len(st.Folders))
-	if len(st.Folders) == 0 {
+	fmt.Fprintf(w, "\nstores (%d):\n", len(st.Stores))
+	if len(st.Stores) == 0 {
 		fmt.Fprintln(w, "  (none)")
 	}
-	for _, f := range st.Folders {
-		kept := "no"
-		if f.KeepOffline {
-			kept = "yes"
+	for _, s := range st.Stores {
+		where := s.Root
+		if s.Parent != "" {
+			where = s.Parent + "/" + s.Path + " -> " + s.Root
 		}
-		fmt.Fprintf(w, "  %s\n    group %s\n    mount %s\n", f.Name, f.Group, f.Mount)
-		if f.Storage != "" {
-			fmt.Fprintf(w, "    storage %s\n", f.Storage)
+		fmt.Fprintf(w, "  %s\n    group %s\n    sync  %s\n    root  %s\n", s.Name, s.Group, s.Sync, where)
+		if len(s.Symlinks) > 0 {
+			fmt.Fprintf(w, "    links %s\n", strings.Join(s.Symlinks, " "))
 		}
-		fmt.Fprintf(w, "    keepOffline %s\n", kept)
 	}
 
 	fmt.Fprintf(w, "\nconnections (%d):\n", len(st.Connections))
@@ -661,9 +665,9 @@ func renderStatus(w io.Writer, st *api.Status) {
 		if s.Permissions.Mode != "" {
 			detail += fmt.Sprintf(", %s:%s %s", s.Permissions.User, s.Permissions.Group, s.Permissions.Mode)
 		}
-		fmt.Fprintf(w, "  %s\n    %s\n", s.Folder, detail)
+		fmt.Fprintf(w, "  %s\n    %s\n", s.Store, detail)
 		if s.Scanning || s.Pending > 0 || s.Receiving > 0 {
-			// The grind, visible: what a large folder is doing right now.
+			// The grind, visible: what a large store is doing right now.
 			line := fmt.Sprintf("%d/%d local", s.Local, s.Entries)
 			if s.Scanning {
 				line += ", scanning"
@@ -676,17 +680,19 @@ func renderStatus(w io.Writer, st *api.Status) {
 			}
 			fmt.Fprintf(w, "    %s\n", line)
 		}
-		if s.State != "busy" || s.Busy == "" {
-			continue
+		for _, link := range s.Symlinks {
+			if link.State != api.SymlinkBusy {
+				continue
+			}
+			// The path belongs to something else — the one thing the user
+			// needs next is which something, and how to hand it over when it
+			// is their own content.
+			fmt.Fprintf(w, "    not linked: %s (%s)", link.Path, link.Busy)
+			if link.Busy == api.BusyContent {
+				fmt.Fprintf(w, " — storeboard store takeover %s --path %s", s.Store, link.Path)
+			}
+			fmt.Fprintln(w)
 		}
-		// Busy says the path belongs to something else — the one thing the
-		// user needs next is which something, and how to hand it over when
-		// it is their own content.
-		fmt.Fprintf(w, "    not managed: %s", s.Busy)
-		if s.Busy == api.BusyContent {
-			fmt.Fprintf(w, " — storeboard folder takeover %s", s.Folder)
-		}
-		fmt.Fprintln(w)
 	}
 }
 

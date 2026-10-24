@@ -19,7 +19,7 @@ import (
 var recentBlob = 10 * time.Minute
 
 // Collect frees content-store blobs that nothing references any more: not a
-// journal entry, not a kept version, not an orphan journal (a folder removed
+// journal entry, not a kept version, not an orphan journal (a store removed
 // from the config keeps its data — invariant 1 — so its journal on disk still
 // counts as a reference). It runs at startup, when nothing is in flight, and
 // is deliberately conservative: it refuses to act at all if any reference
@@ -28,8 +28,8 @@ var recentBlob = 10 * time.Minute
 func (e *Engine) Collect() (removed int, freed int64) {
 	refs := map[string]bool{}
 
-	// Live journals: everything a folder's current state needs.
-	for _, fs := range e.folders {
+	// Live journals: everything a store's current state needs.
+	for _, fs := range e.stores {
 		for _, ent := range fs.db.All() {
 			if ent.Blob != "" {
 				refs[ent.Blob] = true
@@ -47,7 +47,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 		}
 	}
 
-	// Journals on disk that no loaded folder claims: a folder the config no
+	// Journals on disk that no loaded store claims: a store the config no
 	// longer names still owns its bytes.
 	journalDir := filepath.Join(e.dataDir, "journal")
 	if entries, err := os.ReadDir(journalDir); err == nil {
@@ -56,8 +56,8 @@ func (e *Engine) Collect() (removed int, freed int64) {
 			if filepath.Ext(name) != ".ndjson" {
 				continue
 			}
-			folder := name[:len(name)-len(".ndjson")]
-			if _, loaded := e.byName[folder]; loaded {
+			store := name[:len(name)-len(".ndjson")]
+			if _, loaded := e.byName[store]; loaded {
 				continue
 			}
 			if err := refsFromJournal(filepath.Join(journalDir, name), refs); err != nil {
@@ -67,7 +67,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 		}
 	}
 
-	// History files on disk: a folder whose backup has since been turned off
+	// History files on disk: a store whose backup has since been turned off
 	// keeps its versions reachable-by-re-enabling, so their blobs count as
 	// referenced exactly like an orphan journal's.
 	historyDir := filepath.Join(e.dataDir, "history")
@@ -169,21 +169,21 @@ func listDir(dir string) []string {
 //
 // With no version named it restores the newest recorded one — which is how a
 // deleted file comes back, since the deletion is itself recorded with the
-// content it removed. Restoring into the folder is an ordinary local change:
+// content it removed. Restoring into the store is an ordinary local change:
 // it becomes a new version, propagates like any other, and never replaces
 // anything without keeping what was there (the journal keeps the old blob).
-// With `to` set, the content is written there instead and the folder is left
+// With `to` set, the content is written there instead and the store is left
 // alone.
 //
 // uid is the requesting user, from the socket's peer credentials: root and
-// the folder's owner may restore, nobody else.
+// the store's owner may restore, nobody else.
 func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, to string) (api.RestoreResult, error) {
 	fs := e.byName[name]
 	if fs == nil {
-		return api.RestoreResult{}, fmt.Errorf("unknown folder %q", name)
+		return api.RestoreResult{}, fmt.Errorf("unknown store %q", name)
 	}
 	if fs.hist == nil {
-		return api.RestoreResult{}, fmt.Errorf("folder %q keeps no history on this machine", name)
+		return api.RestoreResult{}, fmt.Errorf("store %q keeps no history on this machine", name)
 	}
 	if !validRel(path) {
 		return api.RestoreResult{}, fmt.Errorf("unsafe path %q", path)
@@ -235,7 +235,7 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 		if err := e.writeBlobTo(fs, to, pick.Blob, pick.Mode, pick.MTime); err != nil {
 			return api.RestoreResult{}, err
 		}
-		return api.RestoreResult{Folder: name, Path: to, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC(), Copied: true}, nil
+		return api.RestoreResult{Store: name, Path: to, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC(), Copied: true}, nil
 	}
 
 	dst := filepath.Join(fs.root, path)
@@ -258,14 +258,14 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	}
 	e.record(fs, ent)
 	e.broadcastIndex(fs, []*Entry{ent})
-	e.logger.Info("restored a version", "folder", name, "path", path,
+	e.logger.Info("restored a version", "store", name, "path", path,
 		"blob", pick.Blob[:8], "at", time.Unix(0, pick.Time).UTC().Format(time.RFC3339))
-	return api.RestoreResult{Folder: name, Path: path, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC()}, nil
+	return api.RestoreResult{Store: name, Path: path, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC()}, nil
 }
 
 // checkOwner is the authorization shared by the acting verbs: root, or the
-// folder's owner.
-func (e *Engine) checkOwner(fs *FolderState, uid int, what string) error {
+// store's owner.
+func (e *Engine) checkOwner(fs *StoreState, uid int, what string) error {
 	fs.scanMu.Lock()
 	perm := e.resolvePerms(fs)
 	fs.scanMu.Unlock()
@@ -276,7 +276,7 @@ func (e *Engine) checkOwner(fs *FolderState, uid int, what string) error {
 	if perm.uid > 0 {
 		owner = fmt.Sprintf("uid %d", perm.uid)
 	}
-	return fmt.Errorf("folder %q belongs to %s: run %s as that user, or as root", fs.name, owner, what)
+	return fmt.Errorf("store %q belongs to %s: run %s as that user, or as root", fs.name, owner, what)
 }
 
 // pruneLoop applies retention until ctx ends: once at startup, then on a
@@ -296,10 +296,10 @@ func (e *Engine) pruneLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// pruneOnce applies every folder's retention schedule and reports what it
+// pruneOnce applies every store's retention schedule and reports what it
 // dropped.
 func (e *Engine) pruneOnce(now time.Time) {
-	for _, fs := range e.folders {
+	for _, fs := range e.stores {
 		e.pruneTrash(fs, now)
 		if fs.hist == nil {
 			continue
@@ -308,7 +308,7 @@ func (e *Engine) pruneOnce(now time.Time) {
 			fs.hist.mu.Lock()
 			pruned := fs.hist.pruned
 			fs.hist.mu.Unlock()
-			e.logger.Info("pruned old versions", "folder", fs.name, "dropped", len(dropped), "totalPruned", pruned)
+			e.logger.Info("pruned old versions", "store", fs.name, "dropped", len(dropped), "totalPruned", pruned)
 		}
 	}
 }
@@ -321,10 +321,10 @@ var pruneInterval = time.Hour
 func (e *Engine) Versions(name, path string) (api.Versions, error) {
 	fs := e.byName[name]
 	if fs == nil {
-		return api.Versions{}, fmt.Errorf("unknown folder %q", name)
+		return api.Versions{}, fmt.Errorf("unknown store %q", name)
 	}
 	if fs.hist == nil {
-		return api.Versions{}, fmt.Errorf("folder %q keeps no history on this machine", name)
+		return api.Versions{}, fmt.Errorf("store %q keeps no history on this machine", name)
 	}
 	if path != "" && !validRel(path) {
 		return api.Versions{}, fmt.Errorf("unsafe path %q", path)
@@ -334,7 +334,7 @@ func (e *Engine) Versions(name, path string) (api.Versions, error) {
 		paths = fs.hist.Paths()
 		sort.Strings(paths)
 	}
-	out := api.Versions{Folder: name, Path: path, Versions: []api.FileVersion{}}
+	out := api.Versions{Store: name, Path: path, Versions: []api.FileVersion{}}
 	if fs.hist.keep > 0 {
 		out.Keep = fs.hist.keep.String()
 	}
@@ -360,11 +360,11 @@ func (e *Engine) Versions(name, path string) (api.Versions, error) {
 }
 
 // pruneTrash applies the same deadline to what deletes left behind: a file in
-// <dataDir>/trash/<folder>/ is content the folder once held, and it lives
+// <dataDir>/trash/<store>/ is content the store once held, and it lives
 // exactly as long as the retention window allows — by its own age, which a
-// move out of the folder preserves. History is the longer-lived safety net:
+// move out of the store preserves. History is the longer-lived safety net:
 // with backup on, the deletion record and its blob outlive the trash copy.
-func (e *Engine) pruneTrash(fs *FolderState, now time.Time) {
+func (e *Engine) pruneTrash(fs *StoreState, now time.Time) {
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
 	keep := fs.keepWindow()
 	var dropped int
@@ -384,11 +384,11 @@ func (e *Engine) pruneTrash(fs *FolderState, now time.Time) {
 	if err != nil || dropped == 0 {
 		return
 	}
-	e.logger.Info("pruned the trash", "folder", fs.name, "files", dropped)
+	e.logger.Info("pruned the trash", "store", fs.name, "files", dropped)
 }
 
-// keepWindow is the retention window this folder runs under.
-func (fs *FolderState) keepWindow() time.Duration {
+// keepWindow is the retention window this store runs under.
+func (fs *StoreState) keepWindow() time.Duration {
 	if fs.hist != nil && fs.hist.keep > 0 {
 		return fs.hist.keep
 	}

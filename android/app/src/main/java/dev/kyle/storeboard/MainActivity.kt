@@ -191,7 +191,7 @@ private fun App() {
     }
 }
 
-/** The status document, rendered: folders, connections, and the peer name. */
+/** The status document, rendered: stores, connections, and the peer name. */
 @Composable
 private fun Summary(status: String) {
     if (status.isEmpty()) {
@@ -205,13 +205,13 @@ private fun Summary(status: String) {
 
     Text("peer ${doc.optString("peer")} (${doc.optString("version")})")
 
-    val folders = doc.optJSONArray("sync")
-    if (folders != null) {
-        for (i in 0 until folders.length()) {
-            val f = folders.optJSONObject(i) ?: continue
+    val sync = doc.optJSONArray("sync")
+    if (sync != null) {
+        for (i in 0 until sync.length()) {
+            val f = sync.optJSONObject(i) ?: continue
             val pending = if (f.has("pending")) ", ${f.optInt("pending")} pending" else ""
             Text(
-                "${f.optString("folder")}: ${f.optString("state")}, " +
+                "${f.optString("store")}: ${f.optString("state")}, " +
                     "${f.optInt("entries")} entries$pending",
                 style = MaterialTheme.typography.bodyMedium,
             )

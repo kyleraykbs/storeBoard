@@ -23,7 +23,7 @@ type Version struct {
 	Deleted bool   `json:"deleted,omitempty"`
 }
 
-// History is a folder's version log: an append-only NDJSON file under the
+// History is a store's version log: an append-only NDJSON file under the
 // data directory, replayed into memory at open (then checkpointed, like the
 // journals) and rewritten only when retention prunes it.
 //
@@ -309,9 +309,9 @@ func VersionOf(e *Entry, at time.Time) Version {
 	}
 }
 
-// record notes a version transition for a folder that keeps history. The
+// record notes a version transition for a store that keeps history. The
 // journal already holds the current state; this is the time series on top.
-func (e *Engine) record(fs *FolderState, ent *Entry) {
+func (e *Engine) record(fs *StoreState, ent *Entry) {
 	if fs.hist == nil || ent == nil {
 		return
 	}

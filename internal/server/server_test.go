@@ -21,28 +21,21 @@ import (
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
-	// Old layout (content at the mount path): most tests predate the storage
-	// directory and assert exactly that; storage-backed tests set their own.
-	noStorage := ""
 	return &config.Config{
 		ConfigVersion: config.ConfigVersion,
+		Root:          filepath.Join(dir, "Storeboard"),
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "storeboard.sock"),
 		Peer:          "laptop",
-		StorageDir:    &noStorage,
 		Peers: map[string]config.Peer{
 			"laptop":  {Endpoints: []string{"192.168.1.10:4242"}},
 			"desktop": {Endpoints: []string{"192.168.1.11:4242"}},
 		},
 		Groups: map[string]config.Group{
-			"family": {
-				Peers: []string{"laptop", "desktop"},
-				Folders: map[string]config.GroupFolder{
-					"photos": {Mount: "/home/kyle/Pictures"},
-				},
-			},
+			"family": {Peers: []string{"laptop", "desktop"}},
 		},
-		Mounts: map[string]string{},
+		StoreTree:   map[string]config.Store{"photos": {Group: "family"}},
+		Permissions: map[string]config.Permissions{},
 	}
 }
 
@@ -139,16 +132,15 @@ func TestStatusDocument(t *testing.T) {
 		t.Errorf("peers = %+v, want two", st.Peers)
 	}
 	if len(st.Groups) != 1 || st.Groups[0].Name != "family" ||
-		len(st.Groups[0].Folders) != 1 || st.Groups[0].Folders[0] != "photos" {
+		len(st.Groups[0].Stores) != 1 || st.Groups[0].Stores[0] != "photos" {
 		t.Errorf("groups = %+v, want family owning photos", st.Groups)
 	}
-	if len(st.Folders) != 1 || st.Folders[0].Name != "photos" ||
-		st.Folders[0].Group != "family" || st.Folders[0].Mount != "/home/kyle/Pictures" {
-		t.Errorf("folders = %+v, want photos in family at its group mount", st.Folders)
+	if len(st.Stores) != 1 || st.Stores[0].Name != "photos" ||
+		st.Stores[0].Group != "family" || st.Stores[0].Sync != config.SyncLocal {
+		t.Errorf("stores = %+v, want photos in family, local", st.Stores)
 	}
-	// Undeclared in KeepOffline means keep a replica.
-	if !st.Folders[0].KeepOffline {
-		t.Error("photos: keepOffline = false, want the keep default")
+	if want := filepath.Join(cfg.Root, "photos"); st.Stores[0].Root != want {
+		t.Errorf("photos root = %q, want %q", st.Stores[0].Root, want)
 	}
 	// The transport manager reports the declared other peer even before the
 	// wire is live (it is dialing or backing off).
@@ -157,9 +149,10 @@ func TestStatusDocument(t *testing.T) {
 	}
 }
 
-func TestStatusDocumentFoldersAlwaysAnArray(t *testing.T) {
+func TestStatusDocumentStoresAlwaysAnArray(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Groups = map[string]config.Group{}
+	cfg.StoreTree = map[string]config.Store{}
 	srv, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -168,8 +161,8 @@ func TestStatusDocumentFoldersAlwaysAnArray(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	srv.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
-	if !strings.Contains(rec.Body.String(), `"folders":[]`) {
-		t.Fatalf("folders missing or null: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"stores":[]`) {
+		t.Fatalf("stores missing or null: %s", rec.Body.String())
 	}
 }
 
@@ -266,11 +259,7 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(busy, "mine.txt"), []byte("local"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g := cfg.Groups["family"]
-	g.Folders["docs"] = config.GroupFolder{}
-	cfg.Groups["family"] = g
-	cfg.Mounts = map[string]string{"docs": busy}
-	cfg.KeepOffline = map[string]bool{"docs": false}
+	cfg.StoreTree["docs"] = config.Store{Group: "family", Sync: config.SyncRemote, Symlinks: []string{busy}}
 
 	srv, err := New(cfg, nil)
 	if err != nil {
@@ -300,9 +289,14 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 		if json.NewDecoder(resp.Body).Decode(&st) != nil {
 			return false
 		}
-		for _, f := range st.Sync {
-			if f.Folder == "docs" {
-				return f.State == "busy" && f.Busy == api.BusyContent
+		for _, s := range st.Sync {
+			if s.Store != "docs" {
+				continue
+			}
+			for _, l := range s.Symlinks {
+				if l.Path == busy {
+					return l.State == api.SymlinkBusy && l.Busy == api.BusyContent
+				}
 			}
 		}
 		return false
@@ -315,7 +309,7 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	resp, err := client.Post("http://storeboard/v1/folders/docs/takeover", "", nil)
+	resp, err := client.Post("http://storeboard/v1/stores/docs/takeover", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,13 +322,16 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Moved != 1 || res.State != "detached" {
-		t.Fatalf("takeover = %+v, want one entry moved and a detached mount", res)
+		t.Fatalf("takeover = %+v, want one entry moved and a remote store detached", res)
 	}
 	if fi, err := os.Lstat(busy); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("mount path is not a symlink after takeover: %v %v", fi, err)
+		t.Fatalf("declared path is not a symlink after takeover: %v %v", fi, err)
 	}
 	if b, err := os.ReadFile(filepath.Join(busy, "mine.txt")); err != nil || string(b) != "local" {
-		t.Fatalf("content not readable through the offline mount: %q %v", b, err)
+		t.Fatalf("content not readable through the link: %q %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(cfg.Root, "docs", "mine.txt")); err != nil || string(b) != "local" {
+		t.Fatalf("content not in the canonical dir: %q %v", b, err)
 	}
 }
 
@@ -350,7 +347,7 @@ func TestTakeoverNeedsPeerCreds(t *testing.T) {
 
 	ts := httptest.NewServer(srv.handler())
 	defer ts.Close()
-	resp, err := http.Post(ts.URL+"/v1/folders/photos/takeover", "", nil)
+	resp, err := http.Post(ts.URL+"/v1/stores/photos/takeover", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,8 +362,7 @@ func TestTakeoverNeedsPeerCreds(t *testing.T) {
 // instead of losing it, and the answer says where it went.
 func TestSendOverUnixSocket(t *testing.T) {
 	cfg := testConfig(t)
-	mount := filepath.Join(t.TempDir(), "pictures")
-	cfg.Mounts = map[string]string{"photos": mount}
+	root := filepath.Join(cfg.Root, "photos")
 
 	srv, err := New(cfg, nil)
 	if err != nil {
@@ -393,7 +389,7 @@ func TestSendOverUnixSocket(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp, err := client.Post("http://storeboard/v1/folders/photos/send", "application/json", strings.NewReader(string(body)))
+		resp, err := client.Post("http://storeboard/v1/stores/photos/send", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -416,7 +412,7 @@ func TestSendOverUnixSocket(t *testing.T) {
 	if res.Path != "shared/holiday.txt" || res.Parked != "" || res.Size != 5 {
 		t.Fatalf("send = %+v", res)
 	}
-	if b, err := os.ReadFile(filepath.Join(mount, "shared", "holiday.txt")); err != nil || string(b) != "first" {
+	if b, err := os.ReadFile(filepath.Join(root, "shared", "holiday.txt")); err != nil || string(b) != "first" {
 		t.Fatalf("sent content = %q, %v", b, err)
 	}
 
@@ -429,10 +425,10 @@ func TestSendOverUnixSocket(t *testing.T) {
 	if res.Parked == "" {
 		t.Fatalf("second send = %+v, want the first file parked", res)
 	}
-	if b, err := os.ReadFile(filepath.Join(mount, "shared", "holiday.txt")); err != nil || string(b) != "second" {
+	if b, err := os.ReadFile(filepath.Join(root, "shared", "holiday.txt")); err != nil || string(b) != "second" {
 		t.Fatalf("destination = %q, %v; want the new content", b, err)
 	}
-	if b, err := os.ReadFile(filepath.Join(mount, res.Parked)); err != nil || string(b) != "first" {
+	if b, err := os.ReadFile(filepath.Join(root, res.Parked)); err != nil || string(b) != "first" {
 		t.Fatalf("parked = %q, %v; want the old content kept", b, err)
 	}
 }

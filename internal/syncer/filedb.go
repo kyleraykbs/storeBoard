@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-// Entry is one file's journal record: where it is in a folder, what bytes it
+// Entry is one file's journal record: where it is in a store, what bytes it
 // holds, and the version vector that orders it against other peers'
 // versions (DESIGN invariant 5).
 type Entry struct {
@@ -40,7 +40,7 @@ type record struct {
 	Entry *Entry `json:"entry,omitempty"`
 }
 
-// FileDB is a folder's journal: an append-only NDJSON log replayed into an
+// FileDB is a store's journal: an append-only NDJSON log replayed into an
 // in-memory index at open (then checkpointed, so the log never grows past
 // one session's changes), with one version-vector counter for this machine.
 type FileDB struct {

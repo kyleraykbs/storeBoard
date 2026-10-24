@@ -30,11 +30,12 @@ func setXDG(t *testing.T) (dataHome, runtimeDir string) {
 	return dataHome, runtimeDir
 }
 
-// valid returns the baseline model: this peer, two more devices, one group
-// with two folders, one local mount override.
+// valid returns the baseline model: this peer, two more devices, two groups,
+// two top-level stores, one child, one external symlink.
 func valid() *Config {
 	return &Config{
 		ConfigVersion: ConfigVersion,
+		Root:          "/home/kyle/Storeboard",
 		DataDir:       "/var/lib/storeboard",
 		Socket:        "/run/storeboard.sock",
 		Peer:          "laptop",
@@ -44,26 +45,32 @@ func valid() *Config {
 			"phone":   {Endpoints: []string{}},
 		},
 		Groups: map[string]Group{
-			"family": {
-				Peers: []string{"laptop", "desktop", "phone"},
-				Folders: map[string]GroupFolder{
-					"photos":    {Mount: "/home/kyle/Pictures"},
-					"documents": {},
+			"family": {Peers: []string{"laptop", "desktop", "phone"}},
+			"media":  {Peers: []string{"laptop", "desktop"}},
+		},
+		StoreTree: map[string]Store{
+			"pictures": {
+				Group: "family",
+				Stores: map[string]Store{
+					"bulk": {Group: "media", Sync: SyncRemote, Path: "Bulk"},
 				},
 			},
+			"documents": {
+				Group:    "family",
+				Symlinks: []string{"/home/kyle/Documents"},
+			},
 		},
-		Mounts:      map[string]string{"documents": "/mnt/docs"},
-		KeepOffline: map[string]bool{},
+		Permissions: map[string]Permissions{},
 	}
 }
 
 func TestLoadRejectsUnknownKeys(t *testing.T) {
-	path := writeConfig(t, `{"configVersion": 1, "folars": {}}`)
+	path := writeConfig(t, `{"configVersion": 2, "strs": {}}`)
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("unknown key accepted")
 	}
-	if !strings.Contains(err.Error(), "folars") {
+	if !strings.Contains(err.Error(), "strs") {
 		t.Fatalf("error does not name the bad key: %v", err)
 	}
 }
@@ -79,6 +86,10 @@ func TestLoadFillsDefaultsAndClaimsHostname(t *testing.T) {
 	if cfg.ConfigVersion != ConfigVersion {
 		t.Errorf("configVersion = %d, want %d", cfg.ConfigVersion, ConfigVersion)
 	}
+	home, _ := os.UserHomeDir()
+	if want := filepath.Join(home, "Storeboard"); cfg.Root != want {
+		t.Errorf("root = %q, want %q", cfg.Root, want)
+	}
 	if want := filepath.Join(dataHome, "storeboard"); cfg.DataDir != want {
 		t.Errorf("dataDir = %q, want %q", cfg.DataDir, want)
 	}
@@ -92,7 +103,7 @@ func TestLoadFillsDefaultsAndClaimsHostname(t *testing.T) {
 	if _, ok := cfg.Peers[cfg.Peer]; !ok {
 		t.Errorf("peer %q not registered in peers: %#v", cfg.Peer, cfg.Peers)
 	}
-	if cfg.Groups == nil || cfg.Mounts == nil {
+	if cfg.Groups == nil || cfg.StoreTree == nil || cfg.Permissions == nil {
 		t.Error("maps must be non-nil after load")
 	}
 }
@@ -125,7 +136,7 @@ func TestLoadRejectsTrailingData(t *testing.T) {
 
 func TestLoadFillsBlankStringsFromDefaults(t *testing.T) {
 	_, runtimeDir := setXDG(t)
-	path := writeConfig(t, `{"configVersion": 1, "socket": ""}`)
+	path := writeConfig(t, `{"configVersion": 2, "socket": ""}`)
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -138,19 +149,24 @@ func TestLoadFillsBlankStringsFromDefaults(t *testing.T) {
 
 func TestLoadFullModel(t *testing.T) {
 	path := writeConfig(t, `{
-		"configVersion": 1,
+		"configVersion": 2,
+		"root": "/srv/board",
 		"peer": "laptop",
 		"peers": {
 			"laptop":  { "endpoints": ["192.168.1.10:4242"] },
 			"desktop": { "endpoints": ["192.168.1.11:4242"] }
 		},
 		"groups": {
-			"family": {
-				"peers": ["laptop", "desktop"],
-				"folders": { "photos": { "mount": "/home/alice/Pictures" } }
-			}
+			"family": { "peers": ["laptop", "desktop"] },
+			"media":  { "peers": ["laptop"] }
 		},
-		"mounts": {}
+		"stores": {
+			"pictures": {
+				"group": "family",
+				"stores": { "bulk": { "group": "media", "sync": "remote" } }
+			},
+			"documents": { "group": "family", "symlinks": ["/home/alice/Documents"] }
+		}
 	}`)
 
 	cfg, err := Load(path)
@@ -160,12 +176,19 @@ func TestLoadFullModel(t *testing.T) {
 	if cfg.Peer != "laptop" {
 		t.Errorf("peer = %q, want laptop", cfg.Peer)
 	}
-	g, ok := cfg.Groups["family"]
+	bulk, ok := cfg.StoreView("bulk")
 	if !ok {
-		t.Fatalf("groups = %#v, want family", cfg.Groups)
+		t.Fatalf("bulk not resolved: %#v", cfg.StoreViews())
 	}
-	if g.Folders["photos"].Mount != "/home/alice/Pictures" {
-		t.Errorf("photos mount = %q", g.Folders["photos"].Mount)
+	if bulk.Parent != "pictures" || bulk.Path != "bulk" || bulk.Sync != SyncRemote {
+		t.Errorf("bulk = %+v, want parent pictures, path bulk, remote", bulk)
+	}
+	if want := filepath.Join("/srv/board", "bulk"); bulk.Dir != want {
+		t.Errorf("bulk dir = %q, want %q", bulk.Dir, want)
+	}
+	docs, _ := cfg.StoreView("documents")
+	if len(docs.Symlinks) != 1 || docs.Symlinks[0] != "/home/alice/Documents" {
+		t.Errorf("documents symlinks = %v", docs.Symlinks)
 	}
 }
 
@@ -176,7 +199,9 @@ func TestValidate(t *testing.T) {
 		wantErr string
 	}{
 		{"valid", func(c *Config) {}, ""},
-		{"wrong config version", func(c *Config) { c.ConfigVersion = 2 }, "configVersion"},
+		{"wrong config version", func(c *Config) { c.ConfigVersion = 1 }, "configVersion"},
+		{"empty root", func(c *Config) { c.Root = "" }, "root"},
+		{"relative root", func(c *Config) { c.Root = "Storeboard" }, "absolute"},
 		{"empty data dir", func(c *Config) { c.DataDir = "" }, "dataDir"},
 		{"relative data dir", func(c *Config) { c.DataDir = "var/lib" }, "absolute"},
 		{"empty socket", func(c *Config) { c.Socket = "" }, "socket"},
@@ -193,41 +218,63 @@ func TestValidate(t *testing.T) {
 		{"endpoint with dead port", func(c *Config) {
 			c.Peers["laptop"] = Peer{Endpoints: []string{"192.168.1.10:0"}}
 		}, "1-65535"},
-		{"group without peers", func(c *Config) { c.Groups["family"] = Group{Peers: nil, Folders: map[string]GroupFolder{"photos": {}}} }, "no peers"},
+		{"group without peers", func(c *Config) { c.Groups["family"] = Group{} }, "no peers"},
 		{"group with unknown peer", func(c *Config) {
-			c.Groups["family"] = Group{Peers: []string{"laptop", "stranger"}, Folders: map[string]GroupFolder{"photos": {}}}
+			c.Groups["family"] = Group{Peers: []string{"laptop", "stranger"}}
 		}, "unknown peer"},
 		{"group without this peer", func(c *Config) {
-			c.Groups["family"] = Group{Peers: []string{"desktop", "phone"}, Folders: map[string]GroupFolder{"photos": {}}}
+			c.Groups["family"] = Group{Peers: []string{"desktop", "phone"}}
 		}, "not a member"},
-		{"duplicate folder across groups", func(c *Config) {
-			c.Groups["work"] = Group{
-				Peers:   []string{"laptop", "desktop"},
-				Folders: map[string]GroupFolder{"photos": {}},
-			}
-		}, "global"},
-		{"relative group mount", func(c *Config) {
-			c.Groups["family"] = Group{
-				Peers:   []string{"laptop", "desktop", "phone"},
-				Folders: map[string]GroupFolder{"photos": {Mount: "Pictures"}},
-			}
-		}, "absolute"},
-		{"folder name is a path", func(c *Config) {
-			c.Groups["family"] = Group{
-				Peers:   []string{"laptop", "desktop", "phone"},
-				Folders: map[string]GroupFolder{"a/b": {}},
-			}
+		{"top-level store without group", func(c *Config) {
+			c.StoreTree["loose"] = Store{}
+		}, "no group"},
+		{"store with unknown group", func(c *Config) {
+			c.StoreTree["loose"] = Store{Group: "ghost"}
+		}, "unknown group"},
+		{"bad sync type", func(c *Config) {
+			c.StoreTree["loose"] = Store{Group: "family", Sync: "sometimes"}
+		}, "sync"},
+		{"top-level path", func(c *Config) {
+			c.StoreTree["loose"] = Store{Group: "family", Path: "Place"}
+		}, "top level"},
+		{"absolute child path", func(c *Config) {
+			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "/Bulk"}
+		}, "relative"},
+		{"escaping child path", func(c *Config) {
+			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "../Bulk"}
+		}, "clean relative"},
+		{"duplicate sibling paths", func(c *Config) {
+			c.StoreTree["pictures"].Stores["bulk"] = Store{Path: "Same"}
+			c.StoreTree["pictures"].Stores["other"] = Store{Path: "Same"}
+		}, "both appear"},
+		{"duplicate id across the tree", func(c *Config) {
+			c.StoreTree["pictures"].Stores["documents"] = Store{}
+		}, "twice"},
+		{"store name is a path", func(c *Config) {
+			c.StoreTree["a/b"] = Store{Group: "family"}
 		}, "identifier"},
-		{"mount override for unknown folder", func(c *Config) {
-			c.Mounts["ghost"] = "/mnt/ghost"
-		}, "unknown folder"},
-		{"relative mount override", func(c *Config) { c.Mounts["photos"] = "pics" }, "absolute"},
-		{"keepOffline for unknown folder", func(c *Config) {
-			c.KeepOffline["ghost"] = false
-		}, "unknown folder"},
-		{"stream instead of keep", func(c *Config) {
-			c.KeepOffline["documents"] = false
-		}, ""},
+		{"relative symlink", func(c *Config) {
+			c.StoreTree["documents"] = Store{Group: "family", Symlinks: []string{"Documents"}}
+		}, "absolute"},
+		{"symlink inside root", func(c *Config) {
+			c.StoreTree["documents"] = Store{Group: "family", Symlinks: []string{"/home/kyle/Storeboard/Documents"}}
+		}, "overlaps root"},
+		{"symlink above root", func(c *Config) {
+			c.StoreTree["documents"] = Store{Group: "family", Symlinks: []string{"/home/kyle"}}
+		}, "overlaps root"},
+		{"duplicate symlink", func(c *Config) {
+			c.StoreTree["pictures"] = Store{Group: "family", Symlinks: []string{"/home/kyle/Documents"}}
+		}, "claim symlink"},
+		{"nested symlinks", func(c *Config) {
+			c.StoreTree["documents"] = Store{Group: "family", Symlinks: []string{"/home/kyle/Documents"}}
+			c.StoreTree["pictures"] = Store{Group: "family", Symlinks: []string{"/home/kyle/Documents/Old"}}
+		}, "nest"},
+		{"backup for unknown store", func(c *Config) {
+			c.Backup = &Backup{Enable: true, Stores: map[string]bool{"ghost": false}}
+		}, "unknown store"},
+		{"permissions for unknown store", func(c *Config) {
+			c.Permissions["ghost"] = Permissions{User: "kyle"}
+		}, "unknown store"},
 	}
 
 	for _, tt := range tests {
@@ -248,85 +295,63 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-func TestMountPrecedence(t *testing.T) {
+// Undeclared -> follow the parent; declared -> do our own thing.
+func TestInheritance(t *testing.T) {
 	cfg := valid()
-	cfg.DataDir = "/var/lib/storeboard"
-
-	byName := map[string]struct{ group, mount string }{}
-	for _, f := range cfg.Folders() {
-		byName[f.Name] = struct{ group, mount string }{f.Group, f.Mount}
+	cfg.StoreTree["pictures"] = Store{
+		Group:       "family",
+		Sync:        SyncLocal,
+		Permissions: &Permissions{Group: "users", Mode: "0770"},
+		Stores: map[string]Store{
+			"bulk":  {}, // inherits everything
+			"media": {Group: "media", Sync: SyncRemote, Path: "Media", Permissions: &Permissions{User: "kyle"}},
+		},
 	}
-
-	// Local override beats the group's default mount.
-	if got := byName["documents"]; got.mount != "/mnt/docs" {
-		t.Errorf("documents mount = %q, want the local override /mnt/docs", got.mount)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
 	}
-	// The group default applies when the peer declares no override.
-	if got := byName["photos"]; got.mount != "/home/kyle/Pictures" {
-		t.Errorf("photos mount = %q, want the group default", got.mount)
+	bulk, _ := cfg.StoreView("bulk")
+	if bulk.Group != "family" || bulk.Sync != SyncLocal || bulk.Path != "bulk" {
+		t.Errorf("bulk = %+v, want the parent's group and sync, its own name as path", bulk)
 	}
-	// Nothing declared: the folder lands inside the one storage directory.
-	cfg.Mounts = map[string]string{}
-	if got := byName["documents"]; got.mount != "/mnt/docs" {
-		t.Errorf("precondition broken: %q", got.mount)
+	if bulk.Permissions == nil || bulk.Permissions.Group != "users" || bulk.Permissions.Mode != "0770" {
+		t.Errorf("bulk permissions = %+v, want the parent's", bulk.Permissions)
 	}
-	cfg.Groups["family"] = Group{
-		Peers:   []string{"laptop", "desktop", "phone"},
-		Folders: map[string]GroupFolder{"documents": {}},
+	media, _ := cfg.StoreView("media")
+	if media.Group != "media" || media.Sync != SyncRemote || media.Path != "Media" {
+		t.Errorf("media = %+v, want its own declarations", media)
 	}
-	for _, f := range cfg.Folders() {
-		if f.Name == "documents" {
-			if want := cfg.DefaultMountDir("documents"); f.Mount != want {
-				t.Errorf("undeclared mount = %q, want the storage-dir default %q", f.Mount, want)
-			}
-			if f.Group != "family" {
-				t.Errorf("group = %q, want family", f.Group)
-			}
-		}
-	}
-
-	// KeepOffline: undeclared means keep a replica.
-	for _, f := range cfg.Folders() {
-		if !f.KeepOffline {
-			t.Errorf("folder %q: keepOffline = false, want the keep default", f.Name)
-		}
-	}
-	// Declared false streams the folder instead of replicating it.
-	cfg.KeepOffline["documents"] = false
-	for _, f := range cfg.Folders() {
-		if f.Name == "documents" && f.KeepOffline {
-			t.Error("documents: keepOffline = true, want the declared false")
-		}
+	if media.Permissions == nil || media.Permissions.User != "kyle" || media.Permissions.Group != "users" {
+		t.Errorf("media permissions = %+v, want user kyle over inherited group users", media.Permissions)
 	}
 }
 
-func TestViewsAreSortedAndNonNil(t *testing.T) {
+func TestStoreViewsAreSortedAndNonNil(t *testing.T) {
 	cfg := valid()
-	cfg.Peers["alpha"] = Peer{Endpoints: []string{}}
-	cfg.Groups["aaa"] = Group{Peers: []string{"laptop", "desktop", "phone"}, Folders: map[string]GroupFolder{}}
 
-	peers := cfg.PeerList()
-	if len(peers) != 4 || peers[0].Name != "alpha" || peers[3].Name != "phone" {
-		t.Errorf("peers not sorted: %#v", peers)
+	views := cfg.StoreViews()
+	if len(views) != 3 || views[0].ID != "bulk" || views[1].ID != "documents" || views[2].ID != "pictures" {
+		t.Errorf("views not sorted: %#v", views)
 	}
-	groups := cfg.GroupList()
-	if len(groups) != 2 || groups[0].Name != "aaa" || groups[1].Name != "family" {
-		t.Errorf("groups not sorted: %#v", groups)
+	stores := cfg.Stores()
+	if len(stores) != 3 || stores[0].Name != "bulk" {
+		t.Errorf("stores not sorted: %#v", stores)
 	}
-	folders := cfg.Folders()
-	if len(folders) != 2 || folders[0].Name != "documents" || folders[1].Name != "photos" {
-		t.Errorf("folders not sorted: %#v", folders)
+	for _, s := range stores {
+		if s.Symlinks == nil {
+			t.Errorf("store %q: nil symlinks; the contract says arrays", s.Name)
+		}
 	}
 
-	empty := &Config{ConfigVersion: ConfigVersion, DataDir: "/d", Socket: "/s", Peers: map[string]Peer{}, Groups: map[string]Group{}, Mounts: map[string]string{}}
+	empty := &Config{ConfigVersion: ConfigVersion, Root: "/r", DataDir: "/d", Socket: "/s", Peers: map[string]Peer{}, Groups: map[string]Group{}}
 	if peers := empty.PeerList(); peers == nil {
-		t.Error("Peers() nil on empty config")
+		t.Error("PeerList nil on empty config")
 	}
 	if groups := empty.GroupList(); groups == nil {
-		t.Error("Groups() nil on empty config")
+		t.Error("GroupList nil on empty config")
 	}
-	if folders := empty.Folders(); folders == nil {
-		t.Error("Folders() nil on empty config")
+	if stores := empty.Stores(); stores == nil {
+		t.Error("Stores nil on empty config")
 	}
 }
 
@@ -396,64 +421,62 @@ func TestResolvePathUserFileBeatsEnvironment(t *testing.T) {
 
 func TestPermissionsPrecedenceAndValidation(t *testing.T) {
 	path := writeConfig(t, `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "/home/kyle/Storeboard",
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
   "socket": "/run/storeboard.sock",
   "groups": {
     "family": {
       "peers": ["laptop"],
-      "folders": {"photos": {}, "documents": {}},
       "permissions": {"group": "users", "mode": "2770"}
     }
   },
-  "permissions": {"photos": {"user": "kyle", "mode": "0755"}}
+  "stores": {"photos": {"group": "family"}}
 }`)
 	if _, err := Load(path); err == nil {
 		t.Fatal("mode 2770: setgid is not a directory mode this config accepts")
 	}
 
 	path = writeConfig(t, `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "/home/kyle/Storeboard",
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
   "socket": "/run/storeboard.sock",
-  "groups": {
-    "family": {
-      "peers": ["laptop"],
-      "folders": {"photos": {}, "documents": {}},
-      "permissions": {"group": "users", "mode": "0770"}
-    }
-  },
+  "groups": {"family": {"peers": ["laptop"], "permissions": {"group": "users", "mode": "0770"}}},
+  "stores": {"photos": {"group": "family"}, "documents": {"group": "family", "permissions": {"mode": "0750"}}},
   "permissions": {"photos": {"user": "kyle"}}
 }`)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := cfg.PermissionsFor("photos", "family")
+	got := cfg.PermissionsFor("photos")
 	if got == nil || got.User != "kyle" || got.Group != "users" || got.Mode != "0770" {
-		t.Fatalf("photos permissions = %+v, want kyle/users/0770 (local field over group default)", got)
+		t.Fatalf("photos permissions = %+v, want kyle/users/0770 (machine field over group default)", got)
 	}
-	if got := cfg.PermissionsFor("documents", "family"); got == nil || got.User != "" || got.Mode != "0770" {
-		t.Fatalf("documents permissions = %+v, want the group's default alone", got)
+	if got := cfg.PermissionsFor("documents"); got == nil || got.User != "" || got.Mode != "0750" {
+		t.Fatalf("documents permissions = %+v, want the store's own mode over the group default", got)
 	}
 
 	cases := []struct {
 		name, body, want string
 	}{
-		{"unknown folder", `"nope": {"user": "kyle"}`, "unknown folder"},
+		{"unknown store", `"nope": {"user": "kyle"}`, "unknown store"},
 		{"bad mode", `"photos": {"mode": "99"}`, "mode"},
-		{"colon list", `"photos": {"user": "kyle:root"}`, "colon list"},
+		{"colon list", `"photos": {"user": "kyle:root"}`, "name or uid"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			path := writeConfig(t, `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "/home/kyle/Storeboard",
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
   "socket": "/run/storeboard.sock",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"photos": {}}}},
+  "groups": {"family": {"peers": ["laptop"]}},
+  "stores": {"photos": {"group": "family"}},
   "permissions": {`+c.body+`}
 }`)
 			_, err := Load(path)
@@ -478,152 +501,6 @@ func TestParseMode(t *testing.T) {
 	}
 }
 
-func TestNestedMountsWarnAndDuplicatesFail(t *testing.T) {
-	// An empty storageDir is the original layout: content at the mount path,
-	// roots can nest. The default (a storage directory) makes them disjoint,
-	// which the second half of this test pins.
-	base := `{
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "storageDir": "",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "pool": {}, "other": {}}}},
-  "mounts": %s
-}`
-	path := writeConfig(t, fmt.Sprintf(base, `{"docs": "/mainpool/kyle/docs", "pool": "/mainpool", "other": "/srv/other"}`))
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("nested mounts are a deliberate tradeoff, not an error: %v", err)
-	}
-	warns := cfg.Warnings()
-	if len(warns) != 1 || !strings.Contains(warns[0], "nested") && !strings.Contains(warns[0], "contains") {
-		t.Fatalf("warnings = %v, want one about the nesting", warns)
-	}
-
-	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs", "other": "/srv/other"}`))
-	_, err = Load(path)
-	if err == nil || !strings.Contains(err.Error(), "both mount") {
-		t.Fatalf("err = %v, want two folders on one path rejected", err)
-	}
-
-	// Siblings that merely share a prefix are not nesting.
-	path = writeConfig(t, fmt.Sprintf(base, `{"docs": "/srv/docs", "pool": "/srv/docs-archive", "other": "/srv/other"}`))
-	sib, err := Load(path)
-	if err != nil {
-		t.Fatalf("sibling mounts rejected: %v", err)
-	}
-	if w := sib.Warnings(); len(w) != 0 {
-		t.Fatalf("siblings warned: %v", w)
-	}
-}
-
-func TestStorageDirResolution(t *testing.T) {
-	base := `{
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "storageDir": "/srv/store",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "media": {}}, %s}},
-  "mounts": {"docs": "/mnt/docs", "media": "/mnt/media"}
-}`
-
-	// Machine storage applies to every folder; the group's override wins for
-	// its own folders only.
-	path := writeConfig(t, fmt.Sprintf(base, `"storageDir": "/pool"`))
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := cfg.FolderRoot("docs", "family"), "/pool/docs"; got != want {
-		t.Errorf("docs root = %q, want the group's storage %q", got, want)
-	}
-	if got, want := cfg.FolderMount("docs", "family"), "/mnt/docs"; got != want {
-		t.Errorf("docs mount = %q, want %q", got, want)
-	}
-	// Storage roots are disjoint by construction, so nesting mounts do not
-	// warn any more.
-	if w := cfg.Warnings(); len(w) != 0 {
-		t.Errorf("storage-backed folders warned: %v", w)
-	}
-	folders := cfg.Folders()
-	for _, f := range folders {
-		if f.Storage == "" {
-			t.Errorf("folder %q has no storage in the view: %+v", f.Name, f)
-		}
-	}
-
-	// An explicit empty storageDir is the original layout: content at
-	// the mount path.
-	path = writeConfig(t, `{
-  "storageDir": "",
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}},
-  "mounts": {"docs": "/mnt/docs"}
-}`)
-	cfg, err = Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := cfg.FolderRoot("docs", "family"), "/mnt/docs"; got != want {
-		t.Errorf("docs root = %q, want the mount %q when no storage is declared", got, want)
-	}
-
-	// A mount that is its own storage root is a self-symlink: rejected.
-	path = writeConfig(t, `{
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "storageDir": "/srv/store",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}},
-  "mounts": {"docs": "/srv/store/docs"}
-}`)
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "mount and storage") {
-		t.Fatalf("err = %v, want a self-symlink mount rejected", err)
-	}
-
-	// Relative storage is not a path the daemon can use.
-	path = writeConfig(t, `{
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "storageDir": "store",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}}}}
-}`)
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "must be absolute") {
-		t.Fatalf("err = %v, want a relative storageDir rejected", err)
-	}
-}
-
-// The default is a storage directory: roots are then <storageDir>/<folder>,
-// disjoint by construction, so mounts may nest without costing anything.
-func TestDefaultStorageMakesRootsDisjoint(t *testing.T) {
-	path := writeConfig(t, `{
-  "configVersion": 1,
-  "peer": "laptop",
-  "dataDir": "/var/lib/storeboard",
-  "socket": "/run/storeboard.sock",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "pool": {}}}},
-  "mounts": {"docs": "/mainpool/kyle/docs", "pool": "/mainpool"}
-}`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := cfg.FolderRoot("docs", "family"), "/var/lib/storeboard/storage/docs"; got != want {
-		t.Errorf("docs root = %q, want the default storage %q", got, want)
-	}
-	if w := cfg.Warnings(); len(w) != 0 {
-		t.Errorf("storage-backed roots warned: %v", w)
-	}
-}
-
 func TestParseKeep(t *testing.T) {
 	day := 24 * time.Hour
 	cases := map[string]time.Duration{
@@ -632,7 +509,7 @@ func TestParseKeep(t *testing.T) {
 		"90d": 90 * day,
 		"4w":  28 * day,
 		"36h": 36 * time.Hour,
-		"":    0, // the default, resolved by the daemon
+		"":    DefaultKeep,
 	}
 	for in, want := range cases {
 		got, err := ParseKeep(in)
@@ -649,16 +526,18 @@ func TestParseKeep(t *testing.T) {
 
 func TestBackupConfig(t *testing.T) {
 	base := `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "/home/kyle/Storeboard",
   "peer": "laptop",
   "dataDir": "/var/lib/storeboard",
   "socket": "/run/storeboard.sock",
-  "groups": {"family": {"peers": ["laptop"], "folders": {"docs": {}, "media": {}}}},
+  "groups": {"family": {"peers": ["laptop"]}},
+  "stores": {"docs": {"group": "family"}, "media": {"group": "family"}},
   %s
 }`
 
 	// No block: no history anywhere.
-	path := writeConfig(t, fmt.Sprintf(base, `"storageDir": ""`))
+	path := writeConfig(t, fmt.Sprintf(base, `"permissions": {}`))
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -667,8 +546,8 @@ func TestBackupConfig(t *testing.T) {
 		t.Fatalf("BackupFor without a block = %v, %v; want off", on, err)
 	}
 
-	// Enabled, one folder opted out, a window of 90 days.
-	path = writeConfig(t, fmt.Sprintf(base, `"storageDir": "", "backup": {"enable": true, "keep": "90d", "folders": {"media": false}}`))
+	// Enabled, one store opted out, a window of 90 days.
+	path = writeConfig(t, fmt.Sprintf(base, `"backup": {"enable": true, "keep": "90d", "stores": {"media": false}}`))
 	cfg, err = Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -682,7 +561,7 @@ func TestBackupConfig(t *testing.T) {
 	}
 
 	// A keep value the daemon cannot read fails the config, not the daemon.
-	path = writeConfig(t, fmt.Sprintf(base, `"storageDir": "", "backup": {"enable": true, "keep": "1y2d"}`))
+	path = writeConfig(t, fmt.Sprintf(base, `"backup": {"enable": true, "keep": "1y2d"}`))
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "keep") {
 		t.Fatalf("err = %v, want a keep error", err)
 	}

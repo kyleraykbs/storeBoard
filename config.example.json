@@ -1,5 +1,6 @@
 {
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "/home/alice/Storeboard",
   "dataDir": "/home/alice/.local/share/storeboard",
   "socket": "/run/user/1000/storeboard.sock",
   "peer": "laptop",
@@ -11,24 +12,38 @@
   "groups": {
     "family": {
       "peers": ["laptop", "desktop", "phone"],
-      "folders": {
-        "photos": { "mount": "/home/alice/Pictures" },
-        "documents": {},
-        "archive": {}
-      },
-      "permissions": { "group": "users" },
-      "storageDir": "/srv/storeboard"
+      "permissions": { "group": "users" }
+    },
+    "media": {
+      "peers": ["laptop", "desktop"]
     }
   },
-  "mounts": { "documents": "/mnt/docs", "archive": "/mnt/archive" },
-  "keepOffline": { "archive": false },
+  "stores": {
+    "photos": {
+      "group": "family",
+      "symlinks": ["/home/alice/Pictures"],
+      "stores": {
+        "bulk": {
+          "group": "media",
+          "sync": "remote",
+          "path": "Bulk"
+        }
+      }
+    },
+    "documents": {
+      "group": "family",
+      "symlinks": ["/home/alice/Documents"]
+    },
+    "archive": {
+      "group": "family"
+    }
+  },
   "permissions": {
     "documents": { "user": "alice", "mode": "0755" }
   },
-  "storageDir": "/srv/storeboard",
   "backup": {
     "enable": true,
     "keep": "1y",
-    "folders": { "archive": false }
+    "stores": { "archive": false }
   }
 }

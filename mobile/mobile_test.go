@@ -14,18 +14,16 @@ import (
 // — all through the same calls the Android app makes.
 func TestEmbeddedDaemon(t *testing.T) {
 	dir := t.TempDir()
-	mount := filepath.Join(dir, "documents")
+	root := filepath.Join(dir, "root")
+	documents := filepath.Join(root, "documents")
 	cfg := `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "` + root + `",
   "peer": "phone",
   "dataDir": "` + filepath.Join(dir, "data") + `",
   "socket": "` + filepath.Join(dir, "unused.sock") + `",
-  "groups": {
-    "kyle": {
-      "peers": ["phone"],
-      "folders": { "documents": { "mount": "` + mount + `" } }
-    }
-  },
+  "groups": { "kyle": { "peers": ["phone"] } },
+  "stores": { "documents": { "group": "kyle" } },
   "backup": { "enable": true, "keep": "1y" }
 }`
 
@@ -52,7 +50,7 @@ func TestEmbeddedDaemon(t *testing.T) {
 	if sent.Path != "Camera/IMG_0001.jpg" || sent.Parked != "" {
 		t.Fatalf("send result = %+v", sent)
 	}
-	if got, err := os.ReadFile(filepath.Join(mount, "Camera", "IMG_0001.jpg")); err != nil || string(got) != "pretend this is a photo" {
+	if got, err := os.ReadFile(filepath.Join(documents, "Camera", "IMG_0001.jpg")); err != nil || string(got) != "pretend this is a photo" {
 		t.Fatalf("sent file = %q, %v", got, err)
 	}
 
@@ -65,7 +63,7 @@ func TestEmbeddedDaemon(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &st); err != nil {
 		t.Fatal(err)
 	}
-	if st.Peer != "phone" || len(st.Folders) != 1 || st.Folders[0].Name != "documents" {
+	if st.Peer != "phone" || len(st.Stores) != 1 || st.Stores[0].Name != "documents" {
 		t.Fatalf("status = %+v", st)
 	}
 	if len(st.Sync) != 1 || st.Sync[0].Entries == 0 {
@@ -106,13 +104,16 @@ func TestEmbeddedDaemon(t *testing.T) {
 // sender is told where.
 func TestEmbeddedSendNeverOverwrites(t *testing.T) {
 	dir := t.TempDir()
-	mount := filepath.Join(dir, "documents")
+	root := filepath.Join(dir, "root")
+	documents := filepath.Join(root, "documents")
 	cfg := `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "` + root + `",
   "peer": "phone",
   "dataDir": "` + filepath.Join(dir, "data") + `",
   "socket": "` + filepath.Join(dir, "unused.sock") + `",
-  "groups": {"kyle": {"peers": ["phone"], "folders": {"documents": {"mount": "` + mount + `"}}}}
+  "groups": {"kyle": {"peers": ["phone"]}},
+  "stores": {"documents": {"group": "kyle"}}
 }`
 	d, err := Start(cfg, "")
 	if err != nil {
@@ -143,10 +144,10 @@ func TestEmbeddedSendNeverOverwrites(t *testing.T) {
 	if sent.Parked == "" {
 		t.Fatalf("send result = %+v, want the existing file parked", sent)
 	}
-	if got, err := os.ReadFile(filepath.Join(mount, "same.txt")); err != nil || string(got) != "second" {
+	if got, err := os.ReadFile(filepath.Join(documents, "same.txt")); err != nil || string(got) != "second" {
 		t.Fatalf("destination = %q, %v; want the new content", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(mount, sent.Parked)); err != nil || string(got) != "first" {
+	if got, err := os.ReadFile(filepath.Join(documents, sent.Parked)); err != nil || string(got) != "first" {
 		t.Fatalf("parked copy = %q, %v; want the old content kept", got, err)
 	}
 }

@@ -1,7 +1,8 @@
 # Storeboard
 
-Replicated folders across your own devices: every folder keeps healthy
-copies on the machines that want it, and going offline never loses data.
+Replicated stores across your own devices: each store keeps healthy copies on
+the machines that want it, stores nest without costing anything, and going
+offline never loses data.
 
 Status: working. The flake, the daemon, the CLI, the sync engine, the peer
 transport and the embedded library build and run, with the invariants in
@@ -38,37 +39,41 @@ Binaries: `storeboard` (CLI) and `storeboardd` (daemon).
 Strict JSON; unknown keys are an error. The model, in full in
 `config.example.json`:
 
+- `root` — the one directory the bytes live in; a required setting with a
+  sane default (`~/Storeboard`). A plain container: every store is a real
+  directory at `<root>/<id>`, and the tree below it is made of symlinks.
 - `peer` — this machine's name (hostname fallback while no groups exist).
 - `peers` — named devices with declared `host:port` endpoints; discovery is
   config-only, the daemon never invents a peer.
-- `groups` — peer memberships that own `folders`; each folder declares a
-  default `mount`; folder names are unique across all groups.
-- `mounts` — this machine's local override of a group folder's mount.
-  Effective mount: local override → group default → `<dataDir>/mounts/<name>`.
-- `permissions` — ownership and directory mode for what the daemon creates,
-  declared per folder (this machine) and per group (the default). Resolution
-  is field by field: folder entry → group default → **the directory the
-  mount lives in** (its owner, its group, its mode), re-read on every mount
-  transition and scan. So with nothing declared, a folder is permissioned
-  exactly like the directory containing it; `{"user": "kyle"}` on a folder
-  whose parent is root-owned is the common override. Modes are directories
-  only — files keep the mode they were synced with.
-- `storageDir` — where folder *content* lives (this machine, overridable per
-  group): each folder's root becomes `<storageDir>/<folder>` and its mount
-  path is a symlink to it, so the mount may sit anywhere and no two folders
-  can index the same bytes. The default is `<dataDir>/storage`; an explicit
-  empty string restores the original layout, where a replica's content is
-  the mount directory itself. Files already at a mount path are migrated in
-  on the next transition (nothing is overwritten; an interrupted migration
-  resumes).
-- everything the daemon stores (store, journal, index) lives under the one
-  `dataDir`.
-- Two folders on one identical mount are rejected; *nested* mounts (a pool
-  root plus subtrees other machines stream) are allowed but warned about by
-  `config check` and at daemon startup, because the machine holding both
-  indexes those files twice and keeps a copy of the outer tree in its store.
-  A folder only some devices should carry is scoped with the tag's
-  `folders.<f>.devices`.
+- `groups` — peer memberships. A store names a group; a child inherits its
+  parent's when it does not.
+- `stores` — the tree, by id. Ids are globally unique and name the canonical
+  directory under `root`. Each store:
+  - `path` — its relpath inside the parent, and the name it appears under
+    there. Absent means the id, at the parent's top level. Meaningless at the
+    top level, where the canonical dir is the id.
+  - `sync` — `local` (a replica that works offline) or `remote` (streamed
+    from a holder). Absent inherits the parent's; the top-level default is
+    `local`.
+  - `symlinks` — absolute paths that become symlinks to the canonical dir.
+    Never inherited: a path belongs to one machine. `/home/kyle/Documents`
+    becomes a symlink to `~/Storeboard/documents`.
+  - `permissions` — ownership and directory mode; overrides the parent field
+    by field.
+  - `stores` — child stores.
+- `inheritance` — undeclared means follow the parent. Group, `sync`,
+  `permissions` and the backup opt-out all resolve nearest-declared-wins; a
+  child only states what makes it different.
+- `permissions` — this machine's per-store override. Resolution is field by
+  field: machine entry → store's chain → group default → **the directory the
+  root lives in** (its owner, its group, its mode), re-read on every scan. So
+  with nothing declared, a store is permissioned exactly like the directory
+  containing root; `{"user": "kyle"}` on a store whose container is
+  root-owned is the common override. Modes are directories only — files keep
+  the mode they were synced with.
+- `backup` — opt-in per machine, one `keep` window, per-store opt-out by id.
+- everything the daemon stores (blobs, journals, history, trash) lives under
+  the one `dataDir`.
 
 Validate any file with:
 
@@ -79,57 +84,59 @@ Resolution: `--config` > an existing
 default. The Nix modules generate and validate the file at build time, so a
 bad option value fails nixos-rebuild instead of failing at startup.
 
-## Sync and mounts
+There is no migration from configVersion 1. A v1 file is rejected; the store
+tree, the root and the symlinks are declared fresh.
 
-- **Replicas** (`keepOffline = true`) hold the folder's content under the
-  mount path and sync it with every other replica: creates, edits and
-  deletes (deletes land in `<dataDir>/trash/<folder>/`).
-- **Streamed** folders (`keepOffline = false`) are daemon-managed views: the
-  mount path is a symlink into `<dataDir>/views/<folder>`, live while a
-  holder answers. When no holder is reachable the path is swapped to an
-  empty writable dir (`<dataDir>/detached/<folder>`); what is written there
-  is merged back into the view on reconnect and synced onwards. A path
-  owned by something else (a samba mount, a real directory) is left alone
-  and reported as `busy`.
-- Every path the daemon creates — the view, the detached dir, the
-  directories under them — is chowned and chmod'ed to the folder's resolved
-  permissions on every transition, and the storage chain to the mount target
-  is made traversable, so the symlink is usable by the folder's owner.
-  Resolved values show up in `status` (`sync[].permissions`).
+## The tree, and sync
+
+- **Every store's bytes live under root.** `<root>/<id>` is a real directory.
+  A store's presentation is a symlink (or, at the top level, the canonical
+  dir itself).
+- **Children are symlinks.** `pictures` with a child at `Bulk` gets a symlink
+  at `<root>/pictures/Bulk` → `<root>/bulk`. The scanner never descends into
+  a symlink and never journals one, so the parent never indexes the child's
+  bytes. Nesting therefore costs nothing: no double indexing, no content-store
+  copy of the outer tree.
+- **Declared paths are symlinks outward.** A store's `symlinks` become links
+  to its canonical dir. A path that already belongs to something else is left
+  alone and reported `busy` (`sync[].symlinks[]`): content of its own, a
+  foreign symlink, a live mount, or a file in the way.
+- **`local`** stores hold a replica and sync it with every other participant:
+  creates, edits and deletes (deletes land in `<dataDir>/trash/<id>/`).
+- **`remote`** stores are streams from a holder. The canonical dir is always
+  present and visible; `attached`/`detached` only reports whether a holder is
+  reachable. Offline writes land in the store and sync when a holder returns
+  — there is no dummy dir and no root flip.
 - Concurrent edits to one file resolve deterministically on every replica
   (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
   conflicts are visible in `status --json` (`.sync[]`).
-- A streamed folder whose path belongs to something else is reported
-  `busy` with the reason (`sync[].busy`): content of its own, a foreign
-  symlink, a live mount, or a file in the way.
-- A streamed folder backed by a storage directory keeps its mount on the
-  view at all times: without a holder it reports `detached` (not live) but
-  the content stays visible and writes land in the folder, syncing when a
-  holder returns. Without a storage directory the path is replaced by an
-  empty dummy dir instead and what is written there merges back on attach. `storeboard folder takeover
-  <name>` resolves the first case: the content moves into the folder's
-  offline mount, the path becomes the mount, and the ordinary merge hands
-  the files to the mesh — immediately when a holder answers, otherwise on
-  the next reconnect. Nothing is replaced: a name that collides lands under
-  the same deterministic conflict name the merge uses. Root or the folder's
-  owner may run it; the daemon reads that from the socket's peer
-  credentials, so the world-writable socket is not a way in.
+- Permissions are re-applied to every path the daemon creates on every scan;
+  resolved values show up in `status` (`sync[].permissions`).
 - Scans run every 15 s; `STOREBOARD_SCAN_INTERVAL` (a duration, e.g.
   `200ms`) overrides that for tests and tight loops.
+
+### Takeover
+
+A declared path that already holds files is never touched automatically.
+`storeboard store takeover <name> [--path PATH]` moves its entries into the
+store's canonical dir (never overwriting: a name that collides lands under the
+deterministic conflict name) and replaces the path with the symlink. The
+ordinary scan hands the files to the mesh. Root or the store's owner may run
+it; the daemon reads that from the socket's peer credentials, so the
+world-writable socket is not a way in.
 
 ## Backup
 
 Opt-in per machine (`backup.enable`), with one window (`backup.keep`, default
-`1y`, units h/d/w/y) and per-folder opt-outs. Every version transition is
-recorded per folder as a line referencing the blob that holds those bytes —
-the content store is append-only, so the bytes are already there; the history
-is what makes them findable. Retention thins the record the standard way: the
-newest version of each hour for a day, each day for a week, each week for a
-month, each month for a year, each year beyond — and nothing older than the
-window. A file's current version is never dropped. A folder this machine
-*streams* (`keepOffline = false`) keeps no history: its versions belong to the
-machine that holds the content, which is what lets one group-level declaration
-be right everywhere.
+`1y`, units h/d/w/y) and per-store opt-outs (`backup.stores`). Every version
+transition is recorded per store as a line referencing the blob that holds
+those bytes — the content store is append-only, so the bytes are already
+there; the history is what makes them findable. Retention thins the record the
+standard way: the newest version of each hour for a day, each day for a week,
+each week for a month, each month for a year, each year beyond — and nothing
+older than the window. A file's current version is never dropped. A store this
+machine marks `remote` keeps no history: its versions belong to the machine
+that holds the content, which is what lets one declaration be right everywhere.
 
 A startup collector frees content that nothing references — never a journal's,
 a kept version's, an orphan journal's, or a recent write's — and refuses to run
@@ -145,22 +152,22 @@ same window.
 
     storeboard send photos holiday.jpg --as "2026/holiday.jpg"
 
-Copies a local file into a folder: from then on it is an ordinary local
-change — indexed at once, recorded in the history, synced onwards. Nothing
-is overwritten; a name already taken parks the existing file under the same
-deterministic conflict name the merge uses and reports where. The daemon
-does the copying, so the file must be one it can see (the same machine, in
-practice), and root or the folder's owner is the only caller allowed.
+Copies a local file into a store: from then on it is an ordinary local change
+— indexed at once, recorded in the history, synced onwards. Nothing is
+overwritten; a name already taken parks the existing file under the same
+deterministic conflict name the merge uses and reports where. The daemon does
+the copying, so the file must be one it can see (the same machine, in
+practice), and root or the store's owner is the only caller allowed.
 
 The phone's share sheet is the same verb, one layer down: the app's UI calls
 the engine directly (there is no socket inside an app), and a shared file is
-copied in and sent into the camera folder. `storeboard/mobile` and this
-command are two doors onto one operation.
+copied in and sent into the camera store. `storeboard/mobile` and this command
+are two doors onto one operation.
 
 ## Query the daemon
 
     storeboardd --config config.example.json &
-    storeboard --config config.example.json status --json | jq .folders
+    storeboard --config config.example.json status --json | jq .stores
 
 `status --json` is the daemon's `/v1/status` document verbatim (HTTP over
 the unix socket); human output is free to change, JSON shapes are not.
@@ -176,15 +183,17 @@ the unix socket); human output is free to change, JSON shapes are not.
     services.storeboard = {
       enable = true;
       peer = "laptop";
+      root = "/srv/storeboard";
       peers = {
         laptop.endpoints = [ "192.168.1.10:4242" ];
         desktop.endpoints = [ "192.168.1.11:4242" ];
       };
-      groups.family = {
-        peers = [ "laptop" "desktop" ];
-        folders.photos.mount = "/srv/photos";
+      groups.family.peers = [ "laptop" "desktop" ];
+      stores.pictures = {
+        group = "family";
+        symlinks = [ "/home/kyle/Pictures" ];
+        stores.bulk = { group = "media"; sync = "remote"; };
       };
-      mounts = { };  # this machine's local mount overrides
     };
 
     # home-manager — optional, per-user: installs the CLI for one user and

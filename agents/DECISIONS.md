@@ -309,3 +309,31 @@
 - **Open:** the app builds — the bind, the Java surface and the APK are
   verified — but nothing has run it on a device yet; and the `DCIM/`
   adoption decision is Kyle's. Both in NOTES and TODO.
+
+## 2026-10-23 — Stores: one root, a flat namespace, and a tree of symlinks
+
+- **Decision:** configVersion 2 replaces peers→groups→folders with
+  `root` + a tree of `stores` + per-store `symlinks`. Every store's bytes live
+  at `<root>/<id>` (a real dir, flat under the root); a child store is shown
+  inside its parent as a symlink at its `path` (default: its id); a declared
+  `symlinks` entry is an absolute path linked to the canonical dir. `sync` is
+  `local` or `remote` per store; undeclared fields inherit from the parent
+  (group, sync, permissions, backup opt-out). `mounts`, `keepOffline`,
+  `storageDir` and the group folder `mount` are gone. `apiVersion` is 2.
+- **Why:** user direction — "decouple the mountpoints from where the data is
+  stored": a path is a name for a store, never its home. Nesting is
+  structural, and since the scanner skips symlinks the parent never indexes
+  the child, so the old double-indexing warning and the `mainpool` tradeoff
+  disappear. The mount state machine, views, detached dirs and storage
+  migration are deleted.
+- **No migration:** user direction — "I don't want migration, leave the
+  current files alone". A v1 config is rejected; content is never moved or
+  adopted automatically. A declared path that already holds files is reported
+  busy until `store takeover` is run explicitly.
+- **Also fixed:** the transport called `OnPeerConnected` from a link
+  goroutine that could be a duplicate already replaced by the tie-break,
+  leaving the engine with a writer to a closed socket and no disconnect
+  event (a silent mesh). The handler is now called only for the registered
+  link.
+- **Reversible:** no for the config format (v1 is rejected); yes in the sense
+  that no data is touched.

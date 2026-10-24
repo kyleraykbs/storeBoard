@@ -17,7 +17,7 @@ import (
 // frame is one wire line between two sync sessions.
 type frame struct {
 	Type    string   `json:"type"`
-	Folder  string   `json:"folder,omitempty"`
+	Store   string   `json:"store,omitempty"`
 	Path    string   `json:"path,omitempty"`
 	Seq     int      `json:"seq,omitempty"`
 	Data    []byte   `json:"data,omitempty"`
@@ -34,17 +34,17 @@ type pending struct {
 }
 
 type incomingBlob struct {
-	folder string
-	f      *os.File
-	entry  *Entry
+	store string
+	f     *os.File
+	entry *Entry
 }
 
-func wantKey(folder, path string) string { return folder + "\x00" + path }
-func incomeKey(peer, folder, path string) string {
-	return peer + "\x00" + folder + "\x00" + path
+func wantKey(store, path string) string { return store + "\x00" + path }
+func incomeKey(peer, store, path string) string {
+	return peer + "\x00" + store + "\x00" + path
 }
 
-// validRel rejects paths that could escape a folder root.
+// validRel rejects paths that could escape a store root.
 func validRel(p string) bool {
 	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, "\x00") {
 		return false
@@ -68,11 +68,11 @@ func (e *Engine) sendTo(peer string, fr frame) error {
 	return send(b)
 }
 
-func (e *Engine) sendIndexTo(peer string, fs *FolderState, entries []*Entry) error {
+func (e *Engine) sendIndexTo(peer string, fs *StoreState, entries []*Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	return e.sendTo(peer, frame{Type: "index", Folder: fs.name, Entries: entries})
+	return e.sendTo(peer, frame{Type: "index", Store: fs.name, Entries: entries})
 }
 
 // --- receiving -------------------------------------------------------------
@@ -86,9 +86,9 @@ func (e *Engine) sendIndexTo(peer string, fs *FolderState, entries []*Entry) err
 //	                    conflict copy on both sides (never silently lost)
 //	equal content     → merge vectors and move on
 func (e *Engine) handleIndex(peer string, fr *frame) {
-	fs := e.byName[fr.Folder]
+	fs := e.byName[fr.Store]
 	if fs == nil {
-		return // a folder this machine does not carry
+		return // a store this machine does not carry
 	}
 	for _, rem := range fr.Entries {
 		if rem == nil || !validRel(rem.Path) {
@@ -106,7 +106,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 					// The file is still on disk: tombstoning it now would
 					// make the scanner resurrect it later, so keep the live
 					// entry and push it back instead.
-					e.logger.Warn("delete not applied; keeping the local file", "folder", fs.name, "path", loc.Path, "error", err)
+					e.logger.Warn("delete not applied; keeping the local file", "store", fs.name, "path", loc.Path, "error", err)
 					_ = e.sendIndexTo(peer, fs, []*Entry{loc})
 					continue
 				}
@@ -146,7 +146,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 // resolveConflict keeps exactly one of the two contents at the path (both
 // sides compute the same winner) and preserves the other as a
 // `.conflict-<hash8>` copy, indexed like any other file so it spreads.
-func (e *Engine) resolveConflict(peer string, fs *FolderState, loc, rem *Entry) {
+func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 	fs.addConflict()
 	win := winner(loc, rem)
 	merged := MergeVV(loc.VV, rem.VV)
@@ -160,7 +160,7 @@ func (e *Engine) resolveConflict(peer string, fs *FolderState, loc, rem *Entry) 
 		_ = fs.db.Put(upd)
 		e.broadcastIndex(fs, []*Entry{upd})
 		e.logger.Warn("conflict: kept local version, remote saved as copy",
-			"folder", fs.name, "path", loc.Path, "copy", name, "peer", peer)
+			"store", fs.name, "path", loc.Path, "copy", name, "peer", peer)
 		return
 	}
 
@@ -173,12 +173,12 @@ func (e *Engine) resolveConflict(peer string, fs *FolderState, loc, rem *Entry) 
 	winnerEntry.VV = merged
 	e.request(peer, fs, rem, &pending{entry: winnerEntry})
 	e.logger.Warn("conflict: kept remote version, local saved as copy",
-		"folder", fs.name, "path", loc.Path, "peer", peer)
+		"store", fs.name, "path", loc.Path, "peer", peer)
 }
 
 // saveLocalConflict moves the current local content aside under a
 // deterministic conflict name and indexes it as a new file.
-func (e *Engine) saveLocalConflict(fs *FolderState, loc *Entry) *Entry {
+func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	src := filepath.Join(fs.root, loc.Path)
@@ -219,11 +219,11 @@ func (e *Engine) saveLocalConflict(fs *FolderState, loc *Entry) *Entry {
 }
 
 // request asks the peer for a blob and remembers what to do with it.
-func (e *Engine) request(peer string, fs *FolderState, rem *Entry, p *pending) {
+func (e *Engine) request(peer string, fs *StoreState, rem *Entry, p *pending) {
 	e.mu.Lock()
 	e.wants[wantKey(fs.name, rem.Path)] = p
 	e.mu.Unlock()
-	if err := e.sendTo(peer, frame{Type: "want", Folder: fs.name, Path: rem.Path}); err != nil {
+	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path}); err != nil {
 		e.logger.Debug("want", "peer", peer, "error", err)
 	}
 }
@@ -232,7 +232,7 @@ func (e *Engine) request(peer string, fs *FolderState, rem *Entry, p *pending) {
 
 // handleWant streams a stored blob in chunks.
 func (e *Engine) handleWant(peer string, fr *frame) {
-	fs := e.byName[fr.Folder]
+	fs := e.byName[fr.Store]
 	if fs == nil || !validRel(fr.Path) {
 		return
 	}
@@ -242,7 +242,7 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 	}
 	blob, err := e.store.Open(ent.Blob)
 	if err != nil {
-		e.logger.Warn("blob missing for want", "folder", fs.name, "path", fr.Path, "blob", ent.Blob)
+		e.logger.Warn("blob missing for want", "store", fs.name, "path", fr.Path, "blob", ent.Blob)
 		return
 	}
 	defer blob.Close()
@@ -252,7 +252,7 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 	for {
 		n, rerr := blob.Read(buf)
 		if n > 0 {
-			if err := e.sendTo(peer, frame{Type: "blob", Folder: fs.name, Path: fr.Path, Seq: seq, Data: buf[:n]}); err != nil {
+			if err := e.sendTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: seq, Data: buf[:n]}); err != nil {
 				return
 			}
 			seq++
@@ -264,18 +264,18 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 			return
 		}
 	}
-	if err := e.sendTo(peer, frame{Type: "blobEnd", Folder: fs.name, Path: fr.Path, Entry: ent}); err != nil {
+	if err := e.sendTo(peer, frame{Type: "blobEnd", Store: fs.name, Path: fr.Path, Entry: ent}); err != nil {
 		e.logger.Debug("blobEnd", "peer", peer, "error", err)
 	}
 }
 
 // handleBlob collects incoming chunks into a temp file.
 func (e *Engine) handleBlob(peer string, fr *frame) {
-	fs := e.byName[fr.Folder]
+	fs := e.byName[fr.Store]
 	if fs == nil || !validRel(fr.Path) {
 		return
 	}
-	key := incomeKey(peer, fr.Folder, fr.Path)
+	key := incomeKey(peer, fr.Store, fr.Path)
 
 	e.mu.Lock()
 	inc := e.incoming[key]
@@ -285,7 +285,7 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.mu.Unlock()
 			return
 		}
-		inc = &incomingBlob{folder: fr.Folder, f: f}
+		inc = &incomingBlob{store: fr.Store, f: f}
 		e.incoming[key] = inc
 	}
 	e.mu.Unlock()
@@ -299,17 +299,17 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 
 // handleBlobEnd verifies, stores and applies a completed blob.
 func (e *Engine) handleBlobEnd(peer string, fr *frame) {
-	fs := e.byName[fr.Folder]
+	fs := e.byName[fr.Store]
 	if fs == nil {
 		return
 	}
-	key := incomeKey(peer, fr.Folder, fr.Path)
+	key := incomeKey(peer, fr.Store, fr.Path)
 
 	e.mu.Lock()
 	inc := e.incoming[key]
 	delete(e.incoming, key)
-	want := e.wants[wantKey(fr.Folder, fr.Path)]
-	delete(e.wants, wantKey(fr.Folder, fr.Path))
+	want := e.wants[wantKey(fr.Store, fr.Path)]
+	delete(e.wants, wantKey(fr.Store, fr.Path))
 	e.mu.Unlock()
 	if inc == nil {
 		return
@@ -334,7 +334,7 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	}
 	sum, err := store.SumFile(inc.f.Name())
 	if err != nil || sum != wantEntry.Blob {
-		e.logger.Warn("blob failed verification", "folder", fs.name, "path", fr.Path, "want", wantEntry.Blob, "got", sum)
+		e.logger.Warn("blob failed verification", "store", fs.name, "path", fr.Path, "want", wantEntry.Blob, "got", sum)
 		return
 	}
 	if err := e.store.Adopt(inc.f.Name(), sum); err != nil {
@@ -347,7 +347,7 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 		return
 	}
 	if err := e.applyEntry(fs, wantEntry); err != nil {
-		e.logger.Warn("apply entry", "folder", fs.name, "path", wantEntry.Path, "error", err)
+		e.logger.Warn("apply entry", "store", fs.name, "path", wantEntry.Path, "error", err)
 	}
 }
 
@@ -360,12 +360,12 @@ func (e *Engine) dropIncoming(key string, inc *incomingBlob) {
 }
 
 // writeConflictCopy parks a fetched loser version under its conflict name.
-func (e *Engine) writeConflictCopy(fs *FolderState, want *pending, ent *Entry) {
+func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	dst := filepath.Join(fs.root, want.conflictName)
 	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
-		e.logger.Warn("write conflict copy", "folder", fs.name, "path", want.conflictName, "error", err)
+		e.logger.Warn("write conflict copy", "store", fs.name, "path", want.conflictName, "error", err)
 		return
 	}
 	copyEnt := &Entry{
@@ -380,11 +380,11 @@ func (e *Engine) writeConflictCopy(fs *FolderState, want *pending, ent *Entry) {
 	e.broadcastIndex(fs, []*Entry{copyEnt})
 }
 
-// applyEntry writes a fetched version into the folder and records it. If
+// applyEntry writes a fetched version into the store and records it. If
 // the file on disk has unsynced local changes (changed since the last
 // scan), those are preserved as a conflict copy first — a remote update
 // never destroys data the mesh has not seen.
-func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
+func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	if !validRel(ent.Path) {
 		return fmt.Errorf("unsafe path %q", ent.Path)
 	}
@@ -419,7 +419,7 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 					_ = fs.db.Put(parkEnt)
 					e.broadcastIndex(fs, []*Entry{parkEnt})
 					e.logger.Warn("unsynced local change preserved as conflict copy",
-						"folder", fs.name, "path", ent.Path, "copy", name)
+						"store", fs.name, "path", ent.Path, "copy", name)
 				}
 			}
 		}
@@ -438,7 +438,7 @@ func (e *Engine) applyEntry(fs *FolderState, ent *Entry) error {
 // entry's, not the write's: a materialised file must look exactly like the
 // one it mirrors, both for the tools that sort by it (photos, videos) and
 // for the scanner, whose fast path is "size and mtime unchanged".
-func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32, mtime int64) error {
+func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime int64) error {
 	blob, err := e.store.Open(sum)
 	if err != nil {
 		return err
@@ -482,7 +482,7 @@ func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32, mtim
 	if mtime != 0 {
 		when := time.Unix(0, mtime)
 		if err := os.Chtimes(dst, when, when); err != nil {
-			e.logger.Warn("set mtime", "folder", fs.name, "path", dst, "error", err)
+			e.logger.Warn("set mtime", "store", fs.name, "path", dst, "error", err)
 		}
 	}
 	return nil
@@ -492,7 +492,7 @@ func (e *Engine) writeBlobTo(fs *FolderState, dst, sum string, mode uint32, mtim
 // destroyed) before the tombstone is recorded by the caller. It reports an
 // error when the file could not be moved, so the caller can keep the entry
 // alive instead of tombstoning a file that is still on disk.
-func (e *Engine) applyDelete(fs *FolderState, loc *Entry) error {
+func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	src := filepath.Join(fs.root, loc.Path)
@@ -512,13 +512,13 @@ func (e *Engine) applyDelete(fs *FolderState, loc *Entry) error {
 	gone := loc.clone()
 	gone.Deleted = true
 	e.record(fs, gone)
-	e.logger.Info("deleted (moved to trash)", "folder", fs.name, "path", loc.Path)
+	e.logger.Info("deleted (moved to trash)", "store", fs.name, "path", loc.Path)
 	return nil
 }
 
 // moveOrCopy renames src onto dst, falling back to copy-then-remove when the
 // rename cannot cross filesystems. The trash lives under the one data
-// directory while folder roots may sit on other mounts (a pool, an external
+// directory while store roots may sit on other mounts (a pool, an external
 // disk); without the fallback a delete fails silently, the caller still
 // records the tombstone, and the scanner then resurrects the file it was
 // told to delete — a loop that never converges.

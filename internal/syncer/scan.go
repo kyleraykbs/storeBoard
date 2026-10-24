@@ -12,21 +12,21 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
 
-// tmpPrefix marks scratch files the daemon writes inside folder roots; the
+// tmpPrefix marks scratch files the daemon writes inside store roots; the
 // scanner never indexes them.
 const tmpPrefix = ".storeboard-tmp"
 
-// scan walks the folder's active root and folds reality into the journal:
+// scan walks the store's active root and folds reality into the journal:
 // new and changed files become blobs with a fresh version, vanished files
-// become tombstones — but only when tombstones is set. A streamed folder is
+// become tombstones — but only when tombstones is set. A streamed store is
 // a mirror, and its root can be empty or partial for its own reasons (a
-// migration in flight, an index that arrived before its blobs, a folder that
+// migration in flight, an index that arrived before its blobs, a store that
 // is not live); absence there means "not here yet", and treating it as a
 // deletion deletes the content everywhere. The incident that cost 448 files
-// was exactly that. Replicas own their root, and a live streamed folder can
+// was exactly that. Replicas own their root, and a live streamed store can
 // tell its peers about a real deletion, so both may tombstone. It returns
 // the entries that changed, in their newest state, ready to hand to peers.
-func (e *Engine) scan(fs *FolderState, tombstones bool) ([]*Entry, error) {
+func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 
@@ -174,7 +174,7 @@ func (e *Engine) scan(fs *FolderState, tombstones bool) ([]*Entry, error) {
 
 	if unmaterialised > 0 {
 		e.logger.Info("skipped entries this machine never materialised; their absence is not a deletion",
-			"folder", fs.name, "skipped", unmaterialised)
+			"store", fs.name, "skipped", unmaterialised)
 	}
 	if len(changed) > 0 {
 		if err := fs.db.Sync(); err != nil {

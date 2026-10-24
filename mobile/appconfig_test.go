@@ -16,7 +16,8 @@ func TestAppDefaultConfigIsValid(t *testing.T) {
 	dir := t.TempDir()
 	data := filepath.Join(dir, "storeboard")
 	cfg := `{
-  "configVersion": 1,
+  "configVersion": 2,
+  "root": "` + filepath.Join(dir, "Storeboard") + `",
   "peer": "phone",
   "dataDir": "` + data + `",
   "socket": "` + filepath.Join(data, "storeboard.sock") + `",
@@ -26,13 +27,11 @@ func TestAppDefaultConfigIsValid(t *testing.T) {
     "pool": { "endpoints": ["192.168.1.10:4242"] }
   },
   "groups": {
-    "kyle": {
-      "peers": ["phone", "pool"],
-      "folders": {
-        "camera": { "mount": "` + filepath.Join(dir, "camera") + `" },
-        "photos": { "mount": "` + filepath.Join(dir, "photos") + `" }
-      }
-    }
+    "kyle": { "peers": ["phone", "pool"] }
+  },
+  "stores": {
+    "camera": { "group": "kyle" },
+    "photos": { "group": "kyle" }
   }
 }`
 

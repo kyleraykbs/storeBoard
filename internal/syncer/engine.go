@@ -1,7 +1,9 @@
-// Package syncer is storeboard's sync engine: it keeps replica folders in
-// step across peers and materialises streamed folders as mounts that appear
-// live while a holder answers and become a writable empty dir while none
-// does, merging whatever lands there back in on reconnect.
+// Package syncer is storeboard's sync engine: it keeps each store's canonical
+// directory in step across peers and materialises the tree as symlinks. A
+// store's bytes always live at <root>/<store>; a child store appears inside
+// its parent as a symlink, and an external symlink points at the canonical
+// dir from anywhere else. The scanner never crosses a symlink, which is what
+// makes nesting free.
 package syncer
 
 import (
@@ -19,7 +21,7 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
-// scanInterval is how often each folder is rescanned: the default is tuned
+// scanInterval is how often each store is rescanned: the default is tuned
 // for a home mesh (a 15 s poll, cheap because the scanner only hashes files
 // whose size or mtime moved). STOREBOARD_SCAN_INTERVAL overrides it, which
 // is how the smoke test drives the engine fast; tests set it directly.
@@ -34,56 +36,60 @@ func init() {
 	}
 }
 
-// FolderState is one folder's engine-side state.
-type FolderState struct {
-	name      string
-	group     string
-	mount     string
-	storage   string // "" = content at the mount path (original layout)
-	streamed  bool
-	root      string // the root the scanner follows: mount, view, or detached dir
-	state     string
-	busy      string // why state is busy, one of the api.Busy* reasons
+// Store states, mirrored in api.StoreSync docs.
+const (
+	stateReplica  = "replica"
+	stateAttached = "attached"
+	stateDetached = "detached"
+)
+
+// StoreState is one store's engine-side state.
+type StoreState struct {
+	name     string
+	parent   string
+	path     string // relpath inside the parent; "" at the top level
+	group    string
+	streamed bool
+	root     string // canonical directory: <root>/<id>
+
+	symlinks []string // declared external paths
+	links    []api.StoreSymlink
+	state    string
+
 	db        *FileDB
-	hist      *History // nil when this machine keeps no history for the folder
+	hist      *History // nil when this machine keeps no history for the store
 	conflicts int
 	lastScan  time.Time
 
 	perm   perms
 	scanMu sync.Mutex
 
-	// metaMu guards published, the status document's copy of this folder's
+	// metaMu guards published, the status document's copy of this store's
 	// state. Snapshot refreshes it whenever the scan lock happens to be
-	// free and otherwise serves the last values: a folder materialising
-	// tens of gigabytes holds that lock for minutes, and `storeboard status`
-	// has to answer regardless (an endpoint that waits is indistinguishable
-	// from a dead daemon).
+	// free and otherwise serves the last values: a store materialising tens
+	// of gigabytes holds that lock for minutes, and `storeboard status` has
+	// to answer regardless (an endpoint that waits is indistinguishable from
+	// a dead daemon).
 	metaMu    sync.Mutex
-	published api.FolderSync
+	published api.StoreSync
 	local     int  // entries present on this machine, as of the last scan
-	scanning  bool // a scan is walking the folder right now
+	scanning  bool // a scan is walking the store right now
 }
 
-// publish returns the folder's status, refreshing the fields that need the
+// publish returns the store's status, refreshing the fields that need the
 // scan lock when it is free and serving the last known values otherwise.
 // Entries, conflicts and the last scan time are always live: they never
 // needed that lock.
-func (fs *FolderState) publish() api.FolderSync {
+func (fs *StoreState) publish() api.StoreSync {
 	fs.metaMu.Lock()
-	defer fs.metaMu.Unlock()
-	if fs.scanMu.TryLock() {
-		p, root, state, busy := fs.perm, fs.root, fs.state, fs.busy
-		fs.scanMu.Unlock()
-		fs.published = api.FolderSync{
-			Folder:      fs.name,
-			Root:        root,
-			State:       state,
-			Busy:        busy,
-			Permissions: p.apiPerms(),
-		}
+	links := append([]api.StoreSymlink(nil), fs.links...)
+	if links == nil {
+		links = []api.StoreSymlink{}
 	}
 	out := fs.published
-	out.Folder = fs.name
+	out.Symlinks = links
+	fs.metaMu.Unlock()
+	out.Store = fs.name
 	out.Entries = fs.db.Count()
 	out.Conflicts = fs.conflicts
 	out.LastScan = fs.lastScan
@@ -95,37 +101,50 @@ func (fs *FolderState) publish() api.FolderSync {
 	return out
 }
 
+// refreshLocked copies the fields that need the scan lock into published.
+// Callers hold scanMu.
+func (fs *StoreState) refreshLocked() {
+	fs.metaMu.Lock()
+	fs.published = api.StoreSync{
+		Store:       fs.name,
+		Root:        fs.root,
+		State:       fs.state,
+		Permissions: fs.perm.apiPerms(),
+	}
+	fs.metaMu.Unlock()
+}
+
 // addConflict and setLastScan record activity the status documents; both
 // under metaMu so publish sees them without taking the scan lock.
-func (fs *FolderState) addConflict() {
+func (fs *StoreState) addConflict() {
 	fs.metaMu.Lock()
 	fs.conflicts++
 	fs.metaMu.Unlock()
 }
 
-func (fs *FolderState) setLastScan(t time.Time) {
+func (fs *StoreState) setLastScan(t time.Time) {
 	fs.metaMu.Lock()
 	fs.lastScan = t
 	fs.metaMu.Unlock()
 }
 
-// setLocal records how many of the folder's entries exist on this machine
-// (the rest are pending — the work a streamed folder is grinding through),
-// and setScanning whether a walk is running right now. Both live under
-// metaMu so publish sees them without the scan lock.
-func (fs *FolderState) setLocal(local int) {
+// setLocal records how many of the store's entries exist on this machine
+// (the rest are pending — the work a remote store is grinding through), and
+// setScanning whether a walk is running right now. Both live under metaMu so
+// publish sees them without the scan lock.
+func (fs *StoreState) setLocal(local int) {
 	fs.metaMu.Lock()
 	fs.local = local
 	fs.metaMu.Unlock()
 }
 
-func (fs *FolderState) setScanning(scanning bool) {
+func (fs *StoreState) setScanning(scanning bool) {
 	fs.metaMu.Lock()
 	fs.scanning = scanning
 	fs.metaMu.Unlock()
 }
 
-// Engine ties folders, journals and the peer wire together.
+// Engine ties stores, journals and the peer wire together.
 type Engine struct {
 	cfg     *config.Config
 	logger  *slog.Logger
@@ -134,14 +153,14 @@ type Engine struct {
 	store   *store.Store
 
 	mu       sync.Mutex
-	folders  []*FolderState
-	byName   map[string]*FolderState
+	stores   []*StoreState
+	byName   map[string]*StoreState
 	sends    map[string]func([]byte) error
 	wants    map[string]*pending
 	incoming map[string]*incomingBlob
 }
 
-// New prepares the engine. No folder is touched until Run.
+// New prepares the engine. No store is touched until Run.
 func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -168,102 +187,128 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		dataDir:  cfg.DataDir,
 		me:       cfg.Peer,
 		store:    st,
-		byName:   map[string]*FolderState{},
+		byName:   map[string]*StoreState{},
 		sends:    map[string]func([]byte) error{},
 		wants:    map[string]*pending{},
 		incoming: map[string]*incomingBlob{},
 	}
 
-	for _, f := range cfg.Folders() {
-		db, err := OpenFileDB(filepath.Join(journalDir, f.Name+".ndjson"), cfg.Peer)
+	for _, v := range cfg.StoreViews() {
+		db, err := OpenFileDB(filepath.Join(journalDir, v.ID+".ndjson"), cfg.Peer)
 		if err != nil {
 			return nil, err
 		}
+		streamed := v.Sync == config.SyncRemote
 		var hist *History
-		on, keep, herr := cfg.BackupFor(f.Name)
+		on, keep, herr := cfg.BackupFor(v.ID)
 		if herr != nil {
 			return nil, herr
 		}
 		if on {
-			if f.KeepOffline {
-				hist, err = OpenHistory(filepath.Join(cfg.DataDir, "history", f.Name+".ndjson"), keep)
+			if !streamed {
+				hist, err = OpenHistory(filepath.Join(cfg.DataDir, "history", v.ID+".ndjson"), keep)
 				if err != nil {
 					return nil, err
 				}
 			} else {
-				// A streamed folder is a mirror, not a holder: its versions
+				// A remote store is a mirror, not a holder: its versions
 				// belong to the machine that holds the content, so backup is
 				// ignored on this one.
-				logger.Debug("backup ignored: the folder is streamed on this machine", "folder", f.Name)
+				logger.Debug("backup ignored: the store is remote on this machine", "store", v.ID)
 			}
 		}
-		fs := &FolderState{
-			name:     f.Name,
-			group:    f.Group,
-			mount:    f.Mount,
-			storage:  f.Storage,
-			streamed: !f.KeepOffline,
+		state := stateReplica
+		if streamed {
+			state = stateDetached
+		}
+		fs := &StoreState{
+			name:     v.ID,
+			parent:   v.Parent,
+			path:     v.Path,
+			group:    v.Group,
+			streamed: streamed,
+			root:     v.Dir,
+			symlinks: v.Symlinks,
+			state:    state,
 			db:       db,
 			hist:     hist,
 			perm:     noPerms(),
-			published: api.FolderSync{
-				Folder:      f.Name,
-				Root:        f.Mount,
+			published: api.StoreSync{
+				Store:       v.ID,
+				Root:        v.Dir,
+				State:       state,
 				Permissions: noPerms().apiPerms(),
+				Symlinks:    []api.StoreSymlink{},
 			},
 		}
-		e.folders = append(e.folders, fs)
+		e.stores = append(e.stores, fs)
 		e.byName[fs.name] = fs
 	}
 	return e, nil
 }
 
-// Run prepares the mounts and drives scanning until ctx ends.
+// Run prepares the tree and drives scanning until ctx ends.
 func (e *Engine) Run(ctx context.Context) {
+	// The root is the one container the tree lives in; create it before any
+	// store resolves permissions against its parent.
+	e.ensureRoot()
+
+	// Every canonical dir first, then the links that present them: a child's
+	// link can only be made once the parent's dir exists.
+	for _, fs := range e.stores {
+		e.prepareRoot(fs)
+	}
+	for _, fs := range e.stores {
+		e.settleLinks(fs)
+	}
+
+	// Retention first (an in-memory pass), then unreferenced content: the
+	// collector runs before anything is in flight, and a blob touched in the
+	// last few minutes is kept regardless - a peer may be mid-transfer.
+	e.pruneOnce(time.Now())
+	e.Collect()
+	go e.pruneLoop(ctx, pruneInterval)
+
 	var wg sync.WaitGroup
-	for _, fs := range e.folders {
-		e.prepare(fs)
-		// Retention first (an in-memory pass), then unreferenced content: the
-		// collector runs before anything is in flight, and a blob touched in the
-		// last few minutes is kept regardless - a peer may be mid-transfer.
-		e.pruneOnce(time.Now())
-		e.Collect()
-		go e.pruneLoop(ctx, pruneInterval)
+	for _, fs := range e.stores {
 		wg.Add(1)
-		go func(fs *FolderState) {
+		go func(fs *StoreState) {
 			defer wg.Done()
 			e.scanLoop(ctx, fs)
 		}(fs)
 	}
 	<-ctx.Done()
 	// Scanners must be down before the caller tears anything down: an
-	// in-flight scan that writes a journal entry or a scratch file after
-	// Run returned races whatever comes next (in tests, removing the data
+	// in-flight scan that writes a journal entry or a scratch file after Run
+	// returned races whatever comes next (in tests, removing the data
 	// directory; in production, a restarted daemon claiming the same paths).
 	wg.Wait()
 }
 
-func (e *Engine) prepare(fs *FolderState) {
+// ensureRoot creates the one container the store tree lives in. It is not a
+// store: storeboard owns it, nothing syncs there directly.
+func (e *Engine) ensureRoot() {
+	if err := os.MkdirAll(e.cfg.Root, 0o755); err != nil {
+		e.logger.Error("create root", "root", e.cfg.Root, "error", err)
+	}
+}
+
+// prepareRoot creates a store's canonical directory and applies its
+// permissions. Content is never moved into it: an existing directory is the
+// user's, and a store that finds one simply adopts it.
+func (e *Engine) prepareRoot(fs *StoreState) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	fs.perm = e.resolvePerms(fs)
-	switch {
-	case fs.storage != "":
-		// Content lives in the storage directory; only the mount path's
-		// parents are the daemon's to create (the storage directory itself
-		// is made by ensureStorage).
-		if err := e.ensureMountParent(fs); err != nil {
-			e.logger.Error("create mount path parents", "folder", fs.name, "path", fs.mount, "error", err)
-		}
-	case !fs.streamed:
-		if err := os.MkdirAll(fs.mount, fs.perm.dirMode); err != nil {
-			e.logger.Error("create folder root", "folder", fs.name, "error", err)
-		}
+	if err := os.MkdirAll(fs.root, 0o755); err != nil {
+		e.logger.Error("create store root", "store", fs.name, "path", fs.root, "error", err)
 	}
-	e.ensureMounts(fs)
+	e.applyDir(fs, fs.root)
+	fs.refreshLocked()
+	e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state)
 }
 
-func (e *Engine) scanLoop(ctx context.Context, fs *FolderState) {
+func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 	e.scanOnce(fs)
 	t := time.NewTicker(scanInterval)
 	defer t.Stop()
@@ -277,55 +322,41 @@ func (e *Engine) scanLoop(ctx context.Context, fs *FolderState) {
 	}
 }
 
-func (e *Engine) scanOnce(fs *FolderState) {
+func (e *Engine) scanOnce(fs *StoreState) {
 	fs.scanMu.Lock()
 	// Re-resolve every pass: an inherited permission follows the directory
-	// it came from, so a chown or chmod of the mount's parent is honoured on
-	// the next scan rather than at the next restart.
+	// it came from, so a chown or chmod of the root's parent is honoured on
+	// the next scan rather than at the next restart. The canonical dir is
+	// the daemon's own, so it is re-applied here and heals drift.
 	fs.perm = e.resolvePerms(fs)
-	if fs.streamed || fs.storage != "" {
-		// The mount target is the one directory the daemon owns on behalf
-		// of the folder: keep it matching its reference ("permissioned every
-		// time"). A plain replica root is the user's own directory and is
-		// never chmod'ed — but a storage-backed one is the daemon's, so it
-		// is re-applied here too, which is also what heals a root whose mode
-		// drifted.
-		e.applyDir(fs, fs.root)
-	}
-	// A streamed folder is only scanned while it is attached — except when it
-	// is storage-backed, where the root never flips and offline writes land
-	// in the folder directly. The detached dir is a scratchpad for offline
-	// writes (merged back in on attach), not the folder's content: scanning
-	// it sees every known file as vanished and tombstones it — and the next
-	// attach then resurrects the whole folder with fresh versions, so every
-	// reconnect churned the entire mesh.
-	scan := !fs.streamed || fs.storage != "" || fs.state == stateAttached
+	e.applyDir(fs, fs.root)
+	state := fs.state
+	fs.refreshLocked()
 	fs.scanMu.Unlock()
-	if !scan {
-		return
-	}
 
-	// Replicas own their root; a live streamed folder can tell its peers
-	// about a real deletion. Everything else — detached, busy, still
-	// filling — may only report what it finds, never what is missing.
-	tombstones := !fs.streamed || (fs.state == stateAttached && e.participantConnected(fs))
+	// A replica owns its canonical dir, so absence there is a deletion. A
+	// remote store is a mirror: without a holder answering, absence means
+	// "not here yet", and reading it as a deletion emptied 448 files into a
+	// holder's trash on 2026-10-09.
+	tombstones := !fs.streamed || (state == stateAttached && e.participantConnected(fs))
 
 	changed, err := e.scan(fs, tombstones)
 	if err != nil {
-		e.logger.Warn("scan", "folder", fs.name, "error", err)
+		e.logger.Warn("scan", "store", fs.name, "error", err)
 	}
 	if len(changed) > 0 {
 		e.broadcastIndex(fs, changed)
 	}
 }
 
-// broadcastIndex fans a delta out to every connected peer.
-func (e *Engine) broadcastIndex(fs *FolderState, entries []*Entry) {
-	sends := e.sendList()
+// broadcastIndex fans a delta out to every connected peer that shares the
+// store's group.
+func (e *Engine) broadcastIndex(fs *StoreState, entries []*Entry) {
+	sends := e.sendListFor(fs)
 	if len(sends) == 0 {
 		return
 	}
-	b, err := json.Marshal(frame{Type: "index", Folder: fs.name, Entries: entries})
+	b, err := json.Marshal(frame{Type: "index", Store: fs.name, Entries: entries})
 	if err != nil {
 		return
 	}
@@ -335,12 +366,15 @@ func (e *Engine) broadcastIndex(fs *FolderState, entries []*Entry) {
 	}
 }
 
-func (e *Engine) sendList() []func([]byte) error {
+func (e *Engine) sendListFor(fs *StoreState) []func([]byte) error {
+	members := e.cfg.Groups[fs.group].Peers
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]func([]byte) error, 0, len(e.sends))
-	for _, s := range e.sends {
-		out = append(out, s)
+	for peer, s := range e.sends {
+		if slices.Contains(members, peer) {
+			out = append(out, s)
+		}
 	}
 	return out
 }
@@ -348,21 +382,24 @@ func (e *Engine) sendList() []func([]byte) error {
 // --- transport hooks -------------------------------------------------------
 
 // OnPeerConnected opens a sync session: the peer gets this machine's full
-// index for every folder, and streamed folders may now attach.
+// index for every store the two share, and remote stores may now go live.
 func (e *Engine) OnPeerConnected(peer string, send func([]byte) error) {
 	e.mu.Lock()
 	e.sends[peer] = send
 	e.mu.Unlock()
 
-	for _, fs := range e.folders {
+	for _, fs := range e.stores {
+		if !e.storeSharedWith(fs, peer) {
+			continue
+		}
 		if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
-			e.logger.Debug("send index", "peer", peer, "folder", fs.name, "error", err)
+			e.logger.Debug("send index", "peer", peer, "store", fs.name, "error", err)
 		}
 	}
-	e.evaluateMounts()
+	e.evaluatePeers()
 }
 
-// OnPeerDisconnected drops the session and possibly detaches mounts. In-
+// OnPeerDisconnected drops the session and re-evaluates remote stores. In-
 // flight blobs are NOT dropped: during cross-dial churn a replacement link
 // registers almost immediately and a half-received file may still complete
 // over it. Stale scratch files are wiped at startup instead.
@@ -370,7 +407,7 @@ func (e *Engine) OnPeerDisconnected(peer string) {
 	e.mu.Lock()
 	delete(e.sends, peer)
 	e.mu.Unlock()
-	e.evaluateMounts()
+	e.evaluatePeers()
 }
 
 // OnPeerFrame routes one wire frame.
@@ -391,39 +428,39 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	}
 }
 
-// evaluateMounts attaches streamed folders whose group has a connected peer
-// and detaches those without one.
-func (e *Engine) evaluateMounts() {
-	for _, fs := range e.folders {
+// evaluatePeers records whether each remote store has a holder reachable. It
+// never changes a path: the canonical dir is the same directory whether or
+// not a holder answers, so there is no root to flip.
+func (e *Engine) evaluatePeers() {
+	for _, fs := range e.stores {
 		if !fs.streamed {
 			continue
 		}
-		// A connection can beat the startup prepare (transport and engine
-		// run in parallel); an unprepared folder has no state to switch on.
-		fs.scanMu.Lock()
-		unprepared := fs.state == ""
-		fs.scanMu.Unlock()
-		if unprepared {
-			e.prepare(fs)
-		}
-
 		connected := e.participantConnected(fs)
 		fs.scanMu.Lock()
-		state := fs.state
+		was := fs.state
+		if connected {
+			fs.state = stateAttached
+		} else {
+			fs.state = stateDetached
+		}
+		fs.refreshLocked()
 		fs.scanMu.Unlock()
-		switch {
-		case connected && (state == stateDetached || state == ""):
-			e.attach(fs)
+		if connected && was != stateAttached {
+			e.logger.Info("store is live (holder reachable)", "store", fs.name)
 			e.scanOnce(fs)
-		case !connected && state == stateAttached:
-			// No scan after a detach: the root just became the empty
-			// scratchpad, and scanning that would tombstone the folder.
-			e.detach(fs)
+		} else if !connected && was == stateAttached {
+			e.logger.Info("store is not live (no holder reachable)", "store", fs.name)
 		}
 	}
 }
 
-func (e *Engine) participantConnected(fs *FolderState) bool {
+// storeSharedWith reports whether peer is in the store's group.
+func (e *Engine) storeSharedWith(fs *StoreState, peer string) bool {
+	return slices.Contains(e.cfg.Groups[fs.group].Peers, peer)
+}
+
+func (e *Engine) participantConnected(fs *StoreState) bool {
 	members := e.cfg.Groups[fs.group].Peers
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -437,16 +474,16 @@ func (e *Engine) participantConnected(fs *FolderState) bool {
 
 // Snapshot is the status document's sync section. It never waits on the scan
 // or apply locks.
-func (e *Engine) Snapshot() []api.FolderSync {
+func (e *Engine) Snapshot() []api.StoreSync {
 	receiving := map[string]int{}
 	e.mu.Lock()
 	for _, inc := range e.incoming {
-		receiving[inc.folder]++
+		receiving[inc.store]++
 	}
 	e.mu.Unlock()
 
-	out := make([]api.FolderSync, 0, len(e.folders))
-	for _, fs := range e.folders {
+	out := make([]api.StoreSync, 0, len(e.stores))
+	for _, fs := range e.stores {
 		s := fs.publish()
 		s.Receiving = receiving[fs.name]
 		out = append(out, s)
@@ -456,7 +493,7 @@ func (e *Engine) Snapshot() []api.FolderSync {
 
 // Close releases the journals and histories.
 func (e *Engine) Close() {
-	for _, fs := range e.folders {
+	for _, fs := range e.stores {
 		fs.db.Close()
 		if fs.hist != nil {
 			fs.hist.Close()

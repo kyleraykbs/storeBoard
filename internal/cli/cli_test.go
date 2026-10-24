@@ -59,16 +59,12 @@ func TestVersionHuman(t *testing.T) {
 
 func TestConfigCheckValidFile(t *testing.T) {
 	path := writeConfig(t, `{
-		"configVersion": 1,
+		"configVersion": 2,
+		"root": "/home/kyle/Storeboard",
 		"peer": "laptop",
 		"peers": { "laptop": { "endpoints": ["127.0.0.1:4242"] } },
-		"groups": {
-			"family": {
-				"peers": ["laptop"],
-				"folders": { "photos": { "mount": "/home/kyle/Pictures" } }
-			}
-		},
-		"mounts": {}
+		"groups": { "family": { "peers": ["laptop"] } },
+		"stores": { "photos": { "group": "family" } }
 	}`)
 
 	var out, errOut bytes.Buffer
@@ -95,8 +91,8 @@ func TestConfigCheckValidFile(t *testing.T) {
 	if len(report.Groups) != 1 || report.Groups[0] != "family" {
 		t.Errorf("groups = %v, want [family]", report.Groups)
 	}
-	if len(report.Folders) != 1 || report.Folders[0].Name != "photos" || report.Folders[0].Group != "family" {
-		t.Errorf("folders = %+v, want photos in family", report.Folders)
+	if len(report.Stores) != 1 || report.Stores[0].Name != "photos" || report.Stores[0].Group != "family" {
+		t.Errorf("stores = %+v, want photos in family", report.Stores)
 	}
 }
 
@@ -113,7 +109,7 @@ func TestConfigCheckValidFileHuman(t *testing.T) {
 }
 
 func TestConfigCheckRejectsTypo(t *testing.T) {
-	path := writeConfig(t, `{"configVersion": 1, "folars": []}`)
+	path := writeConfig(t, `{"configVersion": 2, "folars": []}`)
 
 	var out, errOut bytes.Buffer
 	err := Run(context.Background(), []string{"config", "check", "--json"}, path, &out, &errOut)
@@ -165,17 +161,16 @@ func TestStatusRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
 		ConfigVersion: config.ConfigVersion,
+		Root:          filepath.Join(dir, "Storeboard"),
 		DataDir:       filepath.Join(dir, "data"),
 		Socket:        filepath.Join(dir, "storeboard.sock"),
 		Peer:          "laptop",
 		Peers:         map[string]config.Peer{"laptop": {Endpoints: []string{"127.0.0.1:4242"}}},
 		Groups: map[string]config.Group{
-			"family": {
-				Peers:   []string{"laptop"},
-				Folders: map[string]config.GroupFolder{"photos": {Mount: "/home/kyle/Pictures"}},
-			},
+			"family": {Peers: []string{"laptop"}},
 		},
-		Mounts: map[string]string{},
+		StoreTree:   map[string]config.Store{"photos": {Group: "family"}},
+		Permissions: map[string]config.Permissions{},
 	}
 	srv, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -208,7 +203,7 @@ func TestStatusRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &st); err != nil {
 		t.Fatalf("status is not the daemon's document: %v\n%s", err, out.String())
 	}
-	if st.APIVersion != api.Version || len(st.Folders) != 1 || st.Folders[0].Name != "photos" {
+	if st.APIVersion != api.Version || len(st.Stores) != 1 || st.Stores[0].Name != "photos" {
 		t.Errorf("status = %+v", st)
 	}
 
@@ -216,7 +211,7 @@ func TestStatusRoundTrip(t *testing.T) {
 	if err := Run(ctx, []string{"status"}, cfgPath, &out, &errOut); err != nil {
 		t.Fatalf("status: %v (%s)", err, errOut.String())
 	}
-	if !strings.Contains(out.String(), "photos") || !strings.Contains(out.String(), "api v1") {
+	if !strings.Contains(out.String(), "photos") || !strings.Contains(out.String(), "api v2") {
 		t.Errorf("human status output: %q", out.String())
 	}
 
@@ -240,14 +235,14 @@ func waitForSocket(t *testing.T, socket string) {
 	}
 }
 
-func TestFolderTakeoverUsage(t *testing.T) {
+func TestStoreTakeoverUsage(t *testing.T) {
 	cases := []struct {
 		args []string
 		want string
 	}{
-		{[]string{"folder"}, "usage: storeboard folder takeover <name>"},
-		{[]string{"folder", "takeover"}, "usage: storeboard folder takeover <name>"},
-		{[]string{"folder", "surrender", "docs"}, "unknown folder command"},
+		{[]string{"store"}, "usage: storeboard store takeover <name>"},
+		{[]string{"store", "takeover"}, "usage: storeboard store takeover <name>"},
+		{[]string{"store", "surrender", "docs"}, "unknown store command"},
 	}
 	for _, c := range cases {
 		var out, errOut bytes.Buffer
@@ -263,7 +258,7 @@ func TestFolderTakeoverUsage(t *testing.T) {
 
 // The daemon's own refusal is what the user reads: a takeover that cannot
 // happen must report why, not "daemon answered 409".
-func TestFolderTakeoverReportsTheDaemonError(t *testing.T) {
+func TestStoreTakeoverReportsTheDaemonError(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "s.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -273,14 +268,14 @@ func TestFolderTakeoverReportsTheDaemonError(t *testing.T) {
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"error":"folder \"docs\" belongs to uid 1000: run this as that user, or as root"}`))
+		_, _ = w.Write([]byte(`{"error":"store \"docs\" belongs to uid 1000: run this as that user, or as root"}`))
 	})}
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	path := writeConfig(t, `{"configVersion": 1, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
+	path := writeConfig(t, `{"configVersion": 2, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
 	var out, errOut bytes.Buffer
-	err = Run(context.Background(), []string{"folder", "takeover", "docs"}, path, &out, &errOut)
+	err = Run(context.Background(), []string{"store", "takeover", "docs"}, path, &out, &errOut)
 	if err == nil || !strings.Contains(err.Error(), "belongs to uid 1000") {
 		t.Fatalf("err = %v, want the daemon's own reason", err)
 	}
@@ -301,12 +296,12 @@ func TestBackupCommands(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/versions"):
-			_, _ = w.Write([]byte(`{"folder":"docs","path":"note.txt","keep":"8760h0m0s","versions":[
+			_, _ = w.Write([]byte(`{"store":"docs","path":"note.txt","keep":"8760h0m0s","versions":[
 				{"path":"note.txt","time":"2026-10-09T12:00:00Z","blob":"abc123def4567890","size":11},
 				{"path":"note.txt","time":"2026-10-08T12:00:00Z","deleted":true,"size":0}]}`))
 		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/restore"):
 			gotBody, _ = io.ReadAll(r.Body)
-			_, _ = w.Write([]byte(`{"folder":"docs","path":"note.txt","blob":"abc123def4567890","at":"2026-10-08T12:00:00Z"}`))
+			_, _ = w.Write([]byte(`{"store":"docs","path":"note.txt","blob":"abc123def4567890","at":"2026-10-08T12:00:00Z"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":"no such endpoint"}`))
@@ -315,7 +310,7 @@ func TestBackupCommands(t *testing.T) {
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	path := writeConfig(t, `{"configVersion": 1, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
+	path := writeConfig(t, `{"configVersion": 2, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`)
 
 	var out, errOut bytes.Buffer
 	if err := Run(context.Background(), []string{"backup", "list", "docs", "note.txt"}, path, &out, &errOut); err != nil {

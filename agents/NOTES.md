@@ -65,3 +65,17 @@ Facts learned the hard way, worth keeping.
   so it needs no storage permission at all. Adopting the real `DCIM/` camera
   roll needs `MANAGE_EXTERNAL_STORAGE` (sideload-only) or a MediaStore-based
   importer — a decision, not a detail.
+## Stores cutover (2026-10-23)
+
+- configVersion 2 has **no migration**. Existing v1 files are rejected; the
+  daemon never moves or adopts content. Point `root` at where content should
+  live and declare `symlinks` for paths that already exist — those report
+  busy until `storeboard store takeover` is run by hand.
+- `root` is a plain container. Canonical dirs are flat (`<root>/<id>`) and the
+  tree is symlinks; do not "fix" that into nested directories, the scanner
+  boundary depends on it.
+- Transport trap (found here): a duplicate link replaced by the cross-dial
+  tie-break must never reach `OnPeerConnected`. If it does, the engine keeps a
+  writer to a closed socket, `dropLink` correctly ignores the stale link, and
+  the mesh goes silent with no error. The handler call is guarded in
+  `serveLink`.
