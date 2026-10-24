@@ -174,11 +174,10 @@ func (c *Config) BackupFor(store string) (bool, time.Duration, error) {
 	return true, keep, nil
 }
 
-// Store is one top-level store declaration. RenamedFrom explicitly adopts a
-// previous store id's canonical directory and durable state; no rename is
-// inferred from casing or similar names.
+// Store is one top-level store declaration. Changing its key creates a new
+// store; old canonical data and durable state remain untouched for manual
+// migration.
 type Store struct {
-	RenamedFrom string            `json:"renamedFrom,omitempty"`
 	Group       string            `json:"group,omitempty"`
 	Sync        string            `json:"sync,omitempty"`
 	Symlinks    []string          `json:"symlinks,omitempty"`
@@ -501,20 +500,6 @@ func (c *Config) Validate() error {
 		seenID[id] = true
 		if err := checkName("store", id); err != nil {
 			return err
-		}
-	}
-	for id, s := range c.StoreTree {
-		if s.RenamedFrom == "" {
-			continue
-		}
-		if err := checkName("renamed store", s.RenamedFrom); err != nil {
-			return err
-		}
-		if s.RenamedFrom == id {
-			return fmt.Errorf("store %q renamedFrom points to itself", id)
-		}
-		if _, exists := c.StoreTree[s.RenamedFrom]; exists {
-			return fmt.Errorf("store %q renamedFrom %q conflicts with a declared store", id, s.RenamedFrom)
 		}
 	}
 	for _, v := range views {

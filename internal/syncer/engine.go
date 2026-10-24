@@ -9,7 +9,6 @@ package syncer
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -251,66 +250,7 @@ func (e *Engine) StopFrames() {
 }
 
 // New prepares the engine. No store is touched until Run.
-func migrateRenamedStores(cfg *config.Config) error {
-	for id, decl := range cfg.StoreTree {
-		old := decl.RenamedFrom
-		if old == "" {
-			continue
-		}
-		for _, dir := range []string{
-			filepath.Join(cfg.Root, old),
-			filepath.Join(cfg.DataDir, "journal", old+".ndjson"),
-			filepath.Join(cfg.DataDir, "history", old+".ndjson"),
-			filepath.Join(cfg.DataDir, "trash", old),
-		} {
-			if _, err := os.Lstat(dir); err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
-				return fmt.Errorf("inspect renamed store %q: %w", old, err)
-			}
-			dst := filepath.Join(filepath.Dir(dir), id)
-			if _, err := os.Lstat(dst); err == nil {
-				if emptyRenameDestination(dir) && !emptyRenameDestination(dst) {
-					if err := os.RemoveAll(dir); err != nil {
-						return fmt.Errorf("remove empty old store state %q: %w", old, err)
-					}
-					continue
-				}
-				if !emptyRenameDestination(dst) {
-					return fmt.Errorf("rename store %q to %q: destination exists", old, id)
-				}
-				if err := os.RemoveAll(dst); err != nil {
-					return fmt.Errorf("remove empty rename destination %q: %w", id, err)
-				}
-			} else if !os.IsNotExist(err) {
-				return fmt.Errorf("inspect rename destination %q: %w", id, err)
-			}
-			if err := os.Rename(dir, dst); err != nil {
-				return fmt.Errorf("rename store state %q to %q: %w", old, id, err)
-			}
-		}
-	}
-	return nil
-}
-
-func emptyRenameDestination(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	if info.IsDir() {
-		entries, err := os.ReadDir(path)
-		return err == nil && len(entries) == 0
-	}
-	return info.Size() == 0
-}
-
-// New prepares the engine. No store is touched until Run.
 func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
-	if err := migrateRenamedStores(cfg); err != nil {
-		return nil, err
-	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -513,10 +453,13 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 
 func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 	e.scanOnce(fs)
-	// The journal may already contain files from a previous run, so the first
-	// scan can produce no delta even though a peer connected before scanning.
-	if err := e.broadcastFullIndex(fs); err != nil {
-		e.logger.Debug("initial index", "store", fs.name, "error", err)
+	// A pre-existing journal may contain files before the first scan. Send its
+	// complete post-scan index once; fresh stores use ordinary scan deltas and
+	// avoid duplicate startup index races.
+	if len(fs.db.All()) > 0 {
+		if err := e.broadcastFullIndex(fs); err != nil {
+			e.logger.Debug("initial index", "store", fs.name, "error", err)
+		}
 	}
 	t := time.NewTicker(scanInterval)
 	defer t.Stop()

@@ -113,11 +113,6 @@ rec {
     { name, ... }:
     {
       options = {
-        renamedFrom = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = "Previous store id whose durable state this declaration adopts.";
-        };
         group = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
         sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]); default = null; };
         symlinks = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
@@ -218,8 +213,7 @@ rec {
     stores:
     lib.mapAttrs (
 	  _: s:
-	  lib.optionalAttrs (s.renamedFrom != null) { renamedFrom = s.renamedFrom; }
-	  // lib.optionalAttrs (s.group != null) { group = s.group; }
+	  lib.optionalAttrs (s.group != null) { group = s.group; }
 	  // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
 	  // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
 	  // lib.optionalAttrs (s.links != { }) { links = s.links; }
