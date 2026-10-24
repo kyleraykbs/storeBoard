@@ -497,26 +497,31 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 // serveLink consumes one live connection: it answers pings and detects the
 // peer going away.
 func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key, direction string) {
-	defer m.dropLink(p, c, key)
-
 	w := &linkWriter{c: c}
 	handler := m.getHandler()
-	// A connection can be replaced between its goroutine starting and this
-	// point (both sides dial at once; the tie-break keeps one). Calling the
-	// handler for the replaced link would leave the engine with a writer to a
-	// closed socket and no disconnect event, because dropLink correctly
-	// ignores a stale connection — the mesh then talks into the void.
 	p.mu.Lock()
 	current := p.conn == c
 	p.mu.Unlock()
 	if !current {
 		return
 	}
+
+	var frames chan []byte
+	var framesDone chan struct{}
 	if handler != nil {
-		// Initial indexes can be large on real stores. Run the handler apart
-		// from the reader: both peers send their full index at connect time,
-		// and blocking here lets both TCP buffers fill before either side
-		// starts reading the other index.
+		frames = make(chan []byte, 1024)
+		framesDone = make(chan struct{})
+		m.spawn(func() {
+			defer close(framesDone)
+			for line := range frames {
+				p.mu.Lock()
+				stillCurrent := p.conn == c
+				p.mu.Unlock()
+				if stillCurrent {
+					handler.OnPeerFrame(p.name, line)
+				}
+			}
+		})
 		m.spawn(func() {
 			p.mu.Lock()
 			stillCurrent := p.conn == c
@@ -528,8 +533,14 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 	}
 
 	stop := make(chan struct{})
-	defer close(stop)
-
+	defer func() {
+		close(stop)
+		if frames != nil {
+			close(frames)
+			<-framesDone
+		}
+		m.dropLink(p, c, key)
+	}()
 	go func() {
 		t := time.NewTicker(pingInterval)
 		defer t.Stop()
@@ -553,8 +564,6 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if ctx.Err() == nil && !isClosed(err) {
-				// A link dying without a daemon restart is worth a line:
-				// every reconnect drops dependent mounts until it returns.
 				m.logger.Info("link closed", "peer", p.name, "direction", direction, "error", err)
 			}
 			return
@@ -564,17 +573,17 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			if err := w.write([]byte("{\"pong\"}\n")); err != nil {
 				return
 			}
-		case "{\"pong\"}":
-			// keepalive answer; nothing to do
-		case "":
+		case "{\"pong\"}", "":
 		default:
-			if handler != nil {
-				handler.OnPeerFrame(p.name, []byte(trimmed))
-				continue
+			if frames != nil {
+				select {
+				case frames <- []byte(trimmed):
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				m.logger.Debug("unhandled frame", "peer", p.name, "bytes", len(line))
 			}
-			// No handler yet: tolerate and note (invariant 9, additive
-			// protocol).
-			m.logger.Debug("unhandled frame", "peer", p.name, "bytes", len(line))
 		}
 	}
 }
