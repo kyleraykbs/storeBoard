@@ -506,3 +506,50 @@ func tailLog(p *peer) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// TestNestedDirectoriesSync covers plain subdirectories inside a store: the
+// journal records file paths, so a deep path must be created complete with
+// its parent directories on the other machine.
+func TestNestedDirectoriesSync(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	const body = "three levels down\n"
+	write(t, filepath.Join(a.storeDir("docs"), "one", "two", "three", "deep.txt"), body)
+
+	waitFor(t, "the nested file on bravo", func() bool {
+		got, err := os.ReadFile(filepath.Join(b.storeDir("docs"), "one", "two", "three", "deep.txt"))
+		return err == nil && string(got) == body
+	})
+	for _, dir := range []string{"one", "one/two", "one/two/three"} {
+		info, err := os.Stat(filepath.Join(b.storeDir("docs"), dir))
+		if err != nil || !info.IsDir() {
+			t.Fatalf("directory %q did not materialise: %v", dir, err)
+		}
+	}
+}
+
+// TestEmptyFileMaterialisesWithItsDirectory covers a zero-byte file. The
+// sender used to emit no chunk at all for an empty blob, so the receiver
+// never opened a transfer and dropped the completion frame: empty files —
+// and any directory that held only empty files — never appeared. A nested
+// empty file is the case that exposed it.
+func TestEmptyFileMaterialisesWithItsDirectory(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	write(t, filepath.Join(a.storeDir("docs"), "sdfsdfs", "test", "empty.txt"), "")
+
+	waitFor(t, "the empty file on bravo", func() bool {
+		info, err := os.Stat(filepath.Join(b.storeDir("docs"), "sdfsdfs", "test", "empty.txt"))
+		return err == nil && !info.IsDir() && info.Size() == 0
+	})
+	info, err := os.Stat(filepath.Join(b.storeDir("docs"), "sdfsdfs", "test"))
+	if err != nil || !info.IsDir() {
+		t.Fatalf("the directory holding only an empty file did not materialise: %v", err)
+	}
+}

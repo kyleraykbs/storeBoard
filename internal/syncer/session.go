@@ -307,6 +307,15 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 			seq++
 		}
 		if rerr == io.EOF {
+			// A zero-byte blob yields no data chunk at all, so the receiver
+			// never opened a transfer and dropped the blobEnd on the floor:
+			// empty files, and the directories holding them, never
+			// materialised. Send the empty first chunk to open the transfer.
+			if seq == 0 {
+				if err := e.sendBulkTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: 0}); err != nil {
+					return
+				}
+			}
 			break
 		}
 		if rerr != nil {
@@ -394,6 +403,18 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	delete(e.wants, wantKey(fr.Store, fr.Path))
 	e.mu.Unlock()
 	if inc == nil {
+		// No transfer was opened. That is legitimate only for a zero-byte
+		// file whose sender never sent a chunk: apply it directly rather than
+		// dropping the want and leaving an empty file missing forever.
+		if ent := fr.Entry; ent != nil && !ent.Deleted && ent.Size == 0 && ent.Blob != "" {
+			if err := e.ensureEmptyBlob(ent.Blob); err != nil {
+				e.logger.Warn("empty blob", "store", fs.name, "path", ent.Path, "error", err)
+				return
+			}
+			if err := e.applyEntry(fs, ent); err != nil {
+				e.logger.Warn("apply empty entry", "store", fs.name, "path", ent.Path, "error", err)
+			}
+		}
 		return
 	}
 	defer os.Remove(inc.f.Name())
@@ -450,6 +471,31 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	if err := e.applyEntry(fs, applyEnt); err != nil {
 		e.logger.Warn("apply entry", "store", fs.name, "path", applyEnt.Path, "error", err)
 	}
+}
+
+// ensureEmptyBlob stores the zero-byte blob under sum, verifying the name is
+// really the hash of nothing before adopting it. It exists for peers that
+// send no chunk at all for an empty file.
+func (e *Engine) ensureEmptyBlob(sum string) error {
+	if e.store.Has(sum) {
+		return nil
+	}
+	f, err := e.store.Temp()
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	got, err := store.SumFile(f.Name())
+	if err != nil {
+		return err
+	}
+	if got != sum {
+		return fmt.Errorf("sum %q is not the empty blob", sum)
+	}
+	return e.store.Adopt(f.Name(), sum)
 }
 
 func (e *Engine) dropIncoming(key string, inc *incomingBlob) {
