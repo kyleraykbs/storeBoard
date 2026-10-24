@@ -32,6 +32,11 @@ var scanInterval = 15 * time.Second
 // next pass; a non-empty directory remains protected until it becomes empty.
 var linkInterval = 5 * time.Second
 
+// indexInterval retries full index exchange after connect. A missed initial
+// frame must not leave a peer permanently stale; this is deliberately slower
+// than link reconciliation because an index can be large.
+var indexInterval = 30 * time.Second
+
 func init() {
 	if v := os.Getenv("STOREBOARD_SCAN_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -41,6 +46,11 @@ func init() {
 	if v := os.Getenv("STOREBOARD_LINK_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			linkInterval = d
+		}
+	}
+	if v := os.Getenv("STOREBOARD_INDEX_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			indexInterval = d
 		}
 	}
 }
@@ -271,6 +281,11 @@ func (e *Engine) Run(ctx context.Context) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		e.indexLoop(ctx)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		e.linkLoop(ctx)
 	}()
 	for _, fs := range e.stores {
@@ -284,6 +299,37 @@ func (e *Engine) Run(ctx context.Context) {
 	// Scanners and link reconciliation must be down before the caller tears
 	// anything down: both can be writing paths or journals.
 	wg.Wait()
+}
+
+func (e *Engine) indexLoop(ctx context.Context) {
+	t := time.NewTicker(indexInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			e.resendIndexes()
+		}
+	}
+}
+
+func (e *Engine) resendIndexes() {
+	e.mu.Lock()
+	peers := make([]string, 0, len(e.sends))
+	for peer := range e.sends {
+		peers = append(peers, peer)
+	}
+	e.mu.Unlock()
+	for _, peer := range peers {
+		for _, fs := range e.stores {
+			if e.storeSharedWith(fs, peer) {
+				if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
+					e.logger.Debug("resend index", "peer", peer, "store", fs.name, "error", err)
+				}
+			}
+		}
+	}
 }
 
 // reconcileLinks recreates missing canonical dirs and declared symlinks. It
