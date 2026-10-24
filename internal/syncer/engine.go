@@ -176,9 +176,14 @@ type Engine struct {
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
-	indexFrames    chan peerFrame
-	wantFrames     chan peerFrame
-	blobFrames     chan peerFrame
+	// Index frames are queued per store. One shared queue let a store with a
+	// large backlog (a Videos store propagating thousands of deletions, each
+	// one filesystem work) hold every other store's index frames behind it
+	// indefinitely: small stores never converged at all. Blob and want work
+	// stays shared — those are bounded per frame.
+	indexFrames map[string]chan peerFrame
+	wantFrames  chan peerFrame
+	blobFrames  chan peerFrame
 }
 
 type peerFrame struct {
@@ -190,21 +195,26 @@ const syncFrameQueue = 256
 
 func (e *Engine) startFrameWorkers() {
 	e.frameStartOnce.Do(func() {
-		e.indexFrames = make(chan peerFrame, syncFrameQueue)
+		e.indexFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.wantFrames = make(chan peerFrame, syncFrameQueue)
 		e.blobFrames = make(chan peerFrame, syncFrameQueue)
-		e.frameWG.Add(3)
-		go func() {
-			defer e.frameWG.Done()
-			for {
-				select {
-				case <-e.closed:
-					return
-				case pf := <-e.indexFrames:
-					e.handleIndex(pf.peer, &pf.fr)
+		e.frameWG.Add(2 + len(e.stores))
+		// One index worker per store: a slow store delays only itself.
+		for _, fs := range e.stores {
+			ch := make(chan peerFrame, syncFrameQueue)
+			e.indexFrames[fs.name] = ch
+			go func(ch chan peerFrame) {
+				defer e.frameWG.Done()
+				for {
+					select {
+					case <-e.closed:
+						return
+					case pf := <-ch:
+						e.handleIndex(pf.peer, &pf.fr)
+					}
 				}
-			}
-		}()
+			}(ch)
+		}
 		go func() {
 			defer e.frameWG.Done()
 			for {
@@ -590,7 +600,11 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	pf := peerFrame{peer: peer, fr: fr}
 	switch fr.Type {
 	case "index":
-		e.enqueueFrame(e.indexFrames, pf)
+		ch, ok := e.indexFrames[fr.Store]
+		if !ok {
+			return // a store this machine does not carry
+		}
+		e.enqueueFrame(ch, pf)
 	case "want":
 		e.enqueueFrame(e.wantFrames, pf)
 	case "blob", "blobEnd":

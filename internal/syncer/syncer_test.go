@@ -1195,6 +1195,73 @@ func TestDeletingTheSamePathTwiceKeepsBothTrashCopies(t *testing.T) {
 	}
 }
 
+// Index frames are queued per store. With one shared queue, a store whose
+// handler is busy held every other store's frames behind it, so small stores
+// never converged while a large one worked through a backlog: on the real
+// mesh a Videos store propagating thousands of deletions starved Documents,
+// Pictures and BulkPictures indefinitely.
+func TestOneBusyStoreDoesNotStarveAnother(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"slow":  {Group: "g"},
+		"quick": {Group: "g"},
+	})
+	n.prepareAll()
+	n.eng.startFrameWorkers()
+
+	// Occupy the slow store's worker for the whole test.
+	release := make(chan struct{})
+	defer close(release)
+	blocked := make(chan struct{})
+	slow := n.store("slow")
+	slow.scanMu.Lock()
+	go func() {
+		close(blocked)
+		<-release
+		slow.scanMu.Unlock()
+	}()
+	<-blocked
+
+	// A delete frame for the slow store makes its handler reach for scanMu.
+	n.eng.OnPeerFrame("b", mustFrame(t, frame{
+		Type:  "index",
+		Store: "slow",
+		Entries: []*Entry{{
+			Path: "stuck.txt", Blob: strings.Repeat("1", 64),
+			Size: 1, MTime: time.Now().UnixNano(), Mode: 0o644,
+			VV: map[string]uint64{"b": 1},
+		}},
+	}))
+
+	// The quick store must still make progress.
+	content := "arrives anyway"
+	sum, err := store.Sum(strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent := &Entry{
+		Path: "quick.txt", Blob: sum, Size: int64(len(content)),
+		MTime: time.Now().UnixNano(), Mode: 0o644,
+		VV: map[string]uint64{"b": 1},
+	}
+	n.eng.OnPeerFrame("b", mustFrame(t, frame{Type: "index", Store: "quick", Entries: []*Entry{ent}}))
+
+	waitFor(t, 20*time.Second, "the quick store to request its blob", func() bool {
+		n.eng.mu.Lock()
+		_, asked := n.eng.wants[wantKey("quick", ent.Path)]
+		n.eng.mu.Unlock()
+		return asked
+	})
+}
+
+func mustFrame(t *testing.T, fr frame) []byte {
+	t.Helper()
+	b, err := json.Marshal(fr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func sameDevice(a, b string) bool {
 	sa, ea := os.Stat(a)
 	sb, eb := os.Stat(b)
