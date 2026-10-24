@@ -1051,6 +1051,109 @@ func TestReconcileKeepsNonEmptyDirectoryBusy(t *testing.T) {
 	}
 }
 
+// A sender that restarts a transfer begins again at seq 0. Appending those
+// bytes onto the partial file produces a blob that can never hash correctly,
+// so the receiver re-requests forever: the loop that pushed 37 GB over the
+// wire for a 105-entry store. The restarted stream must win, and the file
+// must verify and apply.
+func TestRestartedBlobTransferReplacesPartialBytes(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	content := strings.Repeat("payload", 4096)
+	sum, err := store.Sum(strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent := &Entry{
+		Path:  "restarted.bin",
+		Blob:  sum,
+		Size:  int64(len(content)),
+		MTime: time.Now().UnixNano(),
+		Mode:  0o644,
+		VV:    map[string]uint64{"b": 1},
+	}
+
+	// An abandoned first attempt: the opening chunk arrives and the rest
+	// never does.
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 0, Data: []byte("stale bytes")})
+
+	// The sender starts over with the whole file.
+	half := len(content) / 2
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 0, Data: []byte(content[:half])})
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 1, Data: []byte(content[half:])})
+	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: ent.Path, Entry: ent})
+
+	if !n.eng.store.Has(sum) {
+		t.Fatalf("restarted transfer did not verify: %s", lastLines(n.log.String(), 10))
+	}
+	if got := readFile(t, filepath.Join(fs.root, ent.Path)); got != content {
+		t.Fatalf("materialised %d bytes, want %d", len(got), len(content))
+	}
+}
+
+// A chunk that is neither the expected next one nor a restart cannot be
+// trusted to extend the file: the transfer is abandoned rather than written
+// into a blob that fails verification later.
+func TestOutOfOrderBlobChunkAbandonsTransfer(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: "gap.bin", Seq: 0, Data: []byte("first")})
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: "gap.bin", Seq: 7, Data: []byte("jumped")})
+
+	n.eng.mu.Lock()
+	_, open := n.eng.incoming[incomeKey("b", "docs", "gap.bin")]
+	n.eng.mu.Unlock()
+	if open {
+		t.Fatal("an out-of-order chunk left the transfer open")
+	}
+}
+
+// A want recorded for one version must not verify the bytes of another: the
+// sender's entry describes what actually arrived. A superseded want drops the
+// bytes instead of failing verification in a loop.
+func TestSupersededWantDropsArrivingBlob(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+
+	arrived := "the bytes the sender actually has"
+	sum, err := store.Sum(strings.NewReader(arrived))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := &Entry{
+		Path:  "superseded.bin",
+		Blob:  sum,
+		Size:  int64(len(arrived)),
+		MTime: time.Now().UnixNano(),
+		Mode:  0o644,
+		VV:    map[string]uint64{"b": 2},
+	}
+	// This side is still waiting on an older version's content.
+	n.eng.mu.Lock()
+	n.eng.wants[wantKey("docs", sent.Path)] = &pending{entry: &Entry{
+		Path: sent.Path,
+		Blob: strings.Repeat("0", 64),
+		VV:   map[string]uint64{"b": 1},
+	}}
+	n.eng.mu.Unlock()
+
+	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: sent.Path, Seq: 0, Data: []byte(arrived)})
+	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: sent.Path, Entry: sent})
+
+	if exists(filepath.Join(n.root("docs"), sent.Path)) {
+		t.Fatal("a superseded want materialised content the journal never asked for")
+	}
+	n.eng.mu.Lock()
+	_, stillWanted := n.eng.wants[wantKey("docs", sent.Path)]
+	n.eng.mu.Unlock()
+	if stillWanted {
+		t.Fatal("the stale want survived, so the request will loop")
+	}
+}
+
 func sameDevice(a, b string) bool {
 	sa, ea := os.Stat(a)
 	sb, eb := os.Stat(b)

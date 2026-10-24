@@ -33,10 +33,15 @@ type pending struct {
 	conflictName string
 }
 
+// incomingBlob is a transfer in progress. next is the chunk sequence this
+// side expects: a sender that restarts a transfer begins again at 0, and
+// appending its bytes onto the partial file would produce a blob that can
+// never hash correctly, so the file is reset instead of extended.
 type incomingBlob struct {
 	store string
 	f     *os.File
 	entry *Entry
+	next  int
 }
 
 func wantKey(store, path string) string { return store + "\x00" + path }
@@ -293,7 +298,13 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 	}
 }
 
-// handleBlob collects incoming chunks into a temp file.
+// handleBlob collects incoming chunks into a temp file. Chunk sequence is
+// honoured: seq 0 restarts the file (a re-sent transfer must not append onto
+// the bytes of the abandoned one), and any other out-of-order chunk abandons
+// the transfer rather than writing a blob that cannot hash correctly. Before
+// this, a sender that reconnected mid-file made the receiver append a second
+// copy, fail verification, re-request, and loop forever — 37 GB over the wire
+// for a 105-entry store.
 func (e *Engine) handleBlob(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
 	if fs == nil || !validRel(fr.Path) {
@@ -304,6 +315,12 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 	e.mu.Lock()
 	inc := e.incoming[key]
 	if inc == nil {
+		if fr.Seq != 0 {
+			// Mid-stream chunk with no transfer open: the start was dropped,
+			// so there is nothing this can validly extend.
+			e.mu.Unlock()
+			return
+		}
 		f, err := e.store.Temp()
 		if err != nil {
 			e.mu.Unlock()
@@ -314,11 +331,32 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 	}
 	e.mu.Unlock()
 
+	if fr.Seq != inc.next {
+		if fr.Seq != 0 {
+			e.logger.Warn("out-of-order blob chunk; abandoning the transfer",
+				"store", fs.name, "path", fr.Path, "peer", peer, "want", inc.next, "got", fr.Seq)
+			e.dropIncoming(key, inc)
+			return
+		}
+		// The sender started over: truncate rather than append.
+		if err := inc.f.Truncate(0); err != nil {
+			e.dropIncoming(key, inc)
+			return
+		}
+		if _, err := inc.f.Seek(0, io.SeekStart); err != nil {
+			e.dropIncoming(key, inc)
+			return
+		}
+		inc.next = 0
+	}
+
 	if len(fr.Data) > 0 {
 		if _, err := inc.f.Write(fr.Data); err != nil {
 			e.dropIncoming(key, inc)
+			return
 		}
 	}
+	inc.next = fr.Seq + 1
 }
 
 // handleBlobEnd verifies, stores and applies a completed blob.
@@ -340,11 +378,23 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	}
 	defer os.Remove(inc.f.Name())
 
+	// The sender's entry describes the bytes that actually arrived; the
+	// remembered want only says what to do with them. Trusting a stale want's
+	// blob made every arrival fail verification against a hash the sender was
+	// never transmitting, re-request, and loop. Verify against the sender,
+	// then require the want (when there is one) to agree before applying.
 	wantEntry := fr.Entry
-	if want != nil && want.entry != nil {
-		wantEntry = want.entry
-	}
 	if wantEntry == nil || wantEntry.Blob == "" {
+		inc.f.Close()
+		return
+	}
+	if want != nil && want.entry != nil && want.entry.Blob != wantEntry.Blob {
+		// A newer version superseded what this side asked for: keep the bytes
+		// out of the journal and let the next index exchange request the
+		// current one.
+		e.logger.Info("blob superseded before it arrived; dropping it",
+			"store", fs.name, "path", fr.Path, "peer", peer,
+			"asked", want.entry.Blob, "got", wantEntry.Blob)
 		inc.f.Close()
 		return
 	}
@@ -366,12 +416,19 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 		return
 	}
 
+	// The blobs agree, so the want's entry carries the same content with the
+	// merged version vector conflict resolution computed; prefer it so a
+	// resolved pair cannot re-conflict on the next exchange.
+	applyEnt := wantEntry
+	if want != nil && want.entry != nil {
+		applyEnt = want.entry
+	}
 	if want != nil && want.conflict {
-		e.writeConflictCopy(fs, want, wantEntry)
+		e.writeConflictCopy(fs, want, applyEnt)
 		return
 	}
-	if err := e.applyEntry(fs, wantEntry); err != nil {
-		e.logger.Warn("apply entry", "store", fs.name, "path", wantEntry.Path, "error", err)
+	if err := e.applyEntry(fs, applyEnt); err != nil {
+		e.logger.Warn("apply entry", "store", fs.name, "path", applyEnt.Path, "error", err)
 	}
 }
 
