@@ -489,7 +489,18 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		return
 	}
 	if handler != nil {
-		handler.OnPeerConnected(p.name, w.write)
+		// Initial indexes can be large on real stores. Run the handler apart
+		// from the reader: both peers send their full index at connect time,
+		// and blocking here lets both TCP buffers fill before either side
+		// starts reading the other index.
+		m.spawn(func() {
+			p.mu.Lock()
+			stillCurrent := p.conn == c
+			p.mu.Unlock()
+			if stillCurrent {
+				handler.OnPeerConnected(p.name, w.write)
+			}
+		})
 	}
 
 	stop := make(chan struct{})
