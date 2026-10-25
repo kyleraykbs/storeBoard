@@ -34,6 +34,7 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	fs.setScanning(true)
 	defer fs.setScanning(false)
 	seen := make(map[string]bool)
+	var dirs []string
 	var changed []*Entry
 	var unmaterialised int
 
@@ -45,7 +46,14 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 			return err
 		}
 		if d.IsDir() {
-			return nil // WalkDir does not follow directory symlinks
+			// WalkDir does not follow directory symlinks. Every directory is
+			// collected: reconcileDirs decides which of them need an entry.
+			if path != root {
+				if rel, rerr := filepath.Rel(root, path); rerr == nil {
+					dirs = append(dirs, rel)
+				}
+			}
+			return nil
 		}
 		name := d.Name()
 		if strings.HasPrefix(name, tmpPrefix) {
@@ -134,7 +142,7 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	fs.setLocal(len(seen))
 
 	for _, ent := range fs.db.All() {
-		if ent.Deleted || seen[ent.Path] {
+		if ent.Deleted || ent.Dir || seen[ent.Path] {
 			continue
 		}
 		if !tombstones {
@@ -170,7 +178,16 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 		gone.Deleted = true
 		e.record(fs, gone)
 		changed = append(changed, tomb)
+		// A directory exists because it held a file; once that file is gone
+		// the directory goes too. A directory the user made is recorded as a
+		// Dir entry and stops the walk.
+		e.pruneEmptyParents(fs, ent.Path)
 	}
+
+	// Directories are reconciled after deletions: a directory this pass just
+	// emptied has been pruned, and recording it now would resurrect it as a
+	// user-created empty directory.
+	changed = append(changed, e.reconcileDirs(fs, dirs, seen, tombstones)...)
 
 	if unmaterialised > 0 {
 		e.logger.Info("skipped entries this machine never materialised; their absence is not a deletion",
@@ -223,4 +240,135 @@ func (e *Engine) adoptFile(path, sum string) (string, error) {
 		e.logger.Debug("file changed while being scanned", "path", path, "hashed", sum, "stored", stored)
 	}
 	return stored, nil
+}
+
+// reconcileDirs keeps the journal's directory entries in step with the tree.
+//
+// Only directories with no files below them are recorded. A directory holding
+// files is already described by those paths, and applying a file creates its
+// parents, so an entry would be churn. An empty directory — the one the user
+// just made, or one holding nothing but other empty directories — has no
+// other trace in the journal, and without an entry it would never reach a
+// peer.
+//
+// The inverse matters just as much: once a directory gains a file its entry
+// is tombstoned, so that when the file is later deleted nothing claims the
+// directory should stay. That is what makes "the files left, so the directory
+// goes" true without touching empty directories the user created.
+func (e *Engine) reconcileDirs(fs *StoreState, dirs []string, files map[string]bool, tombstones bool) []*Entry {
+	hasFiles := make(map[string]bool, len(dirs))
+	for path := range files {
+		for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
+			if hasFiles[dir] {
+				break
+			}
+			hasFiles[dir] = true
+		}
+	}
+	present := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		present[d] = true
+	}
+
+	var changed []*Entry
+	for _, d := range dirs {
+		cur := fs.db.Get(d)
+		live := cur != nil && !cur.Deleted
+		switch {
+		case hasFiles[d]:
+			// The tree now describes this directory. Drop the entry so a
+			// later deletion of the last file can prune it.
+			if live && cur.Dir {
+				if tomb := e.tombstoneEntry(fs, cur); tomb != nil {
+					changed = append(changed, tomb)
+				}
+			}
+		case live && cur.Dir:
+			// Already recorded and still empty: nothing to do.
+		case live:
+			// A file entry at this path and a directory on disk. The walk
+			// saw the directory, so the stale file entry loses.
+			if tomb := e.tombstoneEntry(fs, cur); tomb != nil {
+				changed = append(changed, tomb)
+			}
+			fallthrough
+		default:
+			if info, err := os.Stat(filepath.Join(fs.root, d)); err != nil || !info.IsDir() {
+				continue // pruned by this pass: the files left it
+			}
+			ent := &Entry{Path: d, Dir: true, Mode: 0o755}
+			vv := map[string]uint64{}
+			if cur != nil {
+				vv = MergeVV(cur.VV, nil)
+			}
+			vv[e.me] = fs.db.Next()
+			ent.VV = vv
+			if err := fs.db.Put(ent); err != nil {
+				e.logger.Warn("record directory", "store", fs.name, "path", d, "error", err)
+				continue
+			}
+			changed = append(changed, ent)
+		}
+	}
+
+	if !tombstones {
+		return changed
+	}
+	for _, ent := range fs.db.All() {
+		if !ent.Dir || ent.Deleted || present[ent.Path] {
+			continue
+		}
+		if tomb := e.tombstoneEntry(fs, ent); tomb != nil {
+			changed = append(changed, tomb)
+		}
+	}
+	return changed
+}
+
+// tombstoneEntry records that a path is gone, extending the version it saw so
+// the deletion dominates. The vanished version is kept in history, which is
+// what a restore undoes; directories carry no content, so they are not
+// recorded there.
+func (e *Engine) tombstoneEntry(fs *StoreState, ent *Entry) *Entry {
+	tomb := ent.clone()
+	tomb.Deleted = true
+	tomb.Blob = ""
+	tomb.Size = 0
+	vv := MergeVV(ent.VV, nil)
+	vv[e.me] = fs.db.Next()
+	tomb.VV = vv
+	if err := fs.db.Put(tomb); err != nil {
+		e.logger.Warn("tombstone", "store", fs.name, "path", ent.Path, "error", err)
+		return nil
+	}
+	if !ent.Dir {
+		gone := ent.clone()
+		gone.Deleted = true
+		e.record(fs, gone)
+	}
+	return tomb
+}
+
+// pruneEmptyParents removes the directories a deleted file leaves behind,
+// walking up until something is non-empty or the store's declared empty
+// directory is reached. Callers hold scanMu.
+//
+// A directory recorded as a Dir entry is never removed: that entry is the
+// user's statement that the directory should exist, and it is exactly the
+// difference between an empty directory they made and one the files left.
+func (e *Engine) pruneEmptyParents(fs *StoreState, path string) {
+	for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator) && dir != ""; dir = filepath.Dir(dir) {
+		if ent := fs.db.Get(dir); ent != nil && !ent.Deleted && ent.Dir {
+			return
+		}
+		abs := filepath.Join(fs.root, dir)
+		entries, err := os.ReadDir(abs)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := os.Remove(abs); err != nil {
+			return
+		}
+		e.logger.Info("removed empty directory", "store", fs.name, "path", dir)
+	}
 }

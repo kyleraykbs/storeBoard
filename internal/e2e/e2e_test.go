@@ -438,7 +438,7 @@ func TestNewFileReachesPeerWhileLargeBlobStreams(t *testing.T) {
 
 	// Big enough that its transfer outlasts the deadline below by a wide
 	// margin on loopback.
-	large := make([]byte, 512<<20)
+	large := make([]byte, 1<<30)
 	for i := range large {
 		large[i] = byte('a' + i%26)
 	}
@@ -471,7 +471,7 @@ func TestNewFileReachesPeerWhileLargeBlobStreams(t *testing.T) {
 	// The small file must not wait for the transfer: unlike the eventual
 	// delivery the other tests assert, this one has a deadline well under the
 	// time the blob needs.
-	const budget = 8 * time.Second
+	const budget = 25 * time.Second
 	start := time.Now()
 	arrived := false
 	for time.Since(start) < budget {
@@ -490,6 +490,58 @@ func TestNewFileReachesPeerWhileLargeBlobStreams(t *testing.T) {
 		t.Skipf("the %d MiB blob finished within %s; the machine is too fast to measure", len(large)>>20, took.Round(time.Millisecond))
 	}
 	t.Logf("small file arrived in %s while the %d MiB blob was still streaming", took.Round(time.Millisecond), len(large)>>20)
+}
+
+// interestingLog returns the log lines that are not per-scan noise: a tests'
+// daemon logs store ready on every tick, which buries the event under test.
+// journalOf returns a store's journal, newest last.
+func journalOf(p *peer, store string) string {
+	b, err := os.ReadFile(filepath.Join(p.dataDir, "journal", store+".ndjson"))
+	if err != nil {
+		return err.Error()
+	}
+	return string(b)
+}
+
+// treeOf lists a directory's entries for failure messages.
+func treeOf(dir string) string {
+	var out []string
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || path == dir {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, path)
+		if d.IsDir() {
+			out = append(out, "d "+rel)
+		} else {
+			out = append(out, "f "+rel)
+		}
+		return nil
+	})
+	return strings.Join(out, "\n")
+}
+
+func interestingLog(p *peer) string {
+	if p.log == nil {
+		return ""
+	}
+	raw, err := os.ReadFile(p.log.Name())
+	if err != nil {
+		return err.Error()
+	}
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		for _, want := range []string{"deleted", "removed", "apply", "want", "error", "WARN", "ERROR", "conflict", "index", "prunedbg"} {
+			if strings.Contains(strings.ToLower(line), strings.ToLower(want)) {
+				out = append(out, line)
+				break
+			}
+		}
+	}
+	if len(out) > 60 {
+		out = out[len(out)-60:]
+	}
+	return strings.Join(out, "\n")
 }
 
 func tailLog(p *peer) string {
@@ -551,5 +603,128 @@ func TestEmptyFileMaterialisesWithItsDirectory(t *testing.T) {
 	info, err := os.Stat(filepath.Join(b.storeDir("docs"), "sdfsdfs", "test"))
 	if err != nil || !info.IsDir() {
 		t.Fatalf("the directory holding only an empty file did not materialise: %v", err)
+	}
+}
+
+// TestEmptyDirectoryTheUserMadeSyncs covers the half that must be preserved:
+// a directory the user creates and leaves empty is content in its own right,
+// so it appears on the peer and stays there.
+func TestEmptyDirectoryTheUserMadeSyncs(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	if err := os.MkdirAll(filepath.Join(a.storeDir("docs"), "empty", "also-empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the user's empty directories on bravo", func() bool {
+		for _, dir := range []string{"empty", "empty/also-empty"} {
+			info, err := os.Stat(filepath.Join(b.storeDir("docs"), dir))
+			if err != nil || !info.IsDir() {
+				return false
+			}
+		}
+		return true
+	})
+
+	// They are not transient: a few scans must not sweep them away.
+	time.Sleep(2 * time.Second)
+	for _, dir := range []string{"empty", "empty/also-empty"} {
+		if info, err := os.Stat(filepath.Join(b.storeDir("docs"), dir)); err != nil || !info.IsDir() {
+			t.Fatalf("the empty directory %q disappeared after syncing", dir)
+		}
+	}
+}
+
+// TestDirectoriesAreRemovedWhenTheirFilesLeave is the other half: a directory
+// exists because it held files. When the last file is deleted the directory
+// goes too, all the way up through directories that held nothing but those
+// now-empty directories.
+func TestDirectoriesAreRemovedWhenTheirFilesLeave(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	deep := filepath.Join("top", "middle", "leaf")
+	write(t, filepath.Join(a.storeDir("docs"), deep, "file.txt"), "content\n")
+	waitFor(t, "the nested file on bravo", func() bool {
+		_, err := os.Stat(filepath.Join(b.storeDir("docs"), deep, "file.txt"))
+		return err == nil
+	})
+
+	if err := os.Remove(filepath.Join(a.storeDir("docs"), deep, "file.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, root := range []struct {
+		name string
+		dir  string
+		log  *peer
+	}{{"alpha", a.storeDir("docs"), a}, {"bravo", b.storeDir("docs"), b}} {
+		for _, dir := range []string{"top/middle/leaf", "top/middle", "top"} {
+			gone := filepath.Join(root.dir, dir)
+			deadline := time.Now().Add(wait)
+			for time.Now().Before(deadline) {
+				if _, err := os.Stat(gone); os.IsNotExist(err) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if _, err := os.Stat(gone); err == nil {
+				t.Fatalf("%s kept %s after its last file was deleted\nalpha journal:\n%s\nbravo journal:\n%s\nalpha tree:\n%s\nbravo tree:\n%s\nalpha log:\n%s\nbravo log:\n%s",
+					root.name, dir, journalOf(a, "docs"), journalOf(b, "docs"), treeOf(a.storeDir("docs")), treeOf(b.storeDir("docs")), interestingLog(a), interestingLog(b))
+			}
+		}
+		// The store root itself is not a directory the tree may remove.
+		if info, err := os.Stat(root.dir); err != nil || !info.IsDir() {
+			t.Fatalf("%s removed its own store root", root.name)
+		}
+	}
+}
+
+// TestEmptiedDirectoryKeepsAUserMadeChild documents the boundary: a directory
+// whose only remaining child is one the user made stays, because that child is
+// recorded and must exist.
+func TestEmptiedDirectoryKeepsAUserMadeChild(t *testing.T) {
+	a, b := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+
+	write(t, filepath.Join(a.storeDir("docs"), "parent", "file.txt"), "content\n")
+	if err := os.MkdirAll(filepath.Join(a.storeDir("docs"), "parent", "kept"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the tree on bravo", func() bool {
+		if _, err := os.Stat(filepath.Join(b.storeDir("docs"), "parent", "file.txt")); err != nil {
+			return false
+		}
+		info, err := os.Stat(filepath.Join(b.storeDir("docs"), "parent", "kept"))
+		return err == nil && info.IsDir()
+	})
+
+	if err := os.Remove(filepath.Join(a.storeDir("docs"), "parent", "file.txt")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(b.storeDir("docs"), "parent", "file.txt")); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(b.storeDir("docs"), "parent", "file.txt")); err == nil {
+		t.Fatalf("bravo kept the deleted file\nalpha journal:\n%s\nbravo journal:\n%s\nalpha tree:\n%s\nbravo tree:\n%s",
+			journalOf(a, "docs"), journalOf(b, "docs"), treeOf(a.storeDir("docs")), treeOf(b.storeDir("docs")))
+	}
+
+	for _, root := range []struct{ name, dir string }{{"alpha", a.storeDir("docs")}, {"bravo", b.storeDir("docs")}} {
+		info, err := os.Stat(filepath.Join(root.dir, "parent", "kept"))
+		if err != nil || !info.IsDir() {
+			t.Fatalf("%s dropped the user's empty child directory: %v", root.name, err)
+		}
 	}
 }

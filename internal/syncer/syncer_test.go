@@ -1383,3 +1383,29 @@ func TestBusyWantDoesNotBlockAnotherStoresIndex(t *testing.T) {
 	})
 	close(release)
 }
+
+// A directory that existed only to hold files is removed when its last file
+// goes, all the way up through directories that held nothing else.
+func TestScanPrunesDirectoriesEmptiedByDeletion(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	deep := filepath.Join("top", "middle", "leaf")
+	writeFile(t, filepath.Join(fs.root, deep, "file.txt"), "content", time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(fs.root, deep, "file.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dir := range []string{"top/middle/leaf", "top/middle", "top"} {
+		if info, err := os.Stat(filepath.Join(fs.root, dir)); err == nil {
+			t.Fatalf("%s survived its deletion (still a directory: %v)", dir, info.IsDir())
+		}
+	}
+}

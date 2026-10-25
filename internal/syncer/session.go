@@ -137,6 +137,11 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		}
 		loc := fs.db.Get(rem.Path)
 
+		if rem.Dir {
+			e.handleDirEntry(peer, fs, rem, loc)
+			continue
+		}
+
 		switch {
 		case rem.Deleted:
 			if loc == nil || loc.Deleted {
@@ -158,6 +163,16 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			}
 
 		case loc == nil || loc.Deleted:
+			// A tombstone is an ordinary entry for ordering purposes. A peer
+			// that has not heard about the deletion yet keeps resending the
+			// live entry; fetching it back resurrected the file the user had
+			// just removed. If our tombstone dominates, say so instead.
+			if loc != nil && loc.Deleted && Dominates(loc.VV, rem.VV) && !Dominates(rem.VV, loc.VV) {
+				if err := e.sendIndexTo(peer, fs, []*Entry{loc}); err != nil {
+					e.logger.Debug("push delete", "peer", peer, "error", err)
+				}
+				continue
+			}
 			e.request(peer, fs, rem, &pending{entry: rem})
 
 		case Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV):
@@ -176,6 +191,25 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			// file or content-store blob is absent/stale.
 			if loc.Blob == rem.Blob {
 				if e.needsMaterialization(fs, rem) {
+					if !fs.streamed && e.store.Has(rem.Blob) && e.pathMissing(fs, rem.Path) {
+						// A replica owns its tree. An entry whose file is
+						// gone is a deletion the user just made, not a
+						// pending fetch: asking for the bytes back resurrected
+						// the file before the next scan could record the
+						// deletion, and a peer's periodic index resent did it
+						// every second. Record the deletion here instead, so
+						// it dominates when the scanner next runs.
+						fs.scanMu.Lock()
+						tomb := e.tombstoneEntry(fs, loc)
+						if tomb != nil {
+							e.pruneEmptyParents(fs, rem.Path)
+						}
+						fs.scanMu.Unlock()
+						if tomb != nil {
+							e.broadcastIndex(fs, []*Entry{tomb})
+						}
+						continue
+					}
 					e.request(peer, fs, rem, &pending{entry: rem})
 					continue
 				}
@@ -187,6 +221,70 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			}
 			e.resolveConflict(peer, fs, loc, rem)
 		}
+	}
+}
+
+// handleDirEntry folds a peer's directory entry into the journal. Directories
+// carry no bytes, so none of the blob machinery applies: the entry's existence
+// is the content, and the version vector decides who is right.
+func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
+	switch {
+	case rem.Deleted:
+		if loc == nil || loc.Deleted {
+			return
+		}
+		if Dominates(rem.VV, loc.VV) {
+			if err := e.applyDelete(fs, loc); err != nil {
+				e.logger.Warn("directory delete not applied", "store", fs.name, "path", loc.Path, "error", err)
+				_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+				return
+			}
+			merged := MergeVV(loc.VV, rem.VV)
+			_ = fs.db.Put(&Entry{Path: rem.Path, Dir: true, Deleted: true, VV: merged})
+			return
+		}
+		_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+
+	case loc == nil || loc.Deleted:
+		if loc != nil && loc.Deleted && Dominates(loc.VV, rem.VV) && !Dominates(rem.VV, loc.VV) {
+			// Our removal dominates a peer's stale directory entry.
+			_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+			return
+		}
+		if err := e.applyEntry(fs, rem); err != nil {
+			e.logger.Warn("create directory", "store", fs.name, "path", rem.Path, "error", err)
+		}
+
+	case !loc.Dir:
+		// A path cannot be a file and a directory at once; the newer side wins.
+		if Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV) {
+			if err := e.applyEntry(fs, rem); err != nil {
+				e.logger.Warn("replace file with directory", "store", fs.name, "path", rem.Path, "error", err)
+			}
+			return
+		}
+		_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+
+	case Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV):
+		if err := e.applyEntry(fs, rem); err != nil {
+			e.logger.Warn("create directory", "store", fs.name, "path", rem.Path, "error", err)
+		}
+
+	case Dominates(loc.VV, rem.VV) && !Dominates(rem.VV, loc.VV):
+		_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+
+	default:
+		// Same version: the directory exists on both sides, so only a missing
+		// one needs recreating (a mount that came back empty, say).
+		if info, err := os.Stat(filepath.Join(fs.root, rem.Path)); err != nil || !info.IsDir() {
+			if err := e.applyEntry(fs, rem); err != nil {
+				e.logger.Warn("create directory", "store", fs.name, "path", rem.Path, "error", err)
+			}
+		}
+		merged := MergeVV(loc.VV, rem.VV)
+		upd := loc.clone()
+		upd.VV = merged
+		_ = fs.db.Put(upd)
 	}
 }
 
@@ -263,6 +361,13 @@ func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
 	}
 	_ = fs.db.Put(ent)
 	return ent
+}
+
+// pathMissing reports whether a store's canonical file is absent. Used to tell
+// "the bytes never arrived" from "the file was deleted here".
+func (e *Engine) pathMissing(fs *StoreState, path string) bool {
+	_, err := os.Stat(filepath.Join(fs.root, path))
+	return os.IsNotExist(err)
 }
 
 // request asks the peer for a blob and remembers what to do with it.
@@ -541,6 +646,17 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	defer fs.scanMu.Unlock()
 	dst := filepath.Join(fs.root, ent.Path)
 
+	if ent.Dir {
+		// A directory carries no bytes: its existence is the whole entry.
+		if info, err := os.Stat(dst); err == nil && !info.IsDir() {
+			return fmt.Errorf("%s exists and is not a directory", ent.Path)
+		}
+		if err := e.ensureDir(fs, dst); err != nil {
+			return err
+		}
+		return fs.db.Put(ent)
+	}
+
 	if info, err := os.Stat(dst); err == nil {
 		loc := fs.db.Get(ent.Path)
 		if loc == nil || loc.Size != info.Size() || loc.MTime != info.ModTime().UnixNano() {
@@ -647,6 +763,20 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	if err != nil {
 		return nil // already gone
 	}
+	if loc.Dir || info.IsDir() {
+		// A directory is only removed when nothing is left in it. A peer that
+		// still holds content under it keeps the tree; its own deletions
+		// prune it in turn.
+		if err := os.Remove(src); err != nil {
+			if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) || os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		e.logger.Info("removed directory", "store", fs.name, "path", loc.Path)
+		e.pruneEmptyParents(fs, loc.Path)
+		return nil
+	}
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
 	dst := filepath.Join(trash, loc.Path)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -660,6 +790,9 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	gone.Deleted = true
 	e.record(fs, gone)
 	e.logger.Info("deleted (moved to trash)", "store", fs.name, "path", loc.Path)
+	// The file has left this directory; if that emptied it, the directory
+	// goes too — unless it is one the user asked to keep.
+	e.pruneEmptyParents(fs, loc.Path)
 	return nil
 }
 

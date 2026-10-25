@@ -20,6 +20,12 @@ type Entry struct {
 	Mode    uint32            `json:"mode"`
 	VV      map[string]uint64 `json:"vv,omitempty"`
 	Deleted bool              `json:"deleted,omitempty"`
+	// Dir marks a directory with no files beneath it. A directory that holds
+	// files needs no entry: the file paths imply it, and applying one creates
+	// the parents. Only an otherwise invisible directory — one the user just
+	// made, or one holding nothing but empty directories — is recorded, so it
+	// exists on every peer instead of being silently local.
+	Dir bool `json:"dir,omitempty"`
 }
 
 func (e *Entry) clone() *Entry {
@@ -203,7 +209,7 @@ func (d *FileDB) LiveCount() int {
 	defer d.mu.Unlock()
 	count := 0
 	for _, ent := range d.entries {
-		if !ent.Deleted {
+		if !ent.Deleted && !ent.Dir {
 			count++
 		}
 	}
