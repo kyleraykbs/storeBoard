@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -97,42 +98,107 @@ type storeDecl struct {
 	Links    map[string]string `json:"links,omitempty"`
 }
 
-// startMesh builds a config per side, launches both daemons and returns them.
-func startMesh(t *testing.T, m mesh) (*peer, *peer) {
-	t.Helper()
-	cli, daemon := binaries(t)
-	_ = cli
-	dir := t.TempDir()
-	epA, epB := freePort(t), freePort(t)
+// network is a set of daemons sharing one group. A peer can be stopped and
+// restarted, which is how an outage is simulated without new machinery.
+type network struct {
+	t      *testing.T
+	daemon string
+	peers  map[string]*peer
+	order  []string
+}
 
-	a := &peer{name: "alpha", root: filepath.Join(dir, "a", "root"), dataDir: filepath.Join(dir, "a", "data"), socket: filepath.Join(dir, "a", "s.sock")}
-	b := &peer{name: "bravo", root: filepath.Join(dir, "b", "root"), dataDir: filepath.Join(dir, "b", "data"), socket: filepath.Join(dir, "b", "s.sock")}
-	for _, p := range []*peer{a, b} {
-		if err := os.MkdirAll(p.root, 0o755); err != nil {
+// startNetwork writes every peer's config with the whole mesh's endpoints,
+// then launches the named peers (all of them when none are named). A peer
+// left down can be brought up later with start.
+func startNetwork(t *testing.T, specs map[string]map[string]storeDecl, launch ...string) *network {
+	return startNetworkWith(t, specs, nil, launch...)
+}
+
+// startNetworkWith is startNetwork plus extra top-level config keys, such as
+// the backup schedule a restore test needs.
+func startNetworkWith(t *testing.T, specs map[string]map[string]storeDecl, extra map[string]any, launch ...string) *network {
+	t.Helper()
+	_, daemon := binaries(t)
+	dir := t.TempDir()
+	n := &network{t: t, daemon: daemon, peers: map[string]*peer{}}
+	for name := range specs {
+		n.order = append(n.order, name)
+	}
+	sort.Strings(n.order)
+
+	eps := make([]endpoint, 0, len(n.order))
+	addrs := map[string]string{}
+	for _, name := range n.order {
+		addrs[name] = freePort(t)
+		eps = append(eps, endpoint{name, addrs[name]})
+		n.peers[name] = &peer{
+			name:    name,
+			root:    filepath.Join(dir, name, "root"),
+			dataDir: filepath.Join(dir, name, "data"),
+			socket:  filepath.Join(dir, name, "s.sock"),
+		}
+		if err := os.MkdirAll(n.peers[name].root, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	a.cfgPath = writeConfig(t, a, map[string]storeDecl{})
-	b.cfgPath = writeConfig(t, b, map[string]storeDecl{})
-	// The mesh ports are only known after both sides are allocated, so the
-	// configs are written once more with the real endpoints.
-	a.cfgPath = writeConfig(t, a, m.storesA, endpoint{a.name, epA}, endpoint{b.name, epB})
-	b.cfgPath = writeConfig(t, b, m.storesB, endpoint{a.name, epA}, endpoint{b.name, epB})
-
-	startDaemon(t, daemon, a)
-	startDaemon(t, daemon, b)
+	for _, name := range n.order {
+		p := n.peers[name]
+		p.cfgPath = writeConfigExt(t, p, specs[name], extra, eps...)
+	}
+	start := launch
+	if len(start) == 0 {
+		start = n.order
+	}
+	for _, name := range start {
+		n.start(name)
+	}
 	t.Cleanup(func() {
-		for _, p := range []*peer{a, b} {
-			stop(p)
+		for _, name := range n.order {
+			stop(n.peers[name])
 		}
 	})
-	return a, b
+	return n
+}
+
+func (n *network) start(name string) { startDaemon(n.t, n.daemon, n.peers[name]) }
+
+// kill stops a daemon without letting it shut down, which is the crash the
+// write path must survive.
+func (n *network) kill(name string) {
+	p := n.peers[name]
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	_ = p.cmd.Process.Kill()
+	_ = p.cmd.Wait()
+	if p.log != nil {
+		_ = p.log.Close()
+	}
+	p.cmd = nil
+}
+func (n *network) stop(name string)       { stop(n.peers[name]) }
+func (n *network) peer(name string) *peer { return n.peers[name] }
+
+// startMesh is the common two-machine case.
+func startMesh(t *testing.T, m mesh) (*peer, *peer) {
+	t.Helper()
+	n := startNetwork(t, map[string]map[string]storeDecl{
+		"alpha": m.storesA,
+		"bravo": m.storesB,
+	})
+	return n.peer("alpha"), n.peer("bravo")
 }
 
 type endpoint struct{ name, addr string }
 
 // writeConfig renders one daemon's config file and returns its path.
 func writeConfig(t *testing.T, p *peer, stores map[string]storeDecl, extra ...endpoint) string {
+	t.Helper()
+	return writeConfigExt(t, p, stores, nil, extra...)
+}
+
+// writeConfigExt renders a config with extra top-level keys merged in.
+func writeConfigExt(t *testing.T, p *peer, stores map[string]storeDecl, top map[string]any, extra ...endpoint) string {
 	t.Helper()
 	self := endpoint{p.name, ""}
 	peers := map[string]any{}
@@ -158,6 +224,9 @@ func writeConfig(t *testing.T, p *peer, stores map[string]storeDecl, extra ...en
 		"peers":         peers,
 		"groups":        map[string]any{"g": map[string]any{"peers": members}},
 		"stores":        stores,
+	}
+	for k, v := range top {
+		doc[k] = v
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

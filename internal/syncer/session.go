@@ -141,6 +141,15 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			e.handleDirEntry(peer, fs, rem, loc)
 			continue
 		}
+		if loc != nil && !loc.Deleted && loc.Dir {
+			// A directory and a file cannot share a path. The directory wins,
+			// deterministically, because entries may live beneath it that
+			// cannot exist if the path becomes a file; a file, by contrast,
+			// can be parked whole beside it. Both machines compute the same
+			// winner, so the clash converges instead of ping-ponging.
+			_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+			continue
+		}
 
 		switch {
 		case rem.Deleted:
@@ -191,6 +200,17 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			// file or content-store blob is absent/stale.
 			if loc.Blob == rem.Blob {
 				if e.needsMaterialization(fs, rem) {
+					if !fs.streamed && e.store.Has(rem.Blob) && !e.pathMissing(fs, rem.Path) {
+						// A replica owns its tree. The bytes are here and the
+						// file differs from the journal, which means the user
+						// changed it since the last scan. Fetching the entry's
+						// blob would park that edit as a conflict copy and put
+						// the old content back — an ordinary edit turned into a
+						// conflict by a peer's periodic index resend. The
+						// scanner is about to record the edit with a newer
+						// version; leave the tree alone until it does.
+						continue
+					}
 					if !fs.streamed && e.store.Has(rem.Blob) && e.pathMissing(fs, rem.Path) {
 						// A replica owns its tree. An entry whose file is
 						// gone is a deletion the user just made, not a
@@ -256,14 +276,15 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 		}
 
 	case !loc.Dir:
-		// A path cannot be a file and a directory at once; the newer side wins.
-		if Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV) {
-			if err := e.applyEntry(fs, rem); err != nil {
-				e.logger.Warn("replace file with directory", "store", fs.name, "path", rem.Path, "error", err)
-			}
-			return
+		// A file holds this path here. The directory wins, and the file is
+		// parked under its conflict name so its bytes survive; that is the
+		// same rule every peer applies, so the clash cannot ping-pong.
+		if copyEnt := e.saveLocalConflict(fs, loc); copyEnt != nil {
+			e.broadcastIndex(fs, []*Entry{copyEnt})
 		}
-		_ = e.sendIndexTo(peer, fs, []*Entry{loc})
+		if err := e.applyEntry(fs, rem); err != nil {
+			e.logger.Warn("replace file with directory", "store", fs.name, "path", rem.Path, "error", err)
+		}
 
 	case Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV):
 		if err := e.applyEntry(fs, rem); err != nil {
@@ -326,6 +347,12 @@ func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
+	return e.saveLocalConflictLocked(fs, loc)
+}
+
+// saveLocalConflictLocked is saveLocalConflict for callers already holding
+// scanMu (applyEntry, which parks a file that a directory is about to replace).
+func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) *Entry {
 	src := filepath.Join(fs.root, loc.Path)
 	sum, err := store.SumFile(src)
 	if err != nil {
@@ -657,6 +684,15 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 		return fs.db.Put(ent)
 	}
 
+	// A path that must become a directory can be blocked by a file entry from
+	// another machine — the two machines disagree about the shape. The
+	// directory wins (the same rule handleDirEntry applies), and the file is
+	// parked so its bytes survive. Without this the child could never be
+	// written and the clash would never converge.
+	if err := e.unblockParents(fs, ent.Path); err != nil {
+		return err
+	}
+
 	if info, err := os.Stat(dst); err == nil {
 		loc := fs.db.Get(ent.Path)
 		if loc == nil || loc.Size != info.Size() || loc.MTime != info.ModTime().UnixNano() {
@@ -693,6 +729,30 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	}
 	_ = fs.db.Put(ent)
 	e.record(fs, ent)
+	return nil
+}
+
+// unblockParents frees every ancestor of path that a peer recorded as a file,
+// parking that file under its conflict name first. Callers hold scanMu.
+func (e *Engine) unblockParents(fs *StoreState, path string) error {
+	for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator) && dir != ""; dir = filepath.Dir(dir) {
+		loc := fs.db.Get(dir)
+		if loc == nil || loc.Deleted || loc.Dir {
+			continue
+		}
+		var parked string
+		if copyEnt := e.saveLocalConflictLocked(fs, loc); copyEnt != nil {
+			parked = copyEnt.Path
+			e.broadcastIndex(fs, []*Entry{copyEnt})
+		}
+		if tomb := e.tombstoneEntry(fs, loc); tomb != nil {
+			e.broadcastIndex(fs, []*Entry{tomb})
+		}
+		// Whatever was on disk is either parked or gone; make sure the path
+		// can hold a directory now.
+		_ = os.Remove(filepath.Join(fs.root, dir))
+		e.logger.Info("file replaced by a directory", "store", fs.name, "path", dir, "parked", parked)
+	}
 	return nil
 }
 
