@@ -502,8 +502,12 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 		MountOptions: fuse.MountOptions{
 			// The daemon runs as root but the files belong to the store's
 			// user, so let the kernel enforce the modes reported above
-			// instead of trusting whoever mounted it.
+			// instead of trusting whoever mounted it. allow_other is what
+			// lets that user reach the mount at all: without it FUSE admits
+			// only the mounting process, and every other uid gets EACCES
+			// before default_permissions is ever consulted.
 			Options:       []string{"default_permissions"},
+			AllowOther:    true,
 			FsName:        "storeboard",
 			Name:          "storeboard",
 			DisableXAttrs: true,
