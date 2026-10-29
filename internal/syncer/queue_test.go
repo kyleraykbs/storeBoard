@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -454,5 +455,98 @@ func TestCreateOfAnEmptyFileIsJournalled(t *testing.T) {
 	ent := n.store("docs").db.Get("empty.txt")
 	if ent == nil || ent.Deleted || ent.Size != 0 || ent.Blob == "" {
 		t.Fatalf("an empty file was not journalled: %+v", ent)
+	}
+}
+
+// A viewer opens an image read-write to edit its metadata and then reads it.
+// Refusing that read made the file look empty to the application while every
+// other reader saw the real bytes.
+func TestReadWriteOpenServesTheFilesBytes(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+
+	const body = "0123456789abcdef"
+	h, err := m.Create("clip.bin", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.WriteAt([]byte(body), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen for writing: reads must still return the file.
+	rw, err := m.Open("clip.bin", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if n, err := rw.ReadAt(buf, 0); err != nil || string(buf[:n]) != "0123" {
+		t.Fatalf("read at 0 = %q (%v)", buf[:n], err)
+	}
+	buf = make([]byte, 6)
+	if n, err := rw.ReadAt(buf, 10); err != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read at 10 = %q (%v)", buf[:n], err)
+	}
+	// Overwrite the middle, then read across the seam: the written bytes and
+	// the untouched ones must sit together correctly.
+	if _, err := rw.WriteAt([]byte("XYZ"), 6); err != nil {
+		t.Fatal(err)
+	}
+	all := make([]byte, len(body))
+	if n, err := rw.ReadAt(all, 0); err != nil && err != io.EOF {
+		t.Fatalf("full read: %v", err)
+	} else if n != len(body) {
+		t.Fatalf("full read returned %d bytes", n)
+	}
+	if want := "012345XYZ9abcdef"; string(all) != want {
+		t.Fatalf("content = %q, want %q", all, want)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ent := fs.db.Get("clip.bin"); ent == nil || ent.Size != int64(len(body)) {
+		t.Fatalf("journal entry after the edit = %+v", ent)
+	}
+}
+
+// Opening a large file for writing must not pull it down: only the ranges
+// written travel, and the commit assembles the whole file from the holder.
+func TestReadWriteOpenDoesNotFetchUntilWritten(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+
+	// No holder is reachable, so any fetch would fail. Opening must succeed,
+	// and so must a read of the untouched prefix when nothing was written.
+	if err := fs.db.Put(&Entry{Path: "big.bin", Blob: "blob", Size: 1 << 20, VV: map[string]uint64{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := m.Open("big.bin", false)
+	if err != nil {
+		t.Fatalf("open for write: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("closing without writing: %v", err)
+	}
+	fs.queueMu.Lock()
+	queued := len(fs.queue)
+	fs.queueMu.Unlock()
+	if queued != 0 {
+		t.Fatalf("an unmodified open queued %d ops", queued)
+	}
+	if ent := fs.db.Get("big.bin"); ent.Size != 1<<20 {
+		t.Fatalf("journal entry changed: %+v", ent)
 	}
 }

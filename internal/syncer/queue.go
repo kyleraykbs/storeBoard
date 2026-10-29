@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -284,7 +285,7 @@ func (m *storeMutator) Create(path string, mode uint32) (streamfs.PendingFile, e
 	if err := m.refuse(); err != nil {
 		return nil, err
 	}
-	pf, err := m.pending(path, mode, nil)
+	pf, err := m.pending(path, mode, 0, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -336,23 +337,46 @@ func (m *storeMutator) Open(path string, truncate bool) (streamfs.PendingFile, e
 	if ent == nil || ent.Deleted || ent.Dir {
 		return nil, os.ErrNotExist
 	}
+	base := ent.Size
+	var fetch func(off, length int64) ([]byte, error)
 	if truncate {
-		pf, err := m.pending(path, ent.Mode, nil)
-		if err != nil {
-			return nil, err
-		}
-		markTouched(pf)
-		return pf, nil
+		base = 0
+	} else {
+		fetch = m.fetcher(ent)
 	}
-	body, err := m.readAll(ent)
+	pf, err := m.pending(path, ent.Mode, base, fetch)
 	if err != nil {
 		return nil, err
 	}
-	return m.pending(path, ent.Mode, body)
+	if truncate {
+		markTouched(pf)
+	}
+	return pf, nil
 }
 
-// Truncate sets a file's length on the holder's content: the kept prefix is
-// fetched, the rest is dropped, and the result is queued as a new version.
+// fetcher reads an entry's bytes from a holder on demand. Opening a file for
+// writing must not download it: only the ranges the writer actually touches
+// come over the wire.
+func (m *storeMutator) fetcher(ent *Entry) func(off, length int64) ([]byte, error) {
+	return func(off, length int64) ([]byte, error) {
+		// Bytes this machine wrote and has not handed over yet live in the
+		// queue: that copy is newer than the holder's, so read it first.
+		if path, ok := m.e.queuedBlob(m.fs, ent.Blob); ok {
+			if f, err := os.Open(path); err == nil {
+				defer f.Close()
+				buf := make([]byte, length)
+				n, err := f.ReadAt(buf, off)
+				if err != nil && err != io.EOF {
+					return nil, err
+				}
+				return buf[:n], nil
+			}
+		}
+		return (&streamFetcher{e: m.e, fs: m.fs}).ReadRange(context.Background(),
+			streamfs.Entry{Path: ent.Path, Blob: ent.Blob, Size: ent.Size}, off, length)
+	}
+}
+
 func (m *storeMutator) Truncate(path string, size int64) error {
 	if err := m.refuse(); err != nil {
 		return err
@@ -364,25 +388,15 @@ func (m *storeMutator) Truncate(path string, size int64) error {
 	if ent == nil || ent.Deleted || ent.Dir {
 		return os.ErrNotExist
 	}
-	var keep []byte
-	if size > 0 {
-		body, err := m.readAll(ent)
-		if err != nil {
-			return err
-		}
-		if int64(len(body)) > size {
-			body = body[:size]
-		}
-		keep = body
-	}
-	pending, err := m.pending(path, ent.Mode, keep)
+	pf, err := m.pending(path, ent.Mode, ent.Size, m.fetcher(ent))
 	if err != nil {
 		return err
 	}
-	if err := pending.Truncate(size); err != nil {
+	if err := pf.Truncate(size); err != nil {
+		pf.Close()
 		return err
 	}
-	return pending.Close()
+	return pf.Close()
 }
 
 // readAll fetches an entry's whole content from a holder.
@@ -407,7 +421,7 @@ func (m *storeMutator) readAll(ent *Entry) ([]byte, error) {
 	return out, nil
 }
 
-func (m *storeMutator) pending(path string, mode uint32, seed []byte) (streamfs.PendingFile, error) {
+func (m *storeMutator) pending(path string, mode uint32, base int64, fetch func(off, length int64) ([]byte, error)) (streamfs.PendingFile, error) {
 	dir := queueBytesDir(m.e.dataDir, m.fs.name)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -416,15 +430,17 @@ func (m *storeMutator) pending(path string, mode uint32, seed []byte) (streamfs.
 	if err != nil {
 		return nil, err
 	}
-	if len(seed) > 0 {
-		if _, err := f.Write(seed); err != nil {
-			f.Close()
-			os.Remove(f.Name())
-			return nil, err
-		}
-	}
-	id := filepath.Base(f.Name())
-	return &pendingFile{e: m.e, fs: m.fs, path: path, mode: mode, f: f, id: id}, nil
+	return &pendingFile{
+		e:     m.e,
+		fs:    m.fs,
+		path:  path,
+		mode:  mode,
+		f:     f,
+		id:    filepath.Base(f.Name()),
+		base:  base,
+		size:  base,
+		fetch: fetch,
+	}, nil
 }
 
 func (m *storeMutator) Remove(path string) error {
@@ -582,6 +598,42 @@ func markTouched(pf streamfs.PendingFile) {
 	}
 }
 
+// span is one range of bytes written through a handle.
+type span struct{ start, end int64 }
+
+// addSpan records a written range, merging it with what is already there.
+func (p *pendingFile) addSpan(start, end int64) {
+	out := append(p.spans, span{start, end})
+	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
+	merged := out[:0]
+	for _, s := range out {
+		if n := len(merged); n > 0 && s.start <= merged[n-1].end {
+			if s.end > merged[n-1].end {
+				merged[n-1].end = s.end
+			}
+			continue
+		}
+		merged = append(merged, s)
+	}
+	p.spans = merged
+}
+
+// writtenWithin reports how much of [off, off+n) this handle wrote at the
+// start of the range: the caller reads that part from the scratch file and
+// asks the holder for the rest.
+func (p *pendingFile) writtenWithin(off, n int64) int64 {
+	for _, s := range p.spans {
+		if off < s.start || off >= s.end {
+			continue
+		}
+		if end := s.end - off; end < n {
+			return end
+		}
+		return n
+	}
+	return 0
+}
+
 // newOpID makes a queue id that sorts by creation time and never collides.
 func newOpID(e *Engine) string {
 	e.mu.Lock()
@@ -600,7 +652,15 @@ type pendingFile struct {
 	f    *os.File
 	id   string
 	mu   sync.Mutex
-	done bool
+	// base is the size the file already had on the holder; spans are the
+	// ranges this handle wrote; fetch reads the untouched bytes from a
+	// holder. Reads fall through to the holder instead of seeding a local
+	// copy, so opening a 20 GiB video read-write costs nothing.
+	base  int64
+	spans []span
+	size  int64
+	fetch func(off, length int64) ([]byte, error)
+	done  bool
 	// dirty records bytes written through this handle; touched records that
 	// the handle changed the file at all (created it, or truncated it). They
 	// are separate because a handle that wrote nothing yet must still commit
@@ -615,6 +675,71 @@ type pendingFile struct {
 	failed bool
 }
 
+// ReadAt serves the bytes this handle overwrote from the scratch file and the
+// rest from the holder, so a file opened for writing still reads correctly
+// without downloading it first.
+func (p *pendingFile) ReadAt(b []byte, off int64) (int, error) {
+	p.mu.Lock()
+	size, base, fetch := p.size, p.base, p.fetch
+	p.mu.Unlock()
+	if off >= size {
+		return 0, io.EOF
+	}
+	want := int64(len(b))
+	if rest := size - off; want > rest {
+		want = rest
+	}
+	var done int64
+	for done < want {
+		cur := off + done
+		p.mu.Lock()
+		local := p.writtenWithin(cur, want-done)
+		p.mu.Unlock()
+		if local > 0 {
+			n, err := p.f.ReadAt(b[done:done+local], cur)
+			done += int64(n)
+			if err != nil && err != io.EOF {
+				return int(done), err
+			}
+			if int64(n) < local {
+				return int(done), io.EOF
+			}
+			continue
+		}
+		// A gap: the holder holds it, unless it is past the original end
+		// (growth), where the bytes are zeroes by definition.
+		next := want - done
+		p.mu.Lock()
+		for _, s := range p.spans {
+			if s.start > cur && s.start-cur < next {
+				next = s.start - cur
+			}
+		}
+		p.mu.Unlock()
+		if fetchable := base - cur; fetchable < next {
+			next = fetchable
+		}
+		if next <= 0 {
+			// Beyond the original end: zero fill.
+			for i := done; i < want; i++ {
+				b[i] = 0
+			}
+			done = want
+			break
+		}
+		buf, err := fetch(cur, next)
+		if err != nil {
+			return int(done), err
+		}
+		copy(b[done:done+next], buf)
+		done += next
+	}
+	if done < int64(len(b)) {
+		return int(done), io.EOF
+	}
+	return int(done), nil
+}
+
 func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -626,7 +751,14 @@ func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
 		return 0, err
 	}
 	p.dirty = true
-	return p.f.WriteAt(b, off)
+	n, err := p.f.WriteAt(b, off)
+	if n > 0 {
+		p.addSpan(off, off+int64(n))
+		if end := off + int64(n); end > p.size {
+			p.size = end
+		}
+	}
+	return n, err
 }
 
 func (p *pendingFile) Sync() error {
@@ -649,7 +781,22 @@ func (p *pendingFile) Truncate(size int64) error {
 		return err
 	}
 	p.dirty = true
-	return p.f.Truncate(size)
+	if err := p.f.Truncate(size); err != nil {
+		return err
+	}
+	kept := p.spans[:0]
+	for _, s := range p.spans {
+		if s.start >= size {
+			continue
+		}
+		if s.end > size {
+			s.end = size
+		}
+		kept = append(kept, s)
+	}
+	p.spans = kept
+	p.size = size
+	return nil
 }
 
 // Close finalises the write: hash, journal, queue, and hand it to a holder if
@@ -695,6 +842,63 @@ func (p *pendingFile) close() error {
 	return p.recordCurrent()
 }
 
+// fillGaps writes the bytes from the holder into every range this handle did
+// not overwrite, so one commit produces the complete file.
+func (p *pendingFile) fillGaps(f *os.File) error {
+	p.mu.Lock()
+	size, base, fetch := p.size, p.base, p.fetch
+	spans := append([]span(nil), p.spans...)
+	p.mu.Unlock()
+	if fetch == nil || base <= 0 {
+		return nil
+	}
+	cur := int64(0)
+	for _, s := range spans {
+		if s.start > cur {
+			if err := p.copyFromHolder(f, fetch, cur, min64(s.start, base)); err != nil {
+				return err
+			}
+		}
+		if s.end > cur {
+			cur = s.end
+		}
+	}
+	if cur < min64(size, base) {
+		if err := p.copyFromHolder(f, fetch, cur, min64(size, base)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *pendingFile) copyFromHolder(f *os.File, fetch func(int64, int64) ([]byte, error), start, end int64) error {
+	for start < end {
+		want := end - start
+		if want > maxReadChunk {
+			want = maxReadChunk
+		}
+		buf, err := fetch(start, want)
+		if err != nil {
+			return err
+		}
+		if len(buf) == 0 {
+			return fmt.Errorf("%s: holder returned no bytes at offset %d", p.path, start)
+		}
+		if _, err := f.WriteAt(buf, start); err != nil {
+			return err
+		}
+		start += int64(len(buf))
+	}
+	return nil
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // dropCreatedEntry removes the journal entry a refused create left behind: the
 // file must not appear in the tree when its bytes were never accepted.
 func (p *pendingFile) dropCreatedEntry() {
@@ -718,6 +922,13 @@ func (p *pendingFile) recordCurrent() error {
 	f := p.f
 	p.mu.Unlock()
 
+	// The scratch file holds only what this handle wrote. Fill the rest from
+	// the holder so the queued copy is the whole file.
+	if err := p.fillGaps(f); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return err
+	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(f.Name())

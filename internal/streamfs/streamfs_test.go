@@ -281,6 +281,16 @@ type fakePending struct {
 	closed int
 }
 
+func (f *fakePending) ReadAt(p []byte, off int64) (int, error) {
+	if f.closed > 0 {
+		return 0, os.ErrClosed
+	}
+	if off >= int64(len(f.body)) {
+		return 0, io.EOF
+	}
+	return copy(p, f.body[off:]), nil
+}
+
 func (f *fakePending) WriteAt(p []byte, off int64) (int, error) {
 	if f.closed > 0 {
 		return 0, os.ErrClosed

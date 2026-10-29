@@ -399,9 +399,15 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 		want = rest
 	}
 	if h.write != nil {
-		// The bytes exist only in the pending queue file so far; a read
-		// through the mount would need a holder that does not have them yet.
-		return nil, syscall.EAGAIN
+		// The handle may already have overwritten part of the file: read
+		// through it, so a writer sees its own bytes and the holder's
+		// everywhere else.
+		buf := make([]byte, want)
+		n, err := h.write.ReadAt(buf, off)
+		if err != nil && err != io.EOF {
+			return nil, errnoFor(err)
+		}
+		return fuse.ReadResultData(buf[:n]), 0
 	}
 	buf, err := h.fsys.fetcher.ReadRange(ctx, h.entry, off, want)
 	if err != nil {
@@ -494,7 +500,13 @@ type Mutator interface {
 
 // PendingFile is one file being written through the mount. Close is where the
 // bytes are hashed, journalled and queued; it must be idempotent.
+//
+// ReadAt is not optional: a viewer opens an image read-write to edit its
+// metadata, then reads it. Refusing that read made the file look empty
+// ("Empty document (application/x-zerosize)") even though every other reader
+// saw the real bytes.
 type PendingFile interface {
+	ReadAt(p []byte, off int64) (int, error)
 	WriteAt(p []byte, off int64) (int, error)
 	Truncate(size int64) error
 	Sync() error
