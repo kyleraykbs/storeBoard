@@ -398,3 +398,23 @@
   above needs: it is the only mode that mounts, and `remote` keeps its mirror
   meaning until the scratch-store proof lands. When `remote` flips, `stream`
   becomes its explicit spelling rather than a separate behaviour.
+
+## 2026-10-29 — What the mount learned: flush is per descriptor, commits are per open
+
+- **Decision:** `FLUSH` syncs and never finalises; `RELEASE` commits. A write
+  handle commits when it wrote, created or truncated; one that did neither is
+  dropped. The offline queue's `capped` policy refuses at write(2) with
+  `ENOSPC`, not at close.
+- **Why:** the first real two-daemon run failed every `printf > file` with
+  EIO. go-fuse's trace showed why: bash dups its redirect target and closes
+  the original, so the kernel sends `FLUSH` *before* `WRITE`. Finalising on
+  flush journalled an empty file and closed the handle under the pending
+  write. Moving the commit to `RELEASE` alone is correct but has no error
+  path, so a refusal had to move to the write itself.
+- **Also fixed:** `SETATTR size` was unimplemented, so `>` onto an existing
+  path (open + truncate) returned EOPNOTSUPP. Truncate now goes through the
+  mutator and keeps or pads the bytes.
+- **Verified:** `scripts/verify-streamed.sh` against two real daemons - read,
+  write, offline write with the holder's daemon stopped, and the flush when it
+  returns, all compared by sha256.
+- **Reversible:** yes - the queue and mount are additive to `stream` stores.

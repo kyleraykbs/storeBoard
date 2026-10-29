@@ -267,6 +267,48 @@ type fileNode struct {
 
 var _ = (fs.NodeOpener)((*fileNode)(nil))
 var _ = (fs.NodeGetattrer)((*fileNode)(nil))
+var _ = (fs.NodeSetattrer)((*fileNode)(nil))
+
+// Setattr honours truncate(2) and open(O_TRUNC), which is how a shell
+// redirect or `cp` resets a file. Mode and times are not the filesystem's to
+// decide - a store's permissions and mtimes come from the journal - so they
+// are accepted and ignored rather than refused.
+func (f *fileNode) Setattr(ctx context.Context, h fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	size, ok := in.GetSize()
+	if !ok {
+		if out != nil {
+			out.Mode = fuse.S_IFREG | 0o644
+			out.Size = uint64(f.entry.Size)
+		}
+		return 0
+	}
+	if h != nil {
+		if fh, isOurs := h.(*fileHandle); isOurs && fh.write != nil {
+			if err := fh.write.Truncate(int64(size)); err != nil {
+				return errnoFor(err)
+			}
+			fh.size = int64(size)
+			f.entry.Size = int64(size)
+			if out != nil {
+				out.Mode = fuse.S_IFREG | 0o644
+				out.Size = size
+			}
+			return 0
+		}
+	}
+	if f.fsys.mutator == nil {
+		return syscall.EROFS
+	}
+	if err := f.fsys.mutator.Truncate(f.path, int64(size)); err != nil {
+		return errnoFor(err)
+	}
+	f.entry.Size = int64(size)
+	if out != nil {
+		out.Mode = fuse.S_IFREG | 0o644
+		out.Size = size
+	}
+	return 0
+}
 
 // Getattr reports the size the journal recorded.
 func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -367,13 +409,16 @@ func (h *fileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Err
 	return 0
 }
 
-// Flush finalises a written file. Close(2) sees this error, so a policy that
-// refuses the write is reported to the writer rather than swallowed.
+// Flush is sent on every close(2) of a descriptor that refers to the file, not
+// once per open - a shell that dups its redirect target closes the original
+// before it writes. It must therefore never finalise: the file is committed in
+// Release, and a policy that refuses the data refuses it at write(2), which is
+// where the caller can still act on it.
 func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 	if h.write == nil {
 		return 0
 	}
-	if err := h.write.Close(); err != nil {
+	if err := h.write.Sync(); err != nil {
 		return errnoFor(err)
 	}
 	return 0
@@ -410,6 +455,9 @@ type Mutator interface {
 	// Open starts writing an existing file. Truncate decides whether the
 	// holder's current bytes are kept as the starting point.
 	Open(path string, truncate bool) (PendingFile, error)
+	// Truncate sets a file's length. Growing pads with zeroes; shrinking
+	// keeps the first size bytes.
+	Truncate(path string, size int64) error
 	Remove(path string) error
 	MakeDir(path string, mode uint32) error
 	RemoveDir(path string) error
@@ -459,6 +507,8 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 			FsName:        "storeboard",
 			Name:          "storeboard",
 			DisableXAttrs: true,
+			// STOREBOARD_FUSE_DEBUG logs every operation go-fuse serves.
+			Debug: os.Getenv("STOREBOARD_FUSE_DEBUG") != "",
 		},
 	}
 	server, err := fs.Mount(mountpoint, root, serverOpts)

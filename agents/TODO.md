@@ -47,6 +47,10 @@
   streamed store: send is a write through the mount, the other two are
   forwarded to a holder.
 - Remaining: the mobile on-demand fetch API; Android does not mount FUSE.
+- Script: `scripts/verify-streamed.sh --store <id> --holder-root <path>
+  --holder-ssh <host>` runs the read/write/offline/flush check from the
+  streaming machine and compares sha256 on both sides; `--holder-stop` and
+  `--holder-start` override how the holder's daemon is cycled.
 - Proved locally (2026-10-29): two real `storeboardd` processes on loopback,
   `a` local and `b` streamed. Read through b's mount, wrote through it (a
   received the file, b's blob store stayed empty, the queue drained), stopped

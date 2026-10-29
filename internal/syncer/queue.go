@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -283,7 +284,12 @@ func (m *storeMutator) Create(path string, mode uint32) (streamfs.PendingFile, e
 	if err := m.refuse(); err != nil {
 		return nil, err
 	}
-	return m.pending(path, mode, nil)
+	pf, err := m.pending(path, mode, nil)
+	if err != nil {
+		return nil, err
+	}
+	markTouched(pf)
+	return pf, nil
 }
 
 // Open seeds a write with the holder's current bytes unless the caller asked
@@ -298,13 +304,52 @@ func (m *storeMutator) Open(path string, truncate bool) (streamfs.PendingFile, e
 		return nil, os.ErrNotExist
 	}
 	if truncate {
-		return m.pending(path, ent.Mode, nil)
+		pf, err := m.pending(path, ent.Mode, nil)
+		if err != nil {
+			return nil, err
+		}
+		markTouched(pf)
+		return pf, nil
 	}
 	body, err := m.readAll(ent)
 	if err != nil {
 		return nil, err
 	}
 	return m.pending(path, ent.Mode, body)
+}
+
+// Truncate sets a file's length on the holder's content: the kept prefix is
+// fetched, the rest is dropped, and the result is queued as a new version.
+func (m *storeMutator) Truncate(path string, size int64) error {
+	if err := m.refuse(); err != nil {
+		return err
+	}
+	if size < 0 {
+		return os.ErrInvalid
+	}
+	ent := m.fs.db.Get(path)
+	if ent == nil || ent.Deleted || ent.Dir {
+		return os.ErrNotExist
+	}
+	var keep []byte
+	if size > 0 {
+		body, err := m.readAll(ent)
+		if err != nil {
+			return err
+		}
+		if int64(len(body)) > size {
+			body = body[:size]
+		}
+		keep = body
+	}
+	pending, err := m.pending(path, ent.Mode, keep)
+	if err != nil {
+		return err
+	}
+	if err := pending.Truncate(size); err != nil {
+		return err
+	}
+	return pending.Close()
 }
 
 // readAll fetches an entry's whole content from a holder.
@@ -474,6 +519,36 @@ func (e *Engine) nextVV(fs *StoreState, prev *Entry) map[string]uint64 {
 	return MergeVV(seen, map[string]uint64{e.me: fs.db.Next()})
 }
 
+// admits reports whether the offline queue can hold a file of this size. A
+// capped queue refuses at write time rather than at close: close(2) has no way
+// to report a FUSE release, and the caller can still act on a failed write.
+func (p *pendingFile) admits(size int64) error {
+	if size < 0 {
+		size = 0
+	}
+	policy := p.e.offlinePolicy(p.fs)
+	if policy != config.StreamQueueCapped || p.fs.offline == nil {
+		return nil
+	}
+	limit := p.fs.offline.MaxBytes
+	p.fs.queueMu.Lock()
+	queued := p.fs.queuedBytes
+	p.fs.queueMu.Unlock()
+	if queued+size > limit {
+		return fmt.Errorf("offline queue for store %q is full (%d of %d bytes): %w",
+			p.fs.name, queued+size, limit, syscall.ENOSPC)
+	}
+	return nil
+}
+
+// markTouched marks a fresh handle as a change on its own: creating an empty
+// file, or truncating one, must reach the journal even if nothing is written.
+func markTouched(pf streamfs.PendingFile) {
+	if p, ok := pf.(*pendingFile); ok {
+		p.touched = true
+	}
+}
+
 // newOpID makes a queue id that sorts by creation time and never collides.
 func newOpID(e *Engine) string {
 	e.mu.Lock()
@@ -493,6 +568,12 @@ type pendingFile struct {
 	id   string
 	mu   sync.Mutex
 	done bool
+	// dirty records bytes written through this handle; touched records that
+	// the handle changed the file at all (created it, or truncated it). They
+	// are separate because a handle that wrote nothing yet must still commit
+	// when it created the file: `touch` is a change with no write.
+	dirty   bool
+	touched bool
 }
 
 func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
@@ -501,6 +582,10 @@ func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
 	if p.done {
 		return 0, os.ErrClosed
 	}
+	if err := p.admits(off + int64(len(b))); err != nil {
+		return 0, err
+	}
+	p.dirty = true
 	return p.f.WriteAt(b, off)
 }
 
@@ -519,6 +604,10 @@ func (p *pendingFile) Truncate(size int64) error {
 	if p.done {
 		return os.ErrClosed
 	}
+	if err := p.admits(size); err != nil {
+		return err
+	}
+	p.dirty = true
 	return p.f.Truncate(size)
 }
 
@@ -526,8 +615,24 @@ func (p *pendingFile) Truncate(size int64) error {
 // one is reachable. A policy refusal happens here, before anything is
 // journalled, so the tree never claims a file the queue rejected.
 func (p *pendingFile) Close() error {
+	err := p.close()
+	if err != nil {
+		// Release has no error path back to the writer, so a refusal is
+		// recorded here rather than lost.
+		p.e.logger.Warn("write not accepted", "store", p.fs.name, "path", p.path, "error", err)
+	}
+	return err
+}
+
+func (p *pendingFile) close() error {
 	p.mu.Lock()
 	if p.done {
+		p.mu.Unlock()
+		return nil
+	}
+	if !p.dirty && !p.touched {
+		// Nothing changed through this handle: closing it must not add a
+		// version. The scratch file goes away when the process does.
 		p.mu.Unlock()
 		return nil
 	}
@@ -557,6 +662,8 @@ func (p *pendingFile) Close() error {
 		p.fs.queueMu.Unlock()
 		if queued+info.Size() > limit {
 			os.Remove(f.Name())
+			p.e.logger.Warn("offline queue full; write refused",
+				"store", p.fs.name, "path", p.path, "queued", queued, "size", info.Size(), "limit", limit)
 			return fmt.Errorf("offline queue for store %q is full (%d of %d bytes): %w",
 				p.fs.name, queued+info.Size(), limit, os.ErrPermission)
 		}

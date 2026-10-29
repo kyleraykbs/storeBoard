@@ -163,6 +163,11 @@ owned by storeboard, and file bytes are not retained on this machine.
   never touches it: journal, queue and mount only. A handler that walked or
   removed a path there would re-enter the filesystem while holding the scan
   lock.
+- FUSE hands the filesystem `FLUSH` on every close(2) of a descriptor that
+  refers to a file, not once per open: a shell that dups its redirect target
+  closes the original *before* it writes. `FLUSH` therefore only syncs and
+  `RELEASE` commits; a queue policy that refuses data refuses it at write(2),
+  where the caller can still act on it.
 - There is no read cache: a file is fetched per open/range. Disk cost is
   metadata plus queued offline writes only.
 - A detached streamed store never tombstones: absence is not deletion, and the

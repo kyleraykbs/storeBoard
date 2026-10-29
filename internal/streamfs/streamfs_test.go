@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 // fuseAvailable reports whether this machine can mount a userspace filesystem
@@ -270,3 +272,67 @@ func TestEmptyTreeMounts(t *testing.T) {
 	}
 	fmt.Fprint(io.Discard, "")
 }
+
+// fakePending records what the mount did to a file being written.
+type fakePending struct {
+	body   []byte
+	size   int64
+	synced bool
+	closed int
+}
+
+func (f *fakePending) WriteAt(p []byte, off int64) (int, error) {
+	if f.closed > 0 {
+		return 0, os.ErrClosed
+	}
+	f.body = append(f.body, p...)
+	return len(p), nil
+}
+
+func (f *fakePending) Truncate(size int64) error {
+	if f.closed > 0 {
+		return os.ErrClosed
+	}
+	f.size = size
+	return nil
+}
+
+func (f *fakePending) Sync() error { f.synced = true; return nil }
+
+func (f *fakePending) Close() error { f.closed++; return nil }
+
+// Truncate reaches the mutator when no write handle is open, which is what
+// `truncate(2)` and open(O_TRUNC) on an existing file do.
+func TestSetattrTruncatesThroughTheMutator(t *testing.T) {
+	pending := &fakePending{}
+	m := &recordingMutator{pending: pending}
+	f := &fileNode{fsys: &FS{mutator: m}, path: "notes.txt", entry: Entry{Path: "notes.txt", Size: 40}}
+
+	in := &fuse.SetAttrIn{}
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = 7
+	out := &fuse.AttrOut{}
+	if errno := f.Setattr(context.Background(), nil, in, out); errno != 0 {
+		t.Fatalf("setattr: %v", errno)
+	}
+	if m.truncated != 7 {
+		t.Fatalf("truncate(%d), want 7", m.truncated)
+	}
+	if f.entry.Size != 7 || out.Size != 7 {
+		t.Fatalf("sizes after truncate: entry=%d out=%d", f.entry.Size, out.Size)
+	}
+}
+
+// recordingMutator captures the calls the mount makes.
+type recordingMutator struct {
+	pending   *fakePending
+	truncated int64
+}
+
+func (m *recordingMutator) Create(string, uint32) (PendingFile, error) { return m.pending, nil }
+func (m *recordingMutator) Open(string, bool) (PendingFile, error)     { return m.pending, nil }
+func (m *recordingMutator) Truncate(_ string, size int64) error        { m.truncated = size; return nil }
+func (m *recordingMutator) Remove(string) error                        { return nil }
+func (m *recordingMutator) MakeDir(string, uint32) error               { return nil }
+func (m *recordingMutator) RemoveDir(string) error                     { return nil }
+func (m *recordingMutator) Rename(string, string) error                { return nil }

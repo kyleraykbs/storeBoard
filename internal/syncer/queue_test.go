@@ -49,9 +49,10 @@ func TestStreamedStoreWritesThroughToTheHolder(t *testing.T) {
 	}
 	// The streamed side keeps no copy once the holder has taken it.
 	waitFor(t, testWait, "the queue to drain", func() bool {
-		b.store("docs").scanMu.Lock()
-		defer b.store("docs").scanMu.Unlock()
-		return len(b.store("docs").queue) == 0
+		fs := b.store("docs")
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue) == 0
 	})
 	ent := b.store("docs").db.Get("notes.txt")
 	if ent == nil || ent.Blob == "" {
@@ -80,9 +81,12 @@ func TestStreamedStoreQueuesWritesWhileOffline(t *testing.T) {
 		t.Fatalf("offline write: %v", err)
 	}
 	fs := n.store("docs")
-	if ent := fs.db.Get("offline.txt"); ent == nil || ent.Deleted || ent.Blob == "" {
-		t.Fatalf("offline write was not journalled: %+v", ent)
-	}
+	// The journal entry lands when the kernel delivers RELEASE, just after
+	// close(2) returns.
+	waitFor(t, testWait, "the offline write to be journalled", func() bool {
+		ent := fs.db.Get("offline.txt")
+		return ent != nil && !ent.Deleted && ent.Blob != ""
+	})
 	fs.scanMu.Lock()
 	queued := len(fs.queue)
 	fs.scanMu.Unlock()
@@ -126,12 +130,12 @@ func TestStreamedStoreFlushesQueuedWritesOnReconnect(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(b.root("docs"), "later.txt"), []byte(body), 0o644); err != nil {
 		t.Fatalf("offline write: %v", err)
 	}
-	b.store("docs").scanMu.Lock()
-	queued := len(b.store("docs").queue)
-	b.store("docs").scanMu.Unlock()
-	if queued != 1 {
-		t.Fatalf("queued ops before the holder existed = %d, want 1", queued)
-	}
+	waitFor(t, testWait, "the write to be queued", func() bool {
+		fs := b.store("docs")
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue) == 1
+	})
 
 	startNode(t, a)
 	waitFor(t, testWait, "the queued write on the holder", func() bool {
@@ -141,9 +145,10 @@ func TestStreamedStoreFlushesQueuedWritesOnReconnect(t *testing.T) {
 		t.Fatalf("holder content = %q, want %q", got, body)
 	}
 	waitFor(t, testWait, "the queue to drain", func() bool {
-		b.store("docs").scanMu.Lock()
-		defer b.store("docs").scanMu.Unlock()
-		return len(b.store("docs").queue) == 0
+		fs := b.store("docs")
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue) == 0
 	})
 }
 
@@ -369,3 +374,81 @@ func TestStreamedStoreCappedQueueRefusesOverflow(t *testing.T) {
 
 // cfgDir is where this node's durable state lives.
 func (fs *StoreState) cfgDir(n *node) string { return n.cfg.DataDir }
+
+// A close(2) with nothing written must commit nothing: the kernel flushes
+// every descriptor close, and a shell that dups its redirect target closes the
+// original BEFORE it writes. Committing then journalled an empty file and made
+// the write that followed fail with EIO.
+func TestWriteHandleCommitsOnlyWhenDirty(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+
+	// An empty file exists already, so reopening it starts clean: there are
+	// no bytes to fetch and nothing has changed yet.
+	first, err := m.Create("notes.txt", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	queued := func() int {
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue)
+	}
+	if got := queued(); got != 1 {
+		t.Fatalf("queued after creating an empty file = %d, want 1", got)
+	}
+
+	h, err := m.Open("notes.txt", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("flush with nothing written: %v", err)
+	}
+	if got := queued(); got != 1 {
+		t.Fatalf("an unchanged flush queued another op: %d", got)
+	}
+	// The handle must still accept the write that follows that flush.
+	if _, err := h.WriteAt([]byte("two"), 0); err != nil {
+		t.Fatalf("write after an empty flush: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("close after writing: %v", err)
+	}
+	if got := queued(); got != 2 {
+		t.Fatalf("queued after the write = %d, want 2", got)
+	}
+	if ent := fs.db.Get("notes.txt"); ent == nil || ent.Size != 3 {
+		t.Fatalf("journal entry = %+v", ent)
+	}
+}
+
+// Creating an empty file is a change even with no bytes written: `touch` must
+// reach the mesh.
+func TestCreateOfAnEmptyFileIsJournalled(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	m := &storeMutator{e: n.eng, fs: n.store("docs")}
+	h, err := m.Create("empty.txt", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ent := n.store("docs").db.Get("empty.txt")
+	if ent == nil || ent.Deleted || ent.Size != 0 || ent.Blob == "" {
+		t.Fatalf("an empty file was not journalled: %+v", ent)
+	}
+}
