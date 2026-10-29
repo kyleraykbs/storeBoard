@@ -259,6 +259,13 @@ in
         PrivateMounts = false;
         PrivateTmp = false;
         ProtectSystem = false;
+        # These three are implemented with ReadOnlyPaths on /proc/sys and
+        # /sys, which implies a private mount namespace just as ProtectSystem
+        # does - the daemon still had a namespace of its own after the three
+        # above were dropped.
+        ProtectKernelTunables = false;
+        ProtectKernelModules = false;
+        ProtectControlGroups = false;
         RestrictNamespaces = false;
         AmbientCapabilities = [
           "CAP_CHOWN"
