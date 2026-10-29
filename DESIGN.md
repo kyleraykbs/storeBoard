@@ -137,28 +137,33 @@ one, it changes here first, deliberately, with a decision log entry.
   followed. The declared links are the daemon's to create and repair, from
   config.
 
-### Streamed stores (decided 2026-10-29, not yet built)
+### Streamed stores (decided 2026-10-29, implementation in progress)
 
-A store declared `stream` is not a mirror: the canonical path is a FUSE mount
-owned by storeboard, and the bytes are never written to this machine's disk.
+A store declared `remote` is not a mirror: the canonical path is a FUSE mount
+owned by storeboard, and file bytes are not retained on this machine.
 
 - The journal stays local and is the whole truth about the tree. Directories
   are synthesised from it, so structure exists even with no holder.
 - A read opens the file from the fastest reachable holder for that store.
-  Holders are the peers declaring the store `local`; throughput is measured
-  from real transfers (seeded by one small probe on connect) and an optional
-  pinned preference wins over the measurement.
-- A read that fails on the chosen holder is retried on the next one **before**
-  the caller sees an error; only when every holder has failed does the read
-  fail.
-- Writes go through to the chosen holder, so the write path is online-only.
-  When no holder is reachable the mount still presents the directory tree and
-  accepts writes; they are queued locally and merged on reconnect, where the
-  ordinary conflict rules apply (a taken name is parked, never overwritten).
-- There is no read cache: a file is fetched per open. Disk cost is metadata
-  only, which is the point.
-- A detached streamed store never tombstones: absence is not deletion (rule
-  16), and the journal is authoritative.
+  Holders are peers declaring the store `local`; throughput is measured from
+  real transfers (seeded by a small probe on connect), with an optional pinned
+  preference taking priority.
+- Reads use ranged requests. A 20 GiB video does not require a 20 GiB temp
+  file, and seeking does not restart a whole-file transfer.
+- A write goes through to the chosen holder. When no holder is reachable, the
+  mount still presents the directory tree and queues writes locally; the queue
+  policy is configurable as `unbounded` (default), `capped` with a byte limit,
+  or `readonly`. Queued writes merge on reconnect under the ordinary conflict
+  rules.
+- There is no read cache: a file is fetched per open/range. Disk cost is
+  metadata plus queued offline writes only.
+- A detached streamed store never tombstones: absence is not deletion, and the
+  journal is authoritative.
+- Rollout is staged: a scratch store proves the FUSE/read/write/failover path;
+  only then does BulkPictures change from the current mirror to streamed mode.
+  Its existing mirror is hash-verified against a holder before eviction.
+- Linux uses FUSE. The Android engine gets an on-demand fetch API instead of
+  mounting FUSE or silently keeping a second mirror.
 - Peers exchange index deltas; a side that lacks or is behind a version asks
   for the blob (`want` → `blob` chunks → `blobEnd`); a side that is ahead
   pushes its index entry. Concurrent edits resolve deterministically (newer

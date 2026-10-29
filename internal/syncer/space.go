@@ -40,10 +40,6 @@ func (e *Engine) Space() api.Space {
 }
 
 // Cleanup expires trash/history and reports orphaned store data separately
-// from ordinary retention. Orphan removal is deliberately unimplemented: a
-// store the config stopped declaring may still be valuable, and the engine
-// does not know whether the user reorganized, unplugged a disk, or mistyped
-// a name. The server is the authorization boundary for the cleanup call.
 func (e *Engine) Cleanup(removeOrphans bool) api.CleanupResult {
 	if removeOrphans {
 		e.logger.Warn("orphan removal is reserved for a future confirmation protocol")

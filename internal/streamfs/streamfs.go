@@ -34,10 +34,10 @@ type Entry struct {
 	Mode  uint32
 }
 
-// Fetcher opens the bytes of one entry. A streamed store never writes them to
-// disk, so the returned reader is the network transfer itself.
+// Fetcher opens one byte range of an entry. A streamed filesystem issues one
+// request per read, so it never needs a local file-sized cache.
 type Fetcher interface {
-	Open(ctx context.Context, entry Entry) (io.ReadCloser, error)
+	ReadRange(ctx context.Context, entry Entry, offset, length int64) ([]byte, error)
 }
 
 // Tree is the journal's view, replaced wholesale as the journal changes. Reads
@@ -191,50 +191,41 @@ func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrO
 	return 0
 }
 
-// Open starts a fetch. Reads pull from the returned handle's reader.
 func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if flags&uint32(os.O_WRONLY|os.O_RDWR) != 0 {
-		// Writes are a later phase: write-through needs the engine's conflict
-		// machinery, and refusing is honest until it exists.
 		return nil, 0, syscall.EROFS
 	}
 	if f.fsys.fetcher == nil {
 		return nil, 0, syscall.ENOSYS
 	}
-	body, err := f.fsys.fetcher.Open(ctx, f.entry)
-	if err != nil {
-		return nil, 0, errnoFor(err)
-	}
-	return &fileHandle{body: body}, 0, 0
+	return &fileHandle{fsys: f.fsys, entry: f.entry, size: f.entry.Size}, 0, 0
 }
 
-// fileHandle is one open file: a live network read.
 type fileHandle struct {
-	body io.ReadCloser
+	fsys  *FS
+	entry Entry
+	size  int64
 }
 
 var _ = (fs.FileReader)((*fileHandle)(nil))
 var _ = (fs.FileReleaser)((*fileHandle)(nil))
 
-// Read copies from the fetch into the caller's buffer.
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	if off > 0 {
-		if _, err := io.CopyN(io.Discard, h.body, off); err != nil && !errors.Is(err, io.EOF) {
-			return nil, errnoFor(err)
-		}
+	if off >= h.size {
+		return fuse.ReadResultData(nil), 0
 	}
-	n, err := io.ReadFull(h.body, dest)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	want := int64(len(dest))
+	if rest := h.size - off; want > rest {
+		want = rest
+	}
+	buf, err := h.fsys.fetcher.ReadRange(ctx, h.entry, off, want)
+	if err != nil {
 		return nil, errnoFor(err)
 	}
-	return fuse.ReadResultData(dest[:n]), 0
+	return fuse.ReadResultData(buf), 0
 }
 
-// Release closes the transfer.
 func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
-	if h.body != nil {
-		_ = h.body.Close()
-	}
 	return 0
 }
 

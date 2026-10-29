@@ -15,7 +15,6 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
 
-// frame is one wire line between two sync sessions.
 type frame struct {
 	Type    string   `json:"type"`
 	Store   string   `json:"store,omitempty"`
@@ -24,6 +23,10 @@ type frame struct {
 	Data    []byte   `json:"data,omitempty"`
 	Entry   *Entry   `json:"entry,omitempty"`
 	Entries []*Entry `json:"entries,omitempty"`
+	// Offset and Length scope a read to a byte window. A ranged read lets a
+	// streamed file seek without refetching a 20 GiB video from 0.
+	Offset int64 `json:"offset,omitempty"`
+	Length int64 `json:"length,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or
@@ -473,6 +476,18 @@ func (e *Engine) request(peer string, fs *StoreState, rem *Entry, p *pending) {
 	}
 }
 
+// requestRange asks the peer for a byte window of a blob. Offset and Length
+// mirror what a FUSE read asks for, so seeking a streamed file refetches only
+// the bytes the caller actually read.
+func (e *Engine) requestRange(peer string, fs *StoreState, rem *Entry, p *pending, offset, length int64) {
+	e.mu.Lock()
+	e.wants[wantKey(fs.name, rem.Path)] = p
+	e.mu.Unlock()
+	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path, Offset: offset, Length: length}); err != nil {
+		e.logger.Debug("want", "peer", peer, "error", err)
+	}
+}
+
 // --- serving ---------------------------------------------------------------
 
 // handleWant streams a stored blob in chunks.
@@ -491,6 +506,21 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 		return
 	}
 	defer blob.Close()
+
+	offset, length := fr.Offset, fr.Length
+	if offset < 0 || length < 0 || offset > ent.Size || (length > 0 && offset+length > ent.Size) {
+		e.logger.Warn("ranged want out of bounds", "store", fs.name, "path", fr.Path, "offset", offset, "length", length, "size", ent.Size)
+		return
+	}
+	if _, err := io.CopyN(io.Discard, blob, offset); err != nil && err != io.EOF {
+		return
+	}
+	if length > 0 {
+		blob = struct {
+			io.Reader
+			io.Closer
+		}{io.LimitReader(blob, length), blob}
+	}
 
 	buf := make([]byte, store.ChunkSize)
 	seq := 0
@@ -520,7 +550,7 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 			return
 		}
 	}
-	if err := e.sendTo(peer, frame{Type: "blobEnd", Store: fs.name, Path: fr.Path, Entry: ent}); err != nil {
+	if err := e.sendTo(peer, frame{Type: "blobEnd", Store: fs.name, Path: fr.Path, Entry: ent, Offset: fr.Offset, Length: fr.Length}); err != nil {
 		e.logger.Debug("blobEnd", "peer", peer, "error", err)
 	}
 }

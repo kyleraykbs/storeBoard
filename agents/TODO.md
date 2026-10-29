@@ -30,6 +30,19 @@
   it would let `adb`-driven scripts and a desktop over USB talk to the
   phone's daemon with the same CLI.
 
+## Streamed stores
+
+- Add the holder-selection/read-through protocol: FUSE on Linux, ranged
+  requests, throughput probes/EWMA, optional pinned holder, and fallback in
+  holder-rate order.
+- Add write-through plus offline queue policy: `unbounded` by default,
+  `capped` with an explicit byte limit, or `readonly`. Offline mounts show the
+  journal's directory tree but no file bytes.
+- Add the mobile on-demand fetch API; Android does not mount FUSE.
+- Stage the rollout on a scratch store. Only after the real path passes reads,
+  writes, failover and reconnect tests should BulkPictures switch from its
+  current mirror; hash-verify its 69 GiB mirror before eviction.
+
 ## Sync engine
 
 - Event stream (`--follow`, NDJSON) — designed, not built.

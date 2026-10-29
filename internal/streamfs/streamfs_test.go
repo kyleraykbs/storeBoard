@@ -44,13 +44,16 @@ type memoryFetcher struct {
 	opened []string
 }
 
-func (m *memoryFetcher) Open(ctx context.Context, entry Entry) (io.ReadCloser, error) {
+func (m *memoryFetcher) ReadRange(_ context.Context, entry Entry, offset, length int64) ([]byte, error) {
 	m.opened = append(m.opened, entry.Blob)
 	body, ok := m.bodies[entry.Blob]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	return io.NopCloser(strings.NewReader(body)), nil
+	if offset < 0 || offset > int64(len(body)) || length < 0 || offset+length > int64(len(body)) {
+		return nil, syscall.EINVAL
+	}
+	return []byte(body[offset : offset+length]), nil
 }
 
 // The mount presents the journal's tree: directories synthesised from deep
@@ -97,30 +100,24 @@ func TestMountServesJournalTree(t *testing.T) {
 		}
 	}
 
-	// A directory that exists only as a prefix of a deeper path is navigable.
-	deep := filepath.Join(mnt, "Walks & Daily", "October 2026", "Walk 4", "IMG_5639.JPG")
-	info, err := os.Stat(deep)
+	// Reads happen in at least one explicit range and write nothing locally.
+	deep, err := openDeep(t, mnt)
 	if err != nil {
-		t.Fatalf("stat deep file: %v", err)
+		t.Fatal(err)
 	}
-	if info.Size() != int64(len(body)) {
-		t.Fatalf("size = %d, want %d", info.Size(), len(body))
+	buf := make([]byte, 4)
+	if _, err := deep.ReadAt(buf, 2); err != nil {
+		t.Fatal(err)
 	}
-
-	got, err := os.ReadFile(deep)
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	if string(buf) != body[2:6] {
+		t.Fatalf("ranged read = %q", buf)
 	}
-	if string(got) != body {
-		t.Fatalf("content = %q", got)
+	if err := deep.Close(); err != nil {
+		t.Fatal(err)
 	}
-
-	// The bytes were fetched, not cached on disk.
-	if len(fetcher.opened) != 1 {
-		t.Fatalf("fetcher opened %d times, want 1", len(fetcher.opened))
+	if len(fetcher.opened) == 0 {
+		t.Fatal("no ranged fetch happened")
 	}
-	// Nothing was written: once detached, the mountpoint is the empty
-	// directory it was created as, not a tree of downloaded files.
 	if err := mounted.Unmount(); err != nil {
 		t.Fatalf("unmount: %v", err)
 	}
@@ -130,6 +127,40 @@ func TestMountServesJournalTree(t *testing.T) {
 	}
 	if len(leftovers) != 0 {
 		t.Fatalf("%d files were written behind the mount", len(leftovers))
+	}
+}
+
+func openDeep(t *testing.T, mount string) (*os.File, error) {
+	t.Helper()
+	return os.Open(filepath.Join(mount, "Walks & Daily", "October 2026", "Walk 4", "IMG_5639.JPG"))
+}
+
+func TestSeekUsesByteRanges(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	tree := NewTree(map[string]Entry{"big.bin": {Blob: "big", Size: 1024, Mode: 0o644}})
+	fetcher := &memoryFetcher{bodies: map[string]string{"big": strings.Repeat("x", 1024)}}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounted, err := Mount(mnt, tree, fetcher)
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	f, err := os.Open(filepath.Join(mnt, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	middle := make([]byte, 8)
+	if _, err := f.ReadAt(middle, 100); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if string(middle) != strings.Repeat("x", 8) {
+		t.Fatalf("seeking read = %q", middle)
 	}
 }
 

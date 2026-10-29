@@ -361,6 +361,19 @@
 - **Reversible:** yes — set `dataDir` explicitly and the old layout works; the
   blob store refills from the tree on demand.
 
+## 2026-10-29 — Streamed remote stores: automatic for non-offline, staged first
+- **Decision:** `remote` becomes the streamed mode: no local bytes, mounted
+  at the canonical path, holder-backed reads/writes, directory tree even when
+  detached, and configurable offline-write behaviour (`unbounded` default,
+  `capped`, or `readonly`).
+- **Why:** user intent — remote means the files are not stored here; holder
+  machines host them, fastest-holder selection chooses the source, failover
+  follows measured rate, and offline behaviour preserves the directory tree so
+  queued files can merge on reconnect.
+- **Rollout:** a scratch store proves reads, writes, failover and reconnect;
+  BulkPictures remains the current full mirror until that passes, then its
+  local 69 GiB is hash-verified against the holder before eviction.
+- **Reversible:** yes — revert to a mirror by declaring the store `local`.
 ## 2026-10-29 — Streamed stores: a FUSE mount, no local bytes
 - **Decision:** a new `stream` sync mode. The canonical path is a FUSE mount
   backed by the journal; reads fetch from the fastest reachable holder, writes
@@ -381,3 +394,5 @@
   /dev/fuse and a relaxed sandbox (/dev/fuse, RestrictNamespaces).
 - **Reversible:** yes — `stream` is a new value; `remote` behaviour is
   untouched.
+- **Superseded:** this entry is replaced by the preceding `remote`-streaming
+  rollout above; the separate `stream` value is no longer used.

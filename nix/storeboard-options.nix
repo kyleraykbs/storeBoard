@@ -115,6 +115,16 @@ rec {
       options = {
         group = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
         sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]); default = null; };
+        preferred = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Preferred peer for streamed reads. Must share the store's group."; };
+        offline = lib.mkOption {
+          type = lib.types.nullOr (lib.types.submodule {
+            options = {
+              policy = lib.mkOption { type = lib.types.enum [ "unbounded" "capped" "readonly" ]; default = "unbounded"; };
+              maxBytes = lib.mkOption { type = lib.types.nullOr lib.types.ints.positive; default = null; };
+            };
+          });
+          default = null;
+        };
         symlinks = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
         permissions = lib.mkOption { type = lib.types.nullOr permSubmodule; default = null; };
         links = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
@@ -215,6 +225,10 @@ rec {
 	  _: s:
 	  lib.optionalAttrs (s.group != null) { group = s.group; }
 	  // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
+	  // lib.optionalAttrs (s.preferred != null) { preferred = s.preferred; }
+	  // lib.optionalAttrs (s.offline != null) {
+	    offline = { policy = s.offline.policy; } // lib.optionalAttrs (s.offline.maxBytes != null) { maxBytes = s.offline.maxBytes; };
+	  }
 	  // lib.optionalAttrs (s.symlinks != [ ]) { symlinks = s.symlinks; }
 	  // lib.optionalAttrs (s.links != { }) { links = s.links; }
 	  // lib.optionalAttrs (s.permissions != null) {
