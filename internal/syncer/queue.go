@@ -289,7 +289,40 @@ func (m *storeMutator) Create(path string, mode uint32) (streamfs.PendingFile, e
 		return nil, err
 	}
 	markTouched(pf)
+	if p, ok := pf.(*pendingFile); ok {
+		p.created = true
+	}
+	// Record the empty file now: `touch foo && rm foo` in one shell sends
+	// Unlink before the kernel delivers RELEASE, and a path the journal has
+	// not seen cannot be deleted (ENOENT). The queue op still waits for
+	// close, where the real bytes are known.
+	m.fs.queueMu.Lock()
+	prev := m.fs.db.Get(path)
+	ent := &Entry{
+		Path:  path,
+		Blob:  emptyBlob(m.e),
+		Size:  0,
+		MTime: time.Now().UnixNano(),
+		Mode:  mode,
+		VV:    m.e.nextVV(m.fs, prev),
+	}
+	err = m.fs.db.Put(ent)
+	m.fs.queueMu.Unlock()
+	if err != nil {
+		pf.Close()
+		return nil, err
+	}
+	m.e.refreshTree(m.fs)
 	return pf, nil
+}
+
+// emptyBlob is the hash of no bytes, which is what a just-created file holds.
+func emptyBlob(e *Engine) string {
+	sum, err := store.SumFile(os.DevNull)
+	if err != nil {
+		return ""
+	}
+	return sum
 }
 
 // Open seeds a write with the holder's current bytes unless the caller asked
@@ -574,6 +607,12 @@ type pendingFile struct {
 	// when it created the file: `touch` is a change with no write.
 	dirty   bool
 	touched bool
+	// created records that this handle brought the path into existence, so a
+	// refused write can take the journal entry back out again.
+	created bool
+	// failed records that a write was refused; close must then undo the
+	// create instead of committing the empty file.
+	failed bool
 }
 
 func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
@@ -583,6 +622,7 @@ func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
 		return 0, os.ErrClosed
 	}
 	if err := p.admits(off + int64(len(b))); err != nil {
+		p.failed = true
 		return 0, err
 	}
 	p.dirty = true
@@ -605,6 +645,7 @@ func (p *pendingFile) Truncate(size int64) error {
 		return os.ErrClosed
 	}
 	if err := p.admits(size); err != nil {
+		p.failed = true
 		return err
 	}
 	p.dirty = true
@@ -632,11 +673,48 @@ func (p *pendingFile) close() error {
 	}
 	if !p.dirty && !p.touched {
 		// Nothing changed through this handle: closing it must not add a
-		// version. The scratch file goes away when the process does.
+		// version.
 		p.mu.Unlock()
 		return nil
 	}
 	p.done = true
+	failed := p.failed
+	p.mu.Unlock()
+
+	if failed {
+		os.Remove(p.f.Name())
+		p.dropCreatedEntry()
+		return nil
+	}
+
+	// A delete that arrived while the file was open (touch; rm in one shell)
+	// must not be undone by the commit that follows it.
+	if cur := p.fs.db.Get(p.path); cur != nil && cur.Deleted {
+		return nil
+	}
+	return p.recordCurrent()
+}
+
+// dropCreatedEntry removes the journal entry a refused create left behind: the
+// file must not appear in the tree when its bytes were never accepted.
+func (p *pendingFile) dropCreatedEntry() {
+	if !p.created {
+		return
+	}
+	p.fs.queueMu.Lock()
+	tomb := &Entry{
+		Path:    p.path,
+		Deleted: true,
+		VV:      p.e.nextVV(p.fs, p.fs.db.Get(p.path)),
+	}
+	_ = p.fs.db.Put(tomb)
+	p.fs.queueMu.Unlock()
+	p.e.refreshTree(p.fs)
+}
+
+// recordCurrent journals and queues the bytes currently in the scratch file.
+func (p *pendingFile) recordCurrent() error {
+	p.mu.Lock()
 	f := p.f
 	p.mu.Unlock()
 
@@ -664,6 +742,7 @@ func (p *pendingFile) close() error {
 			os.Remove(f.Name())
 			p.e.logger.Warn("offline queue full; write refused",
 				"store", p.fs.name, "path", p.path, "queued", queued, "size", info.Size(), "limit", limit)
+			p.dropCreatedEntry()
 			return fmt.Errorf("offline queue for store %q is full (%d of %d bytes): %w",
 				p.fs.name, queued+info.Size(), limit, os.ErrPermission)
 		}
@@ -684,6 +763,12 @@ func (p *pendingFile) close() error {
 		MTime: mtime,
 		Mode:  p.mode,
 		VV:    vv,
+	}
+
+	// The scratch file becomes the queued copy, so the holder can pull
+	// exactly these bytes.
+	if err := os.Rename(f.Name(), filepath.Join(queueBytesDir(p.e.dataDir, p.fs.name), p.id)); err != nil {
+		return err
 	}
 
 	p.fs.queueMu.Lock()

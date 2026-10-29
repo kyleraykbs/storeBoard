@@ -81,18 +81,13 @@ func TestStreamedStoreQueuesWritesWhileOffline(t *testing.T) {
 		t.Fatalf("offline write: %v", err)
 	}
 	fs := n.store("docs")
-	// The journal entry lands when the kernel delivers RELEASE, just after
+	// The queue op lands when the kernel delivers RELEASE, just after
 	// close(2) returns.
-	waitFor(t, testWait, "the offline write to be journalled", func() bool {
-		ent := fs.db.Get("offline.txt")
-		return ent != nil && !ent.Deleted && ent.Blob != ""
+	waitFor(t, testWait, "the offline write to be queued", func() bool {
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue) == 1
 	})
-	fs.scanMu.Lock()
-	queued := len(fs.queue)
-	fs.scanMu.Unlock()
-	if queued != 1 {
-		t.Fatalf("queued ops = %d, want 1", queued)
-	}
 	// The queue file is the durable copy: it survives a restart.
 	if _, err := os.Stat(filepath.Join(n.cfg.DataDir, "queue", "docs.ndjson")); err != nil {
 		t.Fatalf("queue index missing: %v", err)
@@ -367,8 +362,17 @@ func TestStreamedStoreCappedQueueRefusesOverflow(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(n.root("docs"), "big.txt"), []byte("far more than eight bytes"), 0o644); err == nil {
 		t.Fatal("a capped queue accepted an over-limit write")
 	}
-	if ent := n.store("docs").db.Get("big.txt"); ent != nil && !ent.Deleted {
-		t.Fatalf("refused write was journalled: %+v", ent)
+	// The create is undone when the kernel delivers RELEASE, so the tree ends
+	// up without the file rather than with an empty one.
+	waitFor(t, testWait, "the refused file to leave the journal", func() bool {
+		ent := n.store("docs").db.Get("big.txt")
+		return ent == nil || ent.Deleted
+	})
+	n.store("docs").queueMu.Lock()
+	queued := len(n.store("docs").queue)
+	n.store("docs").queueMu.Unlock()
+	if queued != 0 {
+		t.Fatalf("a refused write queued %d ops", queued)
 	}
 }
 
