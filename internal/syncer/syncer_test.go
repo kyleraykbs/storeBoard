@@ -666,6 +666,7 @@ func TestProgressIsVisibleWhileWorking(t *testing.T) {
 // incoming transfer.
 func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 	n := mkNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2")
+	defer n.eng.Close()
 	n.prepareAll()
 	fs := n.store("docs")
 	path := filepath.Join(fs.root, "old.txt")
@@ -675,11 +676,11 @@ func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 	}
 
 	fs.scanMu.Lock()
+	defer fs.scanMu.Unlock()
 	index, err := json.Marshal(frame{Type: "index", Store: "docs", Entries: []*Entry{{
 		Path: "old.txt", Deleted: true, VV: map[string]uint64{"b": 2},
 	}}})
 	if err != nil {
-		fs.scanMu.Unlock()
 		t.Fatal(err)
 	}
 	n.eng.OnPeerFrame("a", index)
@@ -687,7 +688,6 @@ func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 
 	blob, err := json.Marshal(frame{Type: "blob", Store: "docs", Path: "new.txt", Data: []byte("new")})
 	if err != nil {
-		fs.scanMu.Unlock()
 		t.Fatal(err)
 	}
 	n.eng.OnPeerFrame("a", blob)
@@ -696,7 +696,6 @@ func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 		defer n.eng.mu.Unlock()
 		return len(n.eng.incoming) == 1
 	})
-	fs.scanMu.Unlock()
 }
 
 func TestEqualEntryWithMissingBytesRequestsBlob(t *testing.T) {

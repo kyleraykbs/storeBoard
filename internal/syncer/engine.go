@@ -694,6 +694,17 @@ func (e *Engine) Snapshot() []api.StoreSync {
 func (e *Engine) Close() {
 	e.StopFrames()
 	e.frameWG.Wait()
+	e.mu.Lock()
+	incoming := make([]*incomingBlob, 0, len(e.incoming))
+	for key, inc := range e.incoming {
+		delete(e.incoming, key)
+		incoming = append(incoming, inc)
+	}
+	e.mu.Unlock()
+	for _, inc := range incoming {
+		_ = inc.f.Close()
+		_ = os.Remove(inc.f.Name())
+	}
 	for _, fs := range e.stores {
 		fs.db.Close()
 		if fs.hist != nil {
