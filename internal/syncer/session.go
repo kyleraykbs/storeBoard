@@ -425,11 +425,13 @@ func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error
 // authoritative tree of its own. A plain replica does not — its canonical file
 // is the copy, and the blob is redundant.
 func (e *Engine) wantsBlob(fs *StoreState, path, sum string) bool {
-	if fs.streamed {
-		return true
-	}
 	// With history on, every version this machine records has to keep its
 	// bytes, and the version being recorded right now is one of them.
+	//
+	// A streamed store is not special: the tree it materialises IS the copy,
+	// and a blob beside it is doubling just the same. What differs is only
+	// what absence means, which the scanner and the collector already handle
+	// by keeping blobs for entries with no file on disk.
 	return fs.hist != nil
 }
 

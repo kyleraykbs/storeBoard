@@ -51,7 +51,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 			if ent.Blob == "" || ent.Dir {
 				continue
 			}
-			if fs.streamed || !e.materialised(fs, ent) {
+			if !e.materialised(fs, ent) {
 				keep[ent.Blob] = true
 			}
 		}

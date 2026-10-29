@@ -1438,9 +1438,10 @@ func TestReplicaReleasesBlobAfterMaterialising(t *testing.T) {
 	}
 }
 
-// A streamed store has no authoritative tree of its own, so its bytes stay in
-// the content store.
-func TestStreamedStoreKeepsBlob(t *testing.T) {
+// A streamed store is no different for storage: once the file is materialised
+// the tree holds the bytes, so the content store does not keep a second copy.
+// Only an entry with no file on disk needs its blob.
+func TestStreamedStoreReleasesMaterialisedBlob(t *testing.T) {
 	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
 		"docs": {Group: "g", Sync: config.SyncRemote},
 	})
@@ -1456,8 +1457,28 @@ func TestStreamedStoreKeepsBlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !n.eng.store.Has(sum) {
-		t.Fatal("a streamed store dropped the bytes it exists to cache")
+	if n.eng.store.Has(sum) {
+		t.Fatal("a streamed store kept a second copy of a materialised file")
+	}
+
+	// Without a file on disk the blob is the only copy and must stay.
+	absent := "bytes the mirror has not materialised"
+	absentSum, err := store.Sum(strings.NewReader(absent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.eng.store.Adopt(mkTempFile(t, n.eng, absent), absentSum); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "not-here.txt", Blob: absentSum, Size: int64(len(absent))}); err != nil {
+		t.Fatal(err)
+	}
+	old := recentBlob
+	recentBlob = 0
+	n.eng.Collect()
+	recentBlob = old
+	if !n.eng.store.Has(absentSum) {
+		t.Fatal("the collector dropped the only copy of a file with no tree entry")
 	}
 }
 
