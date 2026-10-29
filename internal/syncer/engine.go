@@ -177,11 +177,6 @@ type Engine struct {
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
-	// Index frames are queued per store. One shared queue let a store with a
-	// large backlog (a Videos store propagating thousands of deletions, each
-	// one filesystem work) hold every other store's index frames behind it
-	// indefinitely: small stores never converged at all. Blob and want work
-	// stays shared — those are bounded per frame.
 	indexFrames map[string]chan peerFrame
 	wantFrames  map[string]chan peerFrame
 	blobFrames  chan peerFrame
