@@ -27,6 +27,7 @@ import (
 // Entry is one path the journal knows: a directory, or a file with the blob
 // that holds its bytes.
 type Entry struct {
+	Path  string
 	Dir   bool
 	Blob  string
 	Size  int64
@@ -258,6 +259,15 @@ func Mount(mountpoint string, tree *Tree, fetcher Fetcher) (*FS, error) {
 	}
 	f.server = server
 	return f, nil
+}
+
+// Replace updates the journal-backed view while the mount remains attached.
+// Existing open handles keep their current range fetch; new lookups see this
+// snapshot.
+func (f *FS) Replace(entries map[string]Entry) {
+	if f != nil && f.tree != nil {
+		f.tree.Replace(entries)
+	}
 }
 
 // Wait blocks until the filesystem is unmounted.

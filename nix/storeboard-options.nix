@@ -114,7 +114,7 @@ rec {
     {
       options = {
         group = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
-        sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" ]); default = null; };
+        sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" "stream" ]); default = null; };
         preferred = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Preferred peer for streamed reads. Must share the store's group."; };
         offline = lib.mkOption {
           type = lib.types.nullOr (lib.types.submodule {

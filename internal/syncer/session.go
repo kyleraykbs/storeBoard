@@ -27,6 +27,11 @@ type frame struct {
 	// streamed file seek without refetching a 20 GiB video from 0.
 	Offset int64 `json:"offset,omitempty"`
 	Length int64 `json:"length,omitempty"`
+	// ID correlates a ranged read with its answer. Reads are concurrent and
+	// multiplexed over the one connection, so the reply cannot rely on order.
+	ID int64 `json:"id,omitempty"`
+	// Error carries a holder's refusal for a read it could not serve.
+	Error string `json:"error,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or
@@ -466,8 +471,14 @@ func (e *Engine) pathMissing(fs *StoreState, path string) bool {
 	return os.IsNotExist(err)
 }
 
-// request asks the peer for a blob and remembers what to do with it.
+// request asks the peer for a blob and remembers what to do with it. A
+// streamed store never fetches: it records the entry and reads ranges from a
+// holder on demand, which is the whole point of the mount.
 func (e *Engine) request(peer string, fs *StoreState, rem *Entry, p *pending) {
+	if fs.stream {
+		_ = e.applyEntry(fs, rem)
+		return
+	}
 	e.mu.Lock()
 	e.wants[wantKey(fs.name, rem.Path)] = p
 	e.mu.Unlock()
@@ -763,6 +774,17 @@ func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
 func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	if !validRel(ent.Path) {
 		return fmt.Errorf("unsafe path %q", ent.Path)
+	}
+	if fs.stream {
+		// A streamed store keeps no bytes of its own: the entry is the
+		// journal record, and the mounted view presents it. Writing here
+		// would materialise a full copy of content the user asked this
+		// machine not to hold.
+		fs.scanMu.Lock()
+		err := fs.db.Put(ent)
+		fs.scanMu.Unlock()
+		e.refreshTree(fs)
+		return err
 	}
 	// Held across the write so a mount transition cannot swap the root out
 	// from under a file in flight.

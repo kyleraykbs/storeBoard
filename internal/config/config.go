@@ -38,11 +38,12 @@ const ConfigEnvVar = "STOREBOARD_CONFIG"
 // appName is the directory storeboard keeps its files in under each XDG base.
 const appName = "storeboard"
 
-// Sync types. Local holds a full replica that works offline; remote streams
-// the store from a holder. Empty in a declaration means inherit.
+// Sync types. Local holds a full replica that works offline; remote is the
+// existing attached mirror; stream is the journal-only FUSE view being staged.
 const (
 	SyncLocal  = "local"
 	SyncRemote = "remote"
+	SyncStream = "stream"
 )
 
 // Peer is a declared device: name lives in its map key, endpoints are the
@@ -546,9 +547,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("store %q: unknown group %q", v.ID, v.Group)
 		}
 		switch v.Sync {
-		case SyncLocal, SyncRemote:
+		case SyncLocal, SyncRemote, SyncStream:
 		default:
-			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote)
+			return fmt.Errorf("store %q: sync %q must be %q, %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote, SyncStream)
 		}
 		if v.Preferred != "" {
 			if _, ok := c.Peers[v.Preferred]; !ok {

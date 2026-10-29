@@ -394,5 +394,7 @@
   /dev/fuse and a relaxed sandbox (/dev/fuse, RestrictNamespaces).
 - **Reversible:** yes — `stream` is a new value; `remote` behaviour is
   untouched.
-- **Superseded:** this entry is replaced by the preceding `remote`-streaming
-  rollout above; the separate `stream` value is no longer used.
+- **Status (implementation):** `stream` is the staging value the rollout
+  above needs: it is the only mode that mounts, and `remote` keeps its mirror
+  meaning until the scratch-store proof lands. When `remote` flips, `stream`
+  becomes its explicit spelling rather than a separate behaviour.

@@ -18,6 +18,7 @@ import (
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
+	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -67,12 +68,17 @@ const (
 type StoreState struct {
 	name      string
 	group     string
-	streamed  bool
+	streamed  bool   // no local replica role: no history, no tombstone on absence
+	stream    bool   // the canonical path is storeboard's FUSE mount
+	preferred string // declared holder preference, empty means none
 	root      string // canonical directory: <root>/<id>
 	symlinks  []string
 	links     map[string]string // target store id -> relative path
 	linkState []api.StoreSymlink
 	state     string
+
+	// mount is the journal-backed view, non-nil only while streamed.
+	mount *streamfs.FS
 
 	db        *FileDB
 	hist      *History
@@ -173,13 +179,16 @@ type Engine struct {
 	sends          map[string]transport.Sender
 	wants          map[string]*pending
 	incoming       map[string]*incomingBlob
+	reads          map[int64]chan readReply
+	readSeq        int64
+	holderRates    map[string]holderRate
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
-	indexFrames map[string]chan peerFrame
-	wantFrames  map[string]chan peerFrame
-	blobFrames  chan peerFrame
+	indexFrames    map[string]chan peerFrame
+	wantFrames     map[string]chan peerFrame
+	blobFrames     chan peerFrame
 }
 
 type peerFrame struct {
@@ -221,7 +230,11 @@ func (e *Engine) startFrameWorkers() {
 					case <-e.closed:
 						return
 					case pf := <-ch:
-						e.handleWant(pf.peer, &pf.fr)
+						if pf.fr.Type == "read" {
+							e.handleRead(pf.peer, &pf.fr)
+						} else {
+							e.handleWant(pf.peer, &pf.fr)
+						}
 					}
 				}
 			}(want)
@@ -281,16 +294,18 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 	}
 
 	e := &Engine{
-		cfg:      cfg,
-		logger:   logger,
-		dataDir:  cfg.DataDir,
-		me:       cfg.Peer,
-		store:    st,
-		byName:   map[string]*StoreState{},
-		sends:    map[string]transport.Sender{},
-		wants:    map[string]*pending{},
-		incoming: map[string]*incomingBlob{},
-		closed:   make(chan struct{}),
+		cfg:         cfg,
+		logger:      logger,
+		dataDir:     cfg.DataDir,
+		me:          cfg.Peer,
+		store:       st,
+		byName:      map[string]*StoreState{},
+		sends:       map[string]transport.Sender{},
+		wants:       map[string]*pending{},
+		incoming:    map[string]*incomingBlob{},
+		reads:       map[int64]chan readReply{},
+		holderRates: map[string]holderRate{},
+		closed:      make(chan struct{}),
 	}
 
 	for _, v := range cfg.StoreViews() {
@@ -298,7 +313,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
-		streamed := v.Sync == config.SyncRemote
+		streamMode := v.Sync == config.SyncStream
+		streamed := v.Sync == config.SyncRemote || streamMode
 		var hist *History
 		on, keep, herr := cfg.BackupFor(v.ID)
 		if herr != nil {
@@ -322,16 +338,18 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			state = stateDetached
 		}
 		fs := &StoreState{
-			name:     v.ID,
-			group:    v.Group,
-			streamed: streamed,
-			root:     v.Dir,
-			symlinks: v.Symlinks,
-			links:    v.Links,
-			state:    state,
-			db:       db,
-			hist:     hist,
-			perm:     noPerms(),
+			name:      v.ID,
+			group:     v.Group,
+			streamed:  streamed,
+			stream:    streamMode,
+			preferred: v.Preferred,
+			root:      v.Dir,
+			symlinks:  v.Symlinks,
+			links:     v.Links,
+			state:     state,
+			db:        db,
+			hist:      hist,
+			perm:      noPerms(),
 			published: api.StoreSync{
 				Store:       v.ID,
 				Root:        v.Dir,
@@ -456,6 +474,15 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 	if err := os.MkdirAll(e.cfg.Root, 0o755); err != nil {
 		e.logger.Error("create store root", "store", fs.name, "path", e.cfg.Root, "error", err)
 	}
+	if fs.stream {
+		// The canonical path is this daemon's mount, not a directory the
+		// user owns: there is nothing to adopt, heal or chown here.
+		e.mountStream(fs)
+		e.refreshTree(fs)
+		fs.refreshLocked()
+		e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state, "mount", fs.mounted())
+		return
+	}
 	if err := os.MkdirAll(fs.root, 0o755); err != nil {
 		e.logger.Error("create store root", "store", fs.name, "path", fs.root, "error", err)
 	}
@@ -511,6 +538,15 @@ func (e *Engine) scanOnce(fs *StoreState) {
 	// the next scan rather than at the next restart. The canonical dir is
 	// the daemon's own, so it is re-applied here and heals drift.
 	fs.perm = e.resolvePerms(fs)
+	if fs.stream {
+		// A streamed store has no local tree to walk: the journal is the
+		// truth, and reading the mount to discover it would fetch every file
+		// the store holds.
+		fs.refreshLocked()
+		fs.scanMu.Unlock()
+		e.refreshTree(fs)
+		return
+	}
 	e.applyDir(fs, fs.root)
 	state := fs.state
 	fs.refreshLocked()
@@ -609,12 +645,16 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
-	case "want":
+	case "want", "read":
 		ch, ok := e.wantFrames[fr.Store]
 		if !ok {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
+	case "readData", "readErr":
+		// Cheap and latency-sensitive: a reply goes straight to the read
+		// that is blocked on it, never behind a queue of store work.
+		e.deliverRead(&fr)
 	case "blob", "blobEnd":
 		e.enqueueFrame(e.blobFrames, pf)
 	}
@@ -701,6 +741,7 @@ func (e *Engine) Close() {
 		_ = os.Remove(inc.f.Name())
 	}
 	for _, fs := range e.stores {
+		e.unmountStream(fs)
 		fs.db.Close()
 		if fs.hist != nil {
 			fs.hist.Close()

@@ -32,16 +32,23 @@
 
 ## Streamed stores
 
-- Add the holder-selection/read-through protocol: FUSE on Linux, ranged
-  requests, throughput probes/EWMA, optional pinned holder, and fallback in
-  holder-rate order.
-- Add write-through plus offline queue policy: `unbounded` by default,
-  `capped` with an explicit byte limit, or `readonly`. Offline mounts show the
-  journal's directory tree but no file bytes.
-- Add the mobile on-demand fetch API; Android does not mount FUSE.
+- Shipped (`stream` sync mode, 2026-10-29): the canonical path is a FUSE
+  mount; the journal is the tree; a read is a ranged `read`/`readData` frame
+  pair correlated by id and served by the fastest reachable holder (declared
+  `preferred` first, then measured throughput, then name); a failed read
+  fails over to the next holder; a streamed store never fetches a whole blob
+  and never materialises an entry. Verified by
+  `TestStreamedStoreServesTheFileThroughItsMount` and friends.
+- Remaining: write-through plus offline queue policy (`unbounded` default,
+  `capped` with a byte limit, `readonly`) — writes currently fail `EROFS`.
+- Remaining: forward `send`, `versions` and `restore` to the holder; today
+  they act on this machine's tree, which a streamed store does not have.
+- Remaining: the mobile on-demand fetch API; Android does not mount FUSE.
 - Stage the rollout on a scratch store. Only after the real path passes reads,
   writes, failover and reconnect tests should BulkPictures switch from its
   current mirror; hash-verify its 69 GiB mirror before eviction.
+- Once the scratch store passes, flip `remote` to the same behaviour and keep
+  `stream` as its explicit spelling.
 
 ## Sync engine
 
