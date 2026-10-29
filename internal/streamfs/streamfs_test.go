@@ -336,3 +336,54 @@ func (m *recordingMutator) Remove(string) error                        { return 
 func (m *recordingMutator) MakeDir(string, uint32) error               { return nil }
 func (m *recordingMutator) RemoveDir(string) error                     { return nil }
 func (m *recordingMutator) Rename(string, string) error                { return nil }
+
+// The same path must keep one inode number: a file manager keys selections,
+// refreshes and "is this the same folder" on (mount, inode), and go-fuse hands
+// out a fresh number per lookup unless the filesystem supplies one. Nautilus
+// showed streamed subdirectories falling apart because of exactly that.
+func TestInodeNumbersAreStableAcrossLookups(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	tree := NewTree(map[string]Entry{
+		"Adventures/Walk 1/IMG_1.JPG": {Blob: "b", Size: 4, Mode: 0o644},
+	})
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounted, err := Mount(mnt, tree, Options{Fetcher: &memoryFetcher{bodies: map[string]string{"b": "data"}}})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+
+	root := filepath.Join(mnt, "Adventures", "Walk 1")
+	first, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the kernel to look the path up again: forget the inode by
+	// dropping every reference, then stat a second time.
+	for range 3 {
+		if _, err := os.Stat(filepath.Join(mnt, "Adventures")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	again, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := again.Sys().(*syscall.Stat_t).Ino, first.Sys().(*syscall.Stat_t).Ino; got != want {
+		t.Fatalf("inode number changed: %d then %d", want, got)
+	}
+	// And a sibling keeps its own distinct number.
+	other, err := os.Stat(filepath.Join(mnt, "Adventures"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Sys().(*syscall.Stat_t).Ino == again.Sys().(*syscall.Stat_t).Ino {
+		t.Fatal("two directories share an inode number")
+	}
+}

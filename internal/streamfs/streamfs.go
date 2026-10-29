@@ -11,6 +11,7 @@ package streamfs
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"io"
 	"os"
 	"path"
@@ -39,6 +40,22 @@ type Entry struct {
 // request per read, so it never needs a local file-sized cache.
 type Fetcher interface {
 	ReadRange(ctx context.Context, entry Entry, offset, length int64) ([]byte, error)
+}
+
+// stableIno derives an inode number from a path, so one path keeps one
+// identity for the life of the mount. go-fuse otherwise hands out a fresh
+// number per Lookup, and a file manager - which keys selections, refresh and
+// "is this the same folder" on (mount, inode) - sees the whole tree churn on
+// every read. `ls` never notices; Nautilus falls apart.
+func stableIno(p string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(p))
+	v := h.Sum64()
+	// 1 is the root and 0 means "unassigned" to go-fuse.
+	if v < 2 {
+		v += 2
+	}
+	return v
 }
 
 // Tree is the journal's view, replaced wholesale as the journal changes. Reads
@@ -135,10 +152,21 @@ func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 			return nil, syscall.ENOENT
 		}
 	}
-	if entry.Dir {
-		return d.NewInode(ctx, &dirNode{fsys: d.fsys, path: child}, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
+	if in := d.GetChild(name); in != nil {
+		// The kernel still holds this name, so keep the identity and just
+		// refresh what the journal says about it.
+		switch n := in.Operations().(type) {
+		case *fileNode:
+			n.entry = entry
+		case *dirNode:
+			n.path = child
+		}
+		return in, 0
 	}
-	return d.NewInode(ctx, &fileNode{fsys: d.fsys, path: child, entry: entry}, fs.StableAttr{Mode: fuse.S_IFREG}), 0
+	if entry.Dir {
+		return d.NewInode(ctx, &dirNode{fsys: d.fsys, path: child}, fs.StableAttr{Mode: fuse.S_IFDIR, Ino: stableIno(child)}), 0
+	}
+	return d.NewInode(ctx, &fileNode{fsys: d.fsys, path: child, entry: entry}, fs.StableAttr{Mode: fuse.S_IFREG, Ino: stableIno(child)}), 0
 }
 
 // Readdir lists the children of this directory.
@@ -200,7 +228,7 @@ func (d *dirNode) Create(ctx context.Context, name string, flags, mode uint32, o
 	}
 	entry := Entry{Path: child, Mode: mode & 0o7777}
 	node := &fileNode{fsys: d.fsys, path: child, entry: entry}
-	inode := d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFREG})
+	inode := d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFREG, Ino: stableIno(child)})
 	h := &fileHandle{fsys: d.fsys, entry: entry, write: pending}
 	return inode, h, 0, 0
 }
@@ -215,7 +243,7 @@ func (d *dirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse
 	if err := d.fsys.mutator.MakeDir(child, mode&0o7777); err != nil {
 		return nil, errnoFor(err)
 	}
-	return d.NewInode(ctx, &dirNode{fsys: d.fsys, path: child}, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
+	return d.NewInode(ctx, &dirNode{fsys: d.fsys, path: child}, fs.StableAttr{Mode: fuse.S_IFDIR, Ino: stableIno(child)}), 0
 }
 
 // Unlink removes a file: the journal records the tombstone and the holder is
