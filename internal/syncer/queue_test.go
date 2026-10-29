@@ -220,6 +220,103 @@ func TestStreamedStoreRenameReachesTheHolder(t *testing.T) {
 	}
 }
 
+// versions and restore are answered by the holder: a streamed peer has no
+// history, and its own path holds no bytes to restore from.
+func TestStreamedStoreForwardsVersionsAndRestore(t *testing.T) {
+	old := scanInterval
+	scanInterval = 50 * time.Millisecond
+	defer func() { scanInterval = old }()
+
+	epA, epB := twoEndpoints(t)
+	store := map[string]config.Store{"docs": {Group: "g"}}
+	a := newNode(t, "a", "b", epA, epB, "", store)
+	a.cfg.Backup = &config.Backup{Enable: true}
+	if err := a.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	a.eng = newEngine(t, a.cfg, a.log)
+
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	startNode(t, a)
+	startNode(t, b)
+
+	writeFile(t, filepath.Join(a.root("docs"), "doc.txt"), "first", time.Now())
+	waitFor(t, testWait, "the entry on the streamed peer", func() bool {
+		return b.store("docs").db.Get("doc.txt") != nil
+	})
+	writeFile(t, filepath.Join(a.root("docs"), "doc.txt"), "second", time.Now().Add(2*time.Second))
+	waitFor(t, testWait, "the second version on the holder", func() bool {
+		return a.store("docs").db.Get("doc.txt").Size == int64(len("second"))
+	})
+
+	vs, err := b.eng.Versions("docs", "doc.txt")
+	if err != nil {
+		t.Fatalf("versions through the holder: %v", err)
+	}
+	if len(vs.Versions) < 2 {
+		t.Fatalf("holder reported %d versions, want at least 2: %+v", len(vs.Versions), vs)
+	}
+
+	// Restore the oldest recorded version back into the store.
+	oldest := vs.Versions[len(vs.Versions)-1]
+	res, err := b.eng.Restore("docs", 0, "doc.txt", oldest.Blob, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("restore through the holder: %v", err)
+	}
+	if res.Blob != oldest.Blob {
+		t.Fatalf("restored %q, want %q", res.Blob, oldest.Blob)
+	}
+	waitFor(t, testWait, "the restored content on the holder", func() bool {
+		data, err := os.ReadFile(filepath.Join(a.root("docs"), "doc.txt"))
+		return err == nil && string(data) == "first"
+	})
+}
+
+// send on a streamed store is an ordinary write through the mount: the holder
+// ends up with the file, the sender keeps no copy.
+func TestStreamedStoreSendReachesTheHolder(t *testing.T) {
+	old := scanInterval
+	scanInterval = 50 * time.Millisecond
+	defer func() { scanInterval = old }()
+
+	epA, epB := twoEndpoints(t)
+	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{
+		"docs": {Group: "g"},
+	})
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	startNode(t, a)
+	startNode(t, b)
+	waitPrepared(t, b.store("docs"))
+	if !b.store("docs").mounted() {
+		t.Skip("no FUSE mount available here")
+	}
+	waitFor(t, testWait, "the peers to connect", func() bool {
+		return len(b.eng.holdersFor(b.store("docs"))) > 0
+	})
+
+	src := filepath.Join(t.TempDir(), "photo.jpg")
+	if err := os.WriteFile(src, []byte("shared from the share sheet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.eng.Send("docs", os.Getuid(), src, "Pictures/photo.jpg")
+	if err != nil {
+		t.Fatalf("send into a streamed store: %v", err)
+	}
+	if res.Path != "Pictures/photo.jpg" {
+		t.Fatalf("send reported path %q", res.Path)
+	}
+	waitFor(t, testWait, "the sent file on the holder", func() bool {
+		return exists(filepath.Join(a.root("docs"), "Pictures", "photo.jpg"))
+	})
+	if got := readFile(t, filepath.Join(a.root("docs"), "Pictures", "photo.jpg")); got != "shared from the share sheet\n" {
+		t.Fatalf("holder content = %q", got)
+	}
+}
+
 // waitPrepared blocks until the engine has run prepareRoot for a store, which
 // is when a streamed store's mount exists (or has failed).
 func waitPrepared(t *testing.T, fs *StoreState) {

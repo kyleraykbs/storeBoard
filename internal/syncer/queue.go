@@ -170,8 +170,8 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 	if !fs.stream || len(fs.queue) == 0 {
 		return
 	}
-	fs.scanMu.Lock()
-	defer fs.scanMu.Unlock()
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
 	for _, op := range append([]queueOp(nil), fs.queue...) {
 		switch op.Op {
 		case opPut:
@@ -216,9 +216,9 @@ func (e *Engine) flushQueue(fs *StoreState) {
 		return
 	}
 	peer := peers[0]
-	fs.scanMu.Lock()
+	fs.queueMu.Lock()
 	ops := append([]queueOp(nil), fs.queue...)
-	fs.scanMu.Unlock()
+	fs.queueMu.Unlock()
 	for _, op := range ops {
 		if op.Op == opRename {
 			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Entry: &Entry{Path: op.To, VV: op.VV}}
@@ -248,8 +248,8 @@ func (e *Engine) queuedBlob(fs *StoreState, sum string) (string, bool) {
 	if !fs.stream || sum == "" {
 		return "", false
 	}
-	fs.scanMu.Lock()
-	defer fs.scanMu.Unlock()
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
 	for _, op := range fs.queue {
 		if op.Op == opPut && op.Blob == sum {
 			return filepath.Join(queueBytesDir(e.dataDir, fs.name), op.ID), true
@@ -504,6 +504,15 @@ func (p *pendingFile) WriteAt(b []byte, off int64) (int, error) {
 	return p.f.WriteAt(b, off)
 }
 
+func (p *pendingFile) Sync() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return nil
+	}
+	return p.f.Sync()
+}
+
 func (p *pendingFile) Truncate(size int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -543,9 +552,9 @@ func (p *pendingFile) Close() error {
 	}
 	if policy := p.e.offlinePolicy(p.fs); policy == config.StreamQueueCapped {
 		limit := p.fs.offline.MaxBytes
-		p.fs.scanMu.Lock()
+		p.fs.queueMu.Lock()
 		queued := p.fs.queuedBytes
-		p.fs.scanMu.Unlock()
+		p.fs.queueMu.Unlock()
 		if queued+info.Size() > limit {
 			os.Remove(f.Name())
 			return fmt.Errorf("offline queue for store %q is full (%d of %d bytes): %w",
@@ -570,7 +579,7 @@ func (p *pendingFile) Close() error {
 		VV:    vv,
 	}
 
-	p.fs.scanMu.Lock()
+	p.fs.queueMu.Lock()
 	_ = p.fs.db.Put(ent)
 	op := queueOp{
 		ID:    p.id,
@@ -583,11 +592,11 @@ func (p *pendingFile) Close() error {
 		VV:    vv,
 	}
 	if err := p.e.enqueue(p.fs, op); err != nil {
-		p.fs.scanMu.Unlock()
+		p.fs.queueMu.Unlock()
 		os.Remove(f.Name())
 		return err
 	}
-	p.fs.scanMu.Unlock()
+	p.fs.queueMu.Unlock()
 
 	p.e.refreshTree(p.fs)
 	p.e.broadcastIndex(p.fs, []*Entry{ent})

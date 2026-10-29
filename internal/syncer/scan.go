@@ -363,6 +363,9 @@ func (e *Engine) tombstoneEntry(fs *StoreState, ent *Entry) *Entry {
 // user's statement that the directory should exist, and it is exactly the
 // difference between an empty directory they made and one the files left.
 func (e *Engine) pruneEmptyParents(fs *StoreState, path string) {
+	if fs.stream {
+		return // a streamed store has no directories on disk to prune
+	}
 	for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator) && dir != ""; dir = filepath.Dir(dir) {
 		if ent := fs.db.Get(dir); ent != nil && !ent.Deleted && ent.Dir {
 			return

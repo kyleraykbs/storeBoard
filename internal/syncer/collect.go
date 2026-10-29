@@ -216,14 +216,27 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	if fs == nil {
 		return api.RestoreResult{}, fmt.Errorf("unknown store %q", name)
 	}
-	if fs.hist == nil {
-		return api.RestoreResult{}, fmt.Errorf("store %q keeps no history on this machine", name)
-	}
 	if !validRel(path) {
 		return api.RestoreResult{}, fmt.Errorf("unsafe path %q", path)
 	}
 	if err := e.checkOwner(fs, uid, "restore from"); err != nil {
 		return api.RestoreResult{}, err
+	}
+	if fs.stream {
+		// The versions and the bytes both live on the holder; it performs the
+		// restore and reports where the content landed.
+		req := verbsRequest{Action: "restore", Path: path, Blob: blob, To: to}
+		if !at.IsZero() {
+			req.At = at.UnixNano()
+		}
+		var out api.RestoreResult
+		if err := e.forwardVerbs(fs, req, &out); err != nil {
+			return api.RestoreResult{}, err
+		}
+		return out, nil
+	}
+	if fs.hist == nil {
+		return api.RestoreResult{}, fmt.Errorf("store %q keeps no history on this machine", name)
 	}
 
 	versions := fs.hist.Versions(path)
@@ -356,6 +369,14 @@ func (e *Engine) Versions(name, path string) (api.Versions, error) {
 	fs := e.byName[name]
 	if fs == nil {
 		return api.Versions{}, fmt.Errorf("unknown store %q", name)
+	}
+	if fs.stream {
+		// This machine holds no history for the store; the holder keeps it.
+		var out api.Versions
+		if err := e.forwardVerbs(fs, verbsRequest{Action: "versions", Path: path}, &out); err != nil {
+			return api.Versions{}, err
+		}
+		return out, nil
 	}
 	if fs.hist == nil {
 		return api.Versions{}, fmt.Errorf("store %q keeps no history on this machine", name)

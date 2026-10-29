@@ -39,14 +39,18 @@
   fails over to the next holder; a streamed store never fetches a whole blob
   and never materialises an entry. Verified by
   `TestStreamedStoreServesTheFileThroughItsMount` and friends.
-- Remaining: write-through plus offline queue policy (`unbounded` default,
-  `capped` with a byte limit, `readonly`) — writes currently fail `EROFS`.
-- Remaining: forward `send`, `versions` and `restore` to the holder; today
-  they act on this machine's tree, which a streamed store does not have.
+- Shipped (2026-10-29): writes through the mount (`create`, `write`,
+  `truncate`, `unlink`, `mkdir`, `rmdir`, `rename`, `fsync`) land in a durable
+  queue under `dataDir/queue/<store>` and reach a holder through the ordinary
+  index exchange; the policy is `unbounded`/`capped`/`readonly`, enforced
+  before anything is journalled. `send`, `versions` and `restore` work on a
+  streamed store: send is a write through the mount, the other two are
+  forwarded to a holder.
 - Remaining: the mobile on-demand fetch API; Android does not mount FUSE.
-- Stage the rollout on a scratch store. Only after the real path passes reads,
-  writes, failover and reconnect tests should BulkPictures switch from its
-  current mirror; hash-verify its 69 GiB mirror before eviction.
+- Remaining: a scratch store on the real fleet (reads, writes, failover,
+  reconnect) before BulkPictures switches; hash-verify its 69 GiB mirror
+  before eviction. Unit coverage exists for each of those paths, but nothing
+  has run across two machines yet.
 - Once the scratch store passes, flip `remote` to the same behaviour and keep
   `stream` as its explicit spelling.
 

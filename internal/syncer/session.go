@@ -34,6 +34,8 @@ type frame struct {
 	ID int64 `json:"id,omitempty"`
 	// Error carries a holder's refusal for a read it could not serve.
 	Error string `json:"error,omitempty"`
+	// Action names a forwarded verb (versions, restore).
+	Action string `json:"action,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or
@@ -374,6 +376,11 @@ func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
 // saveLocalConflictLocked is saveLocalConflict for callers already holding
 // scanMu (applyEntry, which parks a file that a directory is about to replace).
 func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) *Entry {
+	if fs.stream {
+		// There is no local file to park: the bytes live on the holder, and
+		// the loser stays reachable through its entry.
+		return nil
+	}
 	src := filepath.Join(fs.root, loc.Path)
 	sum, err := store.SumFile(src)
 	if err != nil {
@@ -817,6 +824,24 @@ func (e *Engine) dropIncoming(key string, inc *incomingBlob) {
 
 // writeConflictCopy parks a fetched loser version under its conflict name.
 func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
+	if fs.stream {
+		// The loser's bytes stay on the holder. Recording the copy as an
+		// entry is enough: reading it fetches the range that is wanted.
+		fs.queueMu.Lock()
+		copyEnt := &Entry{
+			Path:  want.conflictName,
+			Blob:  ent.Blob,
+			Size:  ent.Size,
+			MTime: ent.MTime,
+			Mode:  ent.Mode,
+			VV:    map[string]uint64{e.me: fs.db.Next()},
+		}
+		_ = fs.db.Put(copyEnt)
+		fs.queueMu.Unlock()
+		e.refreshTree(fs)
+		e.broadcastIndex(fs, []*Entry{copyEnt})
+		return
+	}
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	dst := filepath.Join(fs.root, want.conflictName)
@@ -930,6 +955,11 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 // unblockParents frees every ancestor of path that a peer recorded as a file,
 // parking that file under its conflict name first. Callers hold scanMu.
 func (e *Engine) unblockParents(fs *StoreState, path string) error {
+	if fs.stream {
+		// The tree is the journal, not directories on disk: nothing can be
+		// blocked, and there is no file here to move aside.
+		return nil
+	}
 	for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator) && dir != ""; dir = filepath.Dir(dir) {
 		loc := fs.db.Get(dir)
 		if loc == nil || loc.Deleted || loc.Dir {
@@ -1011,6 +1041,13 @@ func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime
 // error when the file could not be moved, so the caller can keep the entry
 // alive instead of tombstoning a file that is still on disk.
 func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
+	if fs.stream {
+		// A streamed store has no local copy to move to the trash, and its
+		// canonical path is this daemon's own mount: touching it from here
+		// would re-enter the filesystem while holding the scan lock and
+		// deadlock against the mount's own handler.
+		return nil
+	}
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	src := filepath.Join(fs.root, loc.Path)

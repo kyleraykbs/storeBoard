@@ -41,6 +41,10 @@ func (e *Engine) Send(name string, uid int, src, dst string) (api.SendResult, er
 		return api.SendResult{}, fmt.Errorf("unsafe destination %q", dst)
 	}
 
+	if fs.stream {
+		return e.sendStreamed(fs, src, dst, info)
+	}
+
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 
@@ -83,4 +87,37 @@ func (e *Engine) Send(name string, uid int, src, dst string) (api.SendResult, er
 
 	e.logger.Info("sent a file into the store", "store", name, "path", dst, "from", src)
 	return api.SendResult{Store: name, Path: dst, Parked: parked, Size: info.Size()}, nil
+}
+
+// sendStreamed copies a file into a streamed store through its mount. The
+// mount's own write path hashes, journals and queues the file, so this holds
+// no lock the FUSE handlers need: taking the scan lock here deadlocked the
+// send against the close that records it.
+func (e *Engine) sendStreamed(fs *StoreState, src, dst string, info os.FileInfo) (api.SendResult, error) {
+	target := filepath.Join(fs.root, dst)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return api.SendResult{}, err
+	}
+	parked := ""
+	if _, err := os.Lstat(target); err == nil {
+		// Taken: park the existing file under its content-derived name. Both
+		// paths are ordinary writes through the mount, so the move is
+		// journalled and queued like any other change.
+		sum, herr := store.SumFile(target)
+		if herr != nil {
+			return api.SendResult{}, fmt.Errorf("destination %s exists and cannot be hashed: %w", dst, herr)
+		}
+		parked = conflictPath(dst, sum)
+		if err := os.Rename(target, filepath.Join(fs.root, parked)); err != nil {
+			return api.SendResult{}, fmt.Errorf("park existing %s: %w", dst, err)
+		}
+	}
+	if err := moveOrCopy(src, target, info.Mode()); err != nil {
+		return api.SendResult{}, err
+	}
+	// The queue owns the bytes until a holder takes them; make sure it is
+	// flushed now rather than at the next tick.
+	e.flushQueue(fs)
+	e.logger.Info("sent a file into the streamed store", "store", fs.name, "path", dst, "from", src)
+	return api.SendResult{Store: fs.name, Path: dst, Parked: parked, Size: info.Size()}, nil
 }

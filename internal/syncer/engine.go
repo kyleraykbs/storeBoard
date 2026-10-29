@@ -85,6 +85,10 @@ type StoreState struct {
 	offline     *config.OfflineQueue
 	queue       []queueOp
 	queuedBytes int64
+	// queueMu guards the queue. It is deliberately not scanMu: the mount's
+	// handlers call into the queue, and a handler waiting on scanMu while the
+	// engine waits on the mount is a deadlock.
+	queueMu sync.Mutex
 
 	db        *FileDB
 	hist      *History
@@ -242,6 +246,8 @@ func (e *Engine) startFrameWorkers() {
 							e.handleRead(pf.peer, &pf.fr)
 						case "rename":
 							e.handleRename(pf.peer, &pf.fr)
+						case "verbs":
+							e.handleVerbs(pf.peer, &pf.fr)
 						default:
 							e.handleWant(pf.peer, &pf.fr)
 						}
@@ -666,13 +672,13 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
-	case "want", "read", "rename":
+	case "want", "read", "rename", "verbs":
 		ch, ok := e.wantFrames[fr.Store]
 		if !ok {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
-	case "readData", "readErr":
+	case "readData", "readErr", "verbsResult":
 		// Cheap and latency-sensitive: a reply goes straight to the read
 		// that is blocked on it, never behind a queue of store work.
 		e.deliverRead(&fr)

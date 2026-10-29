@@ -155,6 +155,14 @@ owned by storeboard, and file bytes are not retained on this machine.
   policy is configurable as `unbounded` (default), `capped` with a byte limit,
   or `readonly`. Queued writes merge on reconnect under the ordinary conflict
   rules.
+- `versions` and `restore` are forwarded to a holder: the machine that keeps
+  the history and the bytes answers them, and a peer in the store's group is
+  already authorized by the config. `send` is an ordinary write through the
+  mount.
+- A streamed store's canonical path is storeboard's own mount, so engine code
+  never touches it: journal, queue and mount only. A handler that walked or
+  removed a path there would re-enter the filesystem while holding the scan
+  lock.
 - There is no read cache: a file is fetched per open/range. Disk cost is
   metadata plus queued offline writes only.
 - A detached streamed store never tombstones: absence is not deletion, and the

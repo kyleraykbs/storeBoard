@@ -316,6 +316,7 @@ type fileHandle struct {
 var _ = (fs.FileReader)((*fileHandle)(nil))
 var _ = (fs.FileWriter)((*fileHandle)(nil))
 var _ = (fs.FileFlusher)((*fileHandle)(nil))
+var _ = (fs.FileFsyncer)((*fileHandle)(nil))
 var _ = (fs.FileGetattrer)((*fileHandle)(nil))
 var _ = (fs.FileReleaser)((*fileHandle)(nil))
 
@@ -378,6 +379,18 @@ func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
 	return 0
 }
 
+// Fsync pushes the written bytes to the queue file. The bytes are on this
+// machine's disk already; the holder receives them when the file is flushed.
+func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	if h.write == nil {
+		return 0
+	}
+	if err := h.write.Sync(); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
 func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 	if h.write == nil {
 		return 0
@@ -408,6 +421,7 @@ type Mutator interface {
 type PendingFile interface {
 	WriteAt(p []byte, off int64) (int, error)
 	Truncate(size int64) error
+	Sync() error
 	Close() error
 }
 

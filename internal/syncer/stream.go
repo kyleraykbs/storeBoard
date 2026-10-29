@@ -163,12 +163,8 @@ func (e *Engine) deliverRead(fr *frame) {
 	if ch == nil {
 		return
 	}
-	if fr.Type == "readErr" {
-		msg := fr.Error
-		if msg == "" {
-			msg = "holder refused the read"
-		}
-		ch <- readReply{err: fmt.Errorf("%s: %s", fr.Path, msg)}
+	if fr.Error != "" {
+		ch <- readReply{err: fmt.Errorf("%s: %s", fr.Path, fr.Error)}
 		return
 	}
 	ch <- readReply{data: fr.Data}
