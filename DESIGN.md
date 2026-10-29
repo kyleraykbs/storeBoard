@@ -113,8 +113,15 @@ one, it changes here first, deliberately, with a decision log entry.
   journals) referencing the blob that holds those bytes; retention thins it
   on the schedule above and `storeboard backup list|restore` reads it. A
   store that is `remote` on this machine keeps no history.
-- Content is content-addressed (`<dataDir>/store/<sha256>`), shared by all
-  stores on a machine, written temp → fsync → rename.
+- Content is content-addressed (`<dataDir>/store/<sha256>`), written temp →
+  fsync → rename. It is a *cache*, not a second copy: once a file is
+  materialised at its canonical path, the blob is released, and a peer is
+  served by hashing that file when the blob is gone. Blobs are kept only where
+  they are the only copy — a retained history version, a file that is not on
+  disk here, or an entry this machine never materialised.
+- The state directory lives inside the store root (`<root>/.storeboard`), so a
+  store's bytes and its state are on the same filesystem and a root on a pool
+  keeps everything there.
 - Every store keeps an append-only NDJSON journal (`<dataDir>/journal/<id>.ndjson`)
   replayed into memory at open and checkpointed; each entry carries a version
   vector.

@@ -337,3 +337,26 @@
   link.
 - **Reversible:** no for the config format (v1 is rejected); yes in the sense
   that no data is touched.
+
+## 2026-10-29 — State lives inside the store root; a replica stores each file once
+- **Decision:** `dataDir` defaults to `<root>/.storeboard` (config default and
+  the NixOS module's computed default), and the daemon releases a blob as soon
+  as the file is materialised. `handleWant` falls back to hashing the canonical
+  file when the blob is absent; the collector drops blobs the tree already
+  holds and keeps them only where they are the only copy (retained history
+  version, file missing from disk, entry never materialised, orphan journal).
+  `Entry.Local` records that this machine materialised the file, which is the
+  evidence the scanner needs to trust a deletion now that blob presence no
+  longer implies it.
+- **Why:** Kyle: "all data for stores should be IN the store location" and
+  "it's insane to double the amount of data". A 200 GiB tree cost ~220 GiB of
+  blobs on a separate disk per machine; state on the system disk filled a
+  439 GiB root twice.
+- **Measured:** amanita 219 GiB → 84 GiB of blobs (the rest is orphan-store
+  journals kept by invariant 1, plus 13 GiB of trash); psilocybe 182 GiB →
+  19 GiB. A new 20 MiB file syncs with 0 MiB of extra blob storage.
+- **Also fixed:** `FileDB.Put` no longer appends a journal line when the entry
+  is unchanged. Peers resend their full index on connect and every 30 s, and
+  each pass wrote one line per path: amanita's journal had reached 8.5 GiB.
+- **Reversible:** yes — set `dataDir` explicitly and the old layout works; the
+  blob store refills from the tree on demand.
