@@ -174,12 +174,33 @@ func (c *Config) BackupFor(store string) (bool, time.Duration, error) {
 	return true, keep, nil
 }
 
+// StreamPolicy is how a `remote` store behaves when no holder answers.
+type StreamPolicy string
+
+const (
+	// StreamQueueUnbounded accepts offline writes without a byte limit.
+	StreamQueueUnbounded StreamPolicy = "unbounded"
+	// StreamQueueCapped accepts offline writes only within MaxQueuedBytes.
+	StreamQueueCapped StreamPolicy = "capped"
+	// StreamQueueReadOnly refuses offline writes; the tree stays visible.
+	StreamQueueReadOnly StreamPolicy = "readonly"
+)
+
+// OfflineQueue controls queued writes for a streamed store.
+type OfflineQueue struct {
+	Policy StreamPolicy `json:"policy,omitempty"`
+	// MaxBytes bounds a capped queue. Unset means the engine default.
+	MaxBytes int64 `json:"maxBytes,omitempty"`
+}
+
 // Store is one top-level store declaration. Changing its key creates a new
 // store; old canonical data and durable state remain untouched for manual
 // migration.
 type Store struct {
 	Group       string            `json:"group,omitempty"`
 	Sync        string            `json:"sync,omitempty"`
+	Preferred   string            `json:"preferred,omitempty"`
+	Offline     *OfflineQueue     `json:"offline,omitempty"`
 	Symlinks    []string          `json:"symlinks,omitempty"`
 	Permissions *Permissions      `json:"permissions,omitempty"`
 	Links       map[string]string `json:"links,omitempty"`
@@ -226,11 +247,12 @@ type Config struct {
 	Permissions map[string]Permissions `json:"permissions,omitempty"`
 }
 
-// StoreView is one resolved top-level store.
 type StoreView struct {
 	ID          string
 	Group       string
 	Sync        string
+	Preferred   string
+	Offline     *OfflineQueue
 	Symlinks    []string
 	Links       map[string]string
 	Permissions *Permissions
@@ -528,6 +550,27 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote)
 		}
+		if v.Preferred != "" {
+			if _, ok := c.Peers[v.Preferred]; !ok {
+				return fmt.Errorf("store %q: preferred peer %q is not declared", v.ID, v.Preferred)
+			}
+			if !containsString(c.Groups[v.Group].Peers, v.Preferred) {
+				return fmt.Errorf("store %q: preferred peer %q is not in group %q", v.ID, v.Preferred, v.Group)
+			}
+		}
+		if v.Offline != nil {
+			switch v.Offline.Policy {
+			case "", StreamQueueUnbounded, StreamQueueCapped, StreamQueueReadOnly:
+			default:
+				return fmt.Errorf("store %q: offline policy %q must be %q, %q or %q", v.ID, v.Offline.Policy, StreamQueueUnbounded, StreamQueueCapped, StreamQueueReadOnly)
+			}
+			if v.Offline.Policy == StreamQueueCapped && v.Offline.MaxBytes <= 0 {
+				return fmt.Errorf("store %q: capped offline queue needs a positive maxBytes", v.ID)
+			}
+			if v.Offline.Policy != StreamQueueCapped && v.Offline.MaxBytes != 0 {
+				return fmt.Errorf("store %q: maxBytes needs the capped offline policy", v.ID)
+			}
+		}
 		for target, path := range v.Links {
 			if !seenID[target] {
 				return fmt.Errorf("store %q link target %q: unknown store", v.ID, target)
@@ -628,6 +671,8 @@ func (c *Config) StoreViews() []StoreView {
 			ID:          id,
 			Group:       s.Group,
 			Sync:        firstNonEmpty(s.Sync, SyncLocal),
+			Preferred:   s.Preferred,
+			Offline:     s.Offline,
 			Symlinks:    append([]string(nil), s.Symlinks...),
 			Links:       links,
 			Permissions: mergePerms(nil, s.Permissions),

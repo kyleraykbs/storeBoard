@@ -217,6 +217,20 @@ func TestValidate(t *testing.T) {
 		{"bad sync type", func(c *Config) {
 			c.StoreTree["loose"] = Store{Group: "family", Sync: "sometimes"}
 		}, "sync"},
+		{"unknown preferred peer", func(c *Config) {
+			c.StoreTree["bulk"] = Store{Group: "media", Preferred: "ghost"}
+		}, "preferred peer"},
+		{"preferred peer outside the group", func(c *Config) {
+			c.Groups["media"] = Group{Peers: []string{"laptop", "storage"}}
+			c.Peers["storage"] = Peer{Endpoints: []string{"127.0.0.1:4242"}}
+			c.StoreTree["bulk"] = Store{Group: "media", Preferred: "desktop"}
+		}, "not in group"},
+		{"unknown offline policy", func(c *Config) {
+			c.StoreTree["bulk"] = Store{Group: "family", Offline: &OfflineQueue{Policy: "whenever"}}
+		}, "offline policy"},
+		{"capped queue without a byte limit", func(c *Config) {
+			c.StoreTree["bulk"] = Store{Group: "family", Offline: &OfflineQueue{Policy: StreamQueueCapped}}
+		}, "maxBytes"},
 		{"invalid link path", func(c *Config) {
 			c.StoreTree["pictures"].Links["bulk"] = "/Bulk"
 		}, "relative"},
