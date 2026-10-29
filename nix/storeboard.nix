@@ -50,6 +50,14 @@ let
   # nested declarations.
   allStores = lib.attrValues cfg.stores;
 
+  # A streamed store is a FUSE mount, which the hardened sandbox forbids:
+  # PrivateDevices hides /dev/fuse, RestrictNamespaces blocks what fusermount
+  # does, and the capability bounding set drops CAP_SYS_ADMIN, without which
+  # mount(2) is EPERM even for root. The relaxation is applied only when a
+  # store actually streams on this machine, so every other host keeps the
+  # hardened unit unchanged.
+  anyStreamed = lib.any (s: s.sync == "stream") allStores;
+
   # What the engine may write: the root, the data directory, and every
   # declared symlink path (and its parent — a store's link is created where
   # the user asked for it). "-" tolerates a path that does not exist yet
@@ -235,6 +243,25 @@ in
           "AF_UNIX"
           "AF_INET"
           "AF_INET6"
+        ];
+      }
+      // lib.optionalAttrs anyStreamed {
+        # A streamed store is a FUSE mount. This block is after the hardening
+        # one on purpose: these keys merge last, so they win. The device and
+        # the capability are only granted where a store actually streams.
+        PrivateDevices = false;
+        RestrictNamespaces = false;
+        AmbientCapabilities = [
+          "CAP_CHOWN"
+          "CAP_FOWNER"
+          "CAP_DAC_OVERRIDE"
+          "CAP_SYS_ADMIN"
+        ];
+        CapabilityBoundingSet = [
+          "CAP_CHOWN"
+          "CAP_FOWNER"
+          "CAP_DAC_OVERRIDE"
+          "CAP_SYS_ADMIN"
         ];
       };
     };
