@@ -506,8 +506,11 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 			// lets that user reach the mount at all: without it FUSE admits
 			// only the mounting process, and every other uid gets EACCES
 			// before default_permissions is ever consulted.
-			Options:       []string{"default_permissions"},
-			AllowOther:    true,
+			Options: []string{"default_permissions"},
+			// allow_other needs root (or user_allow_other in /etc/fuse.conf);
+			// the daemon mounts as root, and a non-root mount is a test or a
+			// single-user run where the mounter is the only caller anyway.
+			AllowOther:    os.Geteuid() == 0,
 			FsName:        "storeboard",
 			Name:          "storeboard",
 			DisableXAttrs: true,
