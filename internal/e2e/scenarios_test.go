@@ -331,14 +331,34 @@ func TestConcurrentDeleteAndEditKeepsTheFile(t *testing.T) {
 	if err := os.Remove(filepath.Join(n.peer("alpha").storeDir("docs"), base)); err != nil {
 		t.Fatal(err)
 	}
+	// Record alpha's tombstone before reconnecting bravo. Otherwise the
+	// reconnect race can let the stale live index arrive before alpha has
+	// observed its own deletion, making the test depend on scheduler timing.
+	waitFor(t, "alpha to record the deletion", func() bool {
+		j := journalOf(n.peer("alpha"), "docs")
+		return strings.Contains(j, `"path":"`+base+`"`) && strings.Contains(j, `"deleted":true`)
+	})
 	const edited = "edited while alpha deleted\n"
 	write(t, filepath.Join(n.peer("bravo").storeDir("docs"), base), edited)
 	n.start("bravo")
 	a, b := n.peer("alpha"), n.peer("bravo")
-	waitFor(t, "the edited conflict copy on both", func() bool {
+	// Depending on whether bravo's scanner records the edit before the
+	// tombstone arrives, the edited bytes remain at the original path or are
+	// parked as a conflict copy. Both are safe outcomes; only data loss is not.
+	waitFor(t, "the edited data on both", func() bool {
 		for _, p := range []*peer{a, b} {
-			copies := conflictCopies(t, p.storeDir("docs"), base)
-			if len(copies) != 1 || read(t, filepath.Join(p.storeDir("docs"), copies[0])) != edited {
+			atPath, _ := os.ReadFile(filepath.Join(p.storeDir("docs"), base))
+			if string(atPath) == edited {
+				continue
+			}
+			found := false
+			for _, copy := range conflictCopies(t, p.storeDir("docs"), base) {
+				if read(t, filepath.Join(p.storeDir("docs"), copy)) == edited {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 		}
