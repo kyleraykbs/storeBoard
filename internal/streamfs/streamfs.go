@@ -509,6 +509,11 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 			DisableXAttrs: true,
 			// STOREBOARD_FUSE_DEBUG logs every operation go-fuse serves.
 			Debug: os.Getenv("STOREBOARD_FUSE_DEBUG") != "",
+			// A root daemon mounts directly. NixOS has no /bin/fusermount for
+			// go-fuse to fall back to, and the unit already carries
+			// CAP_SYS_ADMIN for exactly this; a non-root daemon keeps the
+			// fusermount path.
+			DirectMount: os.Geteuid() == 0,
 		},
 	}
 	server, err := fs.Mount(mountpoint, root, serverOpts)
