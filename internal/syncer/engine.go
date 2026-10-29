@@ -80,6 +80,12 @@ type StoreState struct {
 	// mount is the journal-backed view, non-nil only while streamed.
 	mount *streamfs.FS
 
+	// offline is the write policy for a streamed store; queue holds the
+	// writes waiting for a holder, and queuedBytes bounds a capped queue.
+	offline     *config.OfflineQueue
+	queue       []queueOp
+	queuedBytes int64
+
 	db        *FileDB
 	hist      *History
 	conflicts int
@@ -95,6 +101,7 @@ type StoreState struct {
 	published api.StoreSync
 	local     int
 	scanning  bool
+	prepared  bool // prepareRoot has run: the mount, if any, exists
 }
 
 // publish returns the store's status, refreshing the fields that need the
@@ -230,9 +237,12 @@ func (e *Engine) startFrameWorkers() {
 					case <-e.closed:
 						return
 					case pf := <-ch:
-						if pf.fr.Type == "read" {
+						switch pf.fr.Type {
+						case "read":
 							e.handleRead(pf.peer, &pf.fr)
-						} else {
+						case "rename":
+							e.handleRename(pf.peer, &pf.fr)
+						default:
 							e.handleWant(pf.peer, &pf.fr)
 						}
 					}
@@ -344,6 +354,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			stream:    streamMode,
 			preferred: v.Preferred,
 			root:      v.Dir,
+			offline:   v.Offline,
 			symlinks:  v.Symlinks,
 			links:     v.Links,
 			state:     state,
@@ -360,6 +371,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		}
 		e.stores = append(e.stores, fs)
 		e.byName[fs.name] = fs
+		if streamMode {
+			if err := e.loadQueue(fs); err != nil {
+				return nil, err
+			}
+		}
 	}
 	e.startFrameWorkers()
 	return e, nil
@@ -469,7 +485,12 @@ func (e *Engine) ensureRoot() {
 // into it: an existing directory is the user's, and a store adopts it.
 func (e *Engine) prepareRoot(fs *StoreState) {
 	fs.scanMu.Lock()
-	defer fs.scanMu.Unlock()
+	defer func() {
+		fs.scanMu.Unlock()
+		fs.metaMu.Lock()
+		fs.prepared = true
+		fs.metaMu.Unlock()
+	}()
 	fs.perm = e.resolvePerms(fs)
 	if err := os.MkdirAll(e.cfg.Root, 0o755); err != nil {
 		e.logger.Error("create store root", "store", fs.name, "path", e.cfg.Root, "error", err)
@@ -645,7 +666,7 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
-	case "want", "read":
+	case "want", "read", "rename":
 		ch, ok := e.wantFrames[fr.Store]
 		if !ok {
 			return // a store this machine does not carry
@@ -681,6 +702,7 @@ func (e *Engine) evaluatePeers() {
 		if connected && was != stateAttached {
 			e.logger.Info("store is live (holder reachable)", "store", fs.name)
 			e.scanOnce(fs)
+			e.flushQueue(fs)
 		} else if !connected && was == stateAttached {
 			e.logger.Info("store is not live (no holder reachable)", "store", fs.name)
 		}

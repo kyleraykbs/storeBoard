@@ -277,7 +277,12 @@ func (e *Engine) mountStream(fs *StoreState) {
 		e.logger.Error("create streamed mountpoint", "store", fs.name, "path", fs.root, "error", err)
 		return
 	}
-	mounted, err := streamfs.Mount(fs.root, streamfs.NewTree(treeEntries(fs)), &streamFetcher{e: e, fs: fs})
+	mounted, err := streamfs.Mount(fs.root, streamfs.NewTree(treeEntries(fs)), streamfs.Options{
+		Fetcher: &streamFetcher{e: e, fs: fs},
+		Mutator: &storeMutator{e: e, fs: fs},
+		UID:     uint32(max(fs.perm.uid, 0)),
+		GID:     uint32(max(fs.perm.gid, 0)),
+	})
 	if err != nil {
 		e.logger.Error("mount streamed store; serving the journal only",
 			"store", fs.name, "path", fs.root, "error", err)

@@ -16,9 +16,11 @@ import (
 )
 
 type frame struct {
-	Type    string   `json:"type"`
-	Store   string   `json:"store,omitempty"`
-	Path    string   `json:"path,omitempty"`
+	Type  string `json:"type"`
+	Store string `json:"store,omitempty"`
+	Path  string `json:"path,omitempty"`
+	// To is the destination of a rename queued on a streamed store.
+	To      string   `json:"to,omitempty"`
 	Seq     int      `json:"seq,omitempty"`
 	Data    []byte   `json:"data,omitempty"`
 	Entry   *Entry   `json:"entry,omitempty"`
@@ -116,6 +118,12 @@ func (e *Engine) needsMaterialization(fs *StoreState, ent *Entry) bool {
 	if ent.Deleted || ent.Dir {
 		return false
 	}
+	if fs.stream {
+		// Nothing is ever materialised here, and the canonical path is our
+		// own mount: statting it from the frame handlers would re-enter the
+		// filesystem to ask a question the journal already answers.
+		return false
+	}
 	path := filepath.Join(fs.root, ent.Path)
 	info, err := os.Stat(path)
 	return err != nil || !info.Mode().IsRegular() || info.Size() != ent.Size || info.ModTime().UnixNano() != ent.MTime
@@ -150,6 +158,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		rem = rem.clone()
 		rem.Local = false
 		loc := fs.db.Get(rem.Path)
+		e.ackQueue(fs, rem)
 
 		if rem.Dir {
 			e.handleDirEntry(peer, fs, rem, loc)
@@ -410,6 +419,17 @@ func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error
 	if ent.Blob != "" && e.store.Has(ent.Blob) {
 		return e.store.Open(ent.Blob)
 	}
+	// A write this machine made but has not handed to a holder yet lives in
+	// the queue: that is the only copy, so a holder pulling it reads here.
+	if path, ok := e.queuedBlob(fs, ent.Blob); ok {
+		return os.Open(path)
+	}
+	if fs.stream {
+		// This store's canonical path is our own mount: statting it from
+		// here would re-enter the filesystem. Bytes exist only in the blob
+		// store or the queue, and neither had them.
+		return nil, os.ErrNotExist
+	}
 	path := filepath.Join(fs.root, ent.Path)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -497,6 +517,50 @@ func (e *Engine) requestRange(peer string, fs *StoreState, rem *Entry, p *pendin
 	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path, Offset: offset, Length: length}); err != nil {
 		e.logger.Debug("want", "peer", peer, "error", err)
 	}
+}
+
+// handleRename applies a rename queued on a streamed peer: the holder moves
+// its own file and journals both paths, so every other peer converges on the
+// same tree.
+func (e *Engine) handleRename(peer string, fr *frame) {
+	fs := e.byName[fr.Store]
+	if fs == nil || !validRel(fr.Path) || !validRel(fr.To) {
+		return
+	}
+	if fs.stream {
+		// A streamed peer has no tree of its own to rename; the journal
+		// records it locally already.
+		return
+	}
+	fs.scanMu.Lock()
+	defer fs.scanMu.Unlock()
+	ent := fs.db.Get(fr.Path)
+	if ent == nil || ent.Deleted {
+		return
+	}
+	from := filepath.Join(fs.root, ent.Path)
+	to := filepath.Join(fs.root, fr.To)
+	if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
+		e.logger.Warn("rename: create parent", "store", fs.name, "path", fr.To, "error", err)
+		return
+	}
+	if err := os.Rename(from, to); err != nil {
+		e.logger.Warn("rename on holder", "store", fs.name, "path", fr.Path, "to", fr.To, "error", err)
+		return
+	}
+	e.chownPath(fs, to)
+
+	vv := fr.Entry.VV
+	if len(vv) == 0 {
+		vv = map[string]uint64{e.me: fs.db.Next()}
+	}
+	old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
+	moved := ent.clone()
+	moved.Path = fr.To
+	moved.VV = vv
+	_ = fs.db.Put(old)
+	_ = fs.db.Put(moved)
+	e.broadcastIndex(fs, []*Entry{old, moved})
 }
 
 // --- serving ---------------------------------------------------------------
@@ -709,7 +773,13 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	}
 	if err := e.applyEntry(fs, applyEnt); err != nil {
 		e.logger.Warn("apply entry", "store", fs.name, "path", applyEnt.Path, "error", err)
+		return
 	}
+	// Fan the applied version out at once. The peer that sent the bytes is
+	// usually a streamed store waiting for proof the holder took them; it
+	// retires its queue entry on that echo rather than on the next
+	// half-minute resend.
+	e.broadcastIndex(fs, []*Entry{applyEnt})
 }
 
 // ensureEmptyBlob stores the zero-byte blob under sum, verifying the name is

@@ -163,6 +163,97 @@ func (d *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 // Getattr reports a directory's attributes.
 func (d *dirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0o755
+	d.fsys.owner(out)
+	return 0
+}
+
+// owner stamps the store's uid and gid, which is what default_permissions
+// compares a caller against.
+func (f *FS) owner(out *fuse.AttrOut) {
+	out.Uid = f.uid
+	out.Gid = f.gid
+}
+
+var _ = (fs.NodeCreater)((*dirNode)(nil))
+var _ = (fs.NodeMkdirer)((*dirNode)(nil))
+var _ = (fs.NodeUnlinker)((*dirNode)(nil))
+var _ = (fs.NodeRmdirer)((*dirNode)(nil))
+var _ = (fs.NodeRenamer)((*dirNode)(nil))
+
+// childPath joins a name onto this directory's path.
+func (d *dirNode) childPath(name string) string {
+	if d.path == "" {
+		return name
+	}
+	return d.path + "/" + name
+}
+
+// Create makes a new file and hands back the handle that takes its bytes.
+func (d *dirNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	if d.fsys.mutator == nil {
+		return nil, nil, 0, syscall.EROFS
+	}
+	child := d.childPath(name)
+	pending, err := d.fsys.mutator.Create(child, mode&0o7777)
+	if err != nil {
+		return nil, nil, 0, errnoFor(err)
+	}
+	entry := Entry{Path: child, Mode: mode & 0o7777}
+	node := &fileNode{fsys: d.fsys, path: child, entry: entry}
+	inode := d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFREG})
+	h := &fileHandle{fsys: d.fsys, entry: entry, write: pending}
+	return inode, h, 0, 0
+}
+
+// Mkdir records an empty directory, which only exists because the journal
+// says so.
+func (d *dirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if d.fsys.mutator == nil {
+		return nil, syscall.EROFS
+	}
+	child := d.childPath(name)
+	if err := d.fsys.mutator.MakeDir(child, mode&0o7777); err != nil {
+		return nil, errnoFor(err)
+	}
+	return d.NewInode(ctx, &dirNode{fsys: d.fsys, path: child}, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
+}
+
+// Unlink removes a file: the journal records the tombstone and the holder is
+// told, so the deletion travels like any other.
+func (d *dirNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	if d.fsys.mutator == nil {
+		return syscall.EROFS
+	}
+	if err := d.fsys.mutator.Remove(d.childPath(name)); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+// Rmdir removes an empty directory.
+func (d *dirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	if d.fsys.mutator == nil {
+		return syscall.EROFS
+	}
+	if err := d.fsys.mutator.RemoveDir(d.childPath(name)); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+// Rename moves a path. The daemon performs it on both the journal and, when a
+// holder is reachable, the holder's own tree.
+func (d *dirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	if d.fsys.mutator == nil {
+		return syscall.EROFS
+	}
+	parent, ok := newParent.(*dirNode)
+	if !ok {
+		return syscall.EXDEV
+	}
+	if err := d.fsys.mutator.Rename(d.childPath(name), parent.childPath(newName)); err != nil {
+		return errnoFor(err)
+	}
 	return 0
 }
 
@@ -185,6 +276,7 @@ func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrO
 	}
 	out.Mode = fuse.S_IFREG | mode&0o777
 	out.Size = uint64(f.entry.Size)
+	f.fsys.owner(out)
 	if !f.entry.MTime.IsZero() {
 		mt := f.entry.MTime
 		out.SetTimes(nil, &mt, nil)
@@ -193,22 +285,38 @@ func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrO
 }
 
 func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	if flags&uint32(os.O_WRONLY|os.O_RDWR) != 0 {
-		return nil, 0, syscall.EROFS
-	}
-	if f.fsys.fetcher == nil {
+	wantWrite := flags&uint32(os.O_WRONLY|os.O_RDWR) != 0
+	if f.fsys.fetcher == nil && !wantWrite {
 		return nil, 0, syscall.ENOSYS
 	}
-	return &fileHandle{fsys: f.fsys, entry: f.entry, size: f.entry.Size}, 0, 0
+	h := &fileHandle{fsys: f.fsys, entry: f.entry, size: f.entry.Size}
+	if wantWrite {
+		if f.fsys.mutator == nil {
+			return nil, 0, syscall.EROFS
+		}
+		w, err := f.fsys.mutator.Open(f.path, flags&uint32(os.O_TRUNC) != 0)
+		if err != nil {
+			return nil, 0, errnoFor(err)
+		}
+		h.write = w
+		if flags&uint32(os.O_TRUNC) != 0 {
+			h.size = 0
+		}
+	}
+	return h, 0, 0
 }
 
 type fileHandle struct {
 	fsys  *FS
 	entry Entry
 	size  int64
+	write PendingFile
 }
 
 var _ = (fs.FileReader)((*fileHandle)(nil))
+var _ = (fs.FileWriter)((*fileHandle)(nil))
+var _ = (fs.FileFlusher)((*fileHandle)(nil))
+var _ = (fs.FileGetattrer)((*fileHandle)(nil))
 var _ = (fs.FileReleaser)((*fileHandle)(nil))
 
 func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -219,6 +327,11 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	if rest := h.size - off; want > rest {
 		want = rest
 	}
+	if h.write != nil {
+		// The bytes exist only in the pending queue file so far; a read
+		// through the mount would need a holder that does not have them yet.
+		return nil, syscall.EAGAIN
+	}
 	buf, err := h.fsys.fetcher.ReadRange(ctx, h.entry, off, want)
 	if err != nil {
 		return nil, errnoFor(err)
@@ -226,23 +339,104 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	return fuse.ReadResultData(buf), 0
 }
 
-func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
+func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	if h.write == nil {
+		return 0, syscall.EROFS
+	}
+	n, err := h.write.WriteAt(data, off)
+	if err != nil {
+		return uint32(n), syscall.EIO
+	}
+	if end := off + int64(n); end > h.size {
+		h.size = end
+	}
+	return uint32(n), 0
+}
+
+// Getattr on the handle reports the size this open has grown to: a caller
+// that stats an open file mid-write must not see the size it had at open.
+func (h *fileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
+	mode := h.entry.Mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	out.Mode = fuse.S_IFREG | mode&0o777
+	out.Size = uint64(h.size)
+	h.fsys.owner(out)
 	return 0
+}
+
+// Flush finalises a written file. Close(2) sees this error, so a policy that
+// refuses the write is reported to the writer rather than swallowed.
+func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
+	if h.write == nil {
+		return 0
+	}
+	if err := h.write.Close(); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
+	if h.write == nil {
+		return 0
+	}
+	if err := h.write.Close(); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+// Mutator persists the changes a writable mount makes. The engine implements
+// it: a mount with no mutator is read-only.
+type Mutator interface {
+	// Create starts a new file at path. The returned handle receives the
+	// bytes and finalises them when closed.
+	Create(path string, mode uint32) (PendingFile, error)
+	// Open starts writing an existing file. Truncate decides whether the
+	// holder's current bytes are kept as the starting point.
+	Open(path string, truncate bool) (PendingFile, error)
+	Remove(path string) error
+	MakeDir(path string, mode uint32) error
+	RemoveDir(path string) error
+	Rename(from, to string) error
+}
+
+// PendingFile is one file being written through the mount. Close is where the
+// bytes are hashed, journalled and queued; it must be idempotent.
+type PendingFile interface {
+	WriteAt(p []byte, off int64) (int, error)
+	Truncate(size int64) error
+	Close() error
+}
+
+// Options configures one mount. A nil Mutator makes it read-only; UID and GID
+// are the owner the kernel checks with default_permissions, which is the
+// store's resolved owner rather than the daemon's.
+type Options struct {
+	Fetcher Fetcher
+	Mutator Mutator
+	UID     uint32
+	GID     uint32
 }
 
 // FS is one mounted streamed store.
 type FS struct {
 	tree    *Tree
 	fetcher Fetcher
+	mutator Mutator
+	uid     uint32
+	gid     uint32
 	server  *fuse.Server
 }
 
 // Mount serves tree at mountpoint until Unmount is called. The mountpoint must
 // exist and be empty; the caller owns its lifetime.
-func Mount(mountpoint string, tree *Tree, fetcher Fetcher) (*FS, error) {
-	f := &FS{tree: tree, fetcher: fetcher}
+func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
+	f := &FS{tree: tree, fetcher: opts.Fetcher, mutator: opts.Mutator, uid: opts.UID, gid: opts.GID}
 	root := &dirNode{fsys: f}
-	opts := &fs.Options{
+	serverOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			// The daemon runs as root but the files belong to the store's
 			// user, so let the kernel enforce the modes reported above
@@ -253,7 +447,7 @@ func Mount(mountpoint string, tree *Tree, fetcher Fetcher) (*FS, error) {
 			DisableXAttrs: true,
 		},
 	}
-	server, err := fs.Mount(mountpoint, root, opts)
+	server, err := fs.Mount(mountpoint, root, serverOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -280,9 +474,16 @@ func (f *FS) Unmount() error { return f.server.Unmount() }
 // is ENOENT, a holder that went away is ESTALE (retry after failover), and
 // anything else is EIO.
 func errnoFor(err error) syscall.Errno {
+	var errno syscall.Errno
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &errno):
+		return errno
+	case errors.Is(err, os.ErrPermission):
+		return syscall.EROFS
+	case errors.Is(err, os.ErrExist):
+		return syscall.EEXIST
 	case errors.Is(err, os.ErrNotExist):
 		return syscall.ENOENT
 	case errors.Is(err, syscall.ESTALE), errors.Is(err, io.ErrUnexpectedEOF):

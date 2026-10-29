@@ -85,6 +85,7 @@ func TestStreamedStoreServesTheFileThroughItsMount(t *testing.T) {
 	waitFor(t, testWait, "journal entry on the streamed peer", func() bool {
 		return b.store("docs").db.Get("Pictures/clip.jpg") != nil
 	})
+	waitPrepared(t, b.store("docs"))
 	if !b.store("docs").mounted() {
 		t.Skip("no FUSE mount available here: the journal path is covered elsewhere")
 	}

@@ -74,7 +74,7 @@ func TestMountServesJournalTree(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, tree, fetcher)
+	mounted, err := Mount(mnt, tree, Options{Fetcher: fetcher})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestSeekUsesByteRanges(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, tree, fetcher)
+	mounted, err := Mount(mnt, tree, Options{Fetcher: fetcher})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestMissingBlobReportsNoSuchFile(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, tree, fetcher)
+	mounted, err := Mount(mnt, tree, Options{Fetcher: fetcher})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestWriteIsRefused(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, tree, &memoryFetcher{bodies: map[string]string{"b": "x"}})
+	mounted, err := Mount(mnt, tree, Options{Fetcher: &memoryFetcher{bodies: map[string]string{"b": "x"}}})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestTreeReplacementIsVisible(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, tree, &memoryFetcher{bodies: map[string]string{"1": "a", "2": "b"}})
+	mounted, err := Mount(mnt, tree, Options{Fetcher: &memoryFetcher{bodies: map[string]string{"1": "a", "2": "b"}}})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestEmptyTreeMounts(t *testing.T) {
 	if err := os.Mkdir(mnt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mounted, err := Mount(mnt, NewTree(nil), &memoryFetcher{})
+	mounted, err := Mount(mnt, NewTree(nil), Options{Fetcher: &memoryFetcher{}})
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
