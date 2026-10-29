@@ -163,10 +163,12 @@ in
       ${cfg.group} = { };
     };
 
-    systemd.tmpfiles.rules = [
-      "d ${cfg.root} 0750 ${cfg.user} ${cfg.group} -"
-      "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
-    ];
+	systemd.tmpfiles.rules = [
+	  # Preserve an existing store-root owner; the daemon repairs it from
+	  # the parent directory on startup.
+	  "d ${cfg.root} 0755 - - -"
+	  "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
+	];
 
     systemd.services.storeboard = {
       description = "Storeboard sync daemon";

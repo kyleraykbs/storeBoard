@@ -89,6 +89,27 @@ func nearestExisting(dir string) string {
 	}
 }
 
+// healRoot repairs the container itself, not every file below it. A blanket
+// chown of the store tree would walk hundreds of gigabytes at startup;
+// descendants are permissioned when created, and each store root is handled
+// by applyDir in prepareRoot.
+func (e *Engine) healRoot(fs *StoreState) {
+	info, err := os.Lstat(e.cfg.Root)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	if fs.perm.uid >= 0 {
+		if err := os.Chown(e.cfg.Root, fs.perm.uid, fs.perm.gid); err != nil {
+			e.logger.Warn("chown root", "path", e.cfg.Root, "error", err)
+		}
+	}
+	if st, err := os.Stat(e.cfg.Root); err == nil {
+		if err := os.Chmod(e.cfg.Root, st.Mode().Perm()|0o700); err != nil {
+			e.logger.Warn("chmod root", "path", e.cfg.Root, "error", err)
+		}
+	}
+}
+
 // applyDir makes path match the store's resolved permissions: chmod to the
 // resolved directory mode, chown to the resolved owner. Best-effort — a
 // failure is logged, never fatal: permissions must not stop a sync.

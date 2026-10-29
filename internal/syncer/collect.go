@@ -25,7 +25,13 @@ var recentBlob = 10 * time.Minute
 // is deliberately conservative: it refuses to act at all if any reference
 // source cannot be read, because a blob it cannot account for is kept, and a
 // blob it wrongly drops is a deleted file.
-func (e *Engine) Collect() (removed int, freed int64) {
+// keepSet is the set of blobs nothing on this machine may delete: every
+// retained history version, any live entry whose file is missing or stale
+// here, and every blob an orphan store's journal or history still names. It is
+// the single judgement both the startup collector and the on-demand cleanup
+// command share, so `storeboard cleanup` can never free something the engine
+// would have kept.
+func (e *Engine) keepSet() (map[string]bool, error) {
 	keep := map[string]bool{}
 
 	// Every retained version needs its bytes: that is the whole point of the
@@ -44,8 +50,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 	}
 
 	// A blob is also the only copy of a file this machine does not hold on
-	// disk: a streamed store's cache, or an entry whose file is missing or
-	// stale. Everything else is duplicated by the tree and can go.
+	// disk. Everything else is duplicated by the tree and can go.
 	for _, fs := range e.stores {
 		for _, ent := range fs.db.All() {
 			if ent.Blob == "" || ent.Dir {
@@ -71,8 +76,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 				continue
 			}
 			if err := refsFromJournal(filepath.Join(journalDir, name), keep); err != nil {
-				e.logger.Warn("collector: cannot read a journal; keeping everything", "journal", name, "error", err)
-				return 0, 0
+				return nil, fmt.Errorf("collector: cannot read a journal; keeping everything: %w", err)
 			}
 		}
 	}
@@ -88,10 +92,18 @@ func (e *Engine) Collect() (removed int, freed int64) {
 				continue
 			}
 			if err := refsFromHistory(filepath.Join(historyDir, name), keep); err != nil {
-				e.logger.Warn("collector: cannot read a history; keeping everything", "history", name, "error", err)
-				return 0, 0
+				return nil, fmt.Errorf("collector: cannot read a history; keeping everything: %w", err)
 			}
 		}
+	}
+	return keep, nil
+}
+
+func (e *Engine) Collect() (removed int, freed int64) {
+	keep, err := e.keepSet()
+	if err != nil {
+		e.logger.Warn(err.Error())
+		return 0, 0
 	}
 
 	// The store: <root>/<ab>/<cd>/<sum>, so the blob's name is its hash.

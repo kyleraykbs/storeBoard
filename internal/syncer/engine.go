@@ -451,16 +451,20 @@ func (e *Engine) ensureRoot() {
 	}
 }
 
-// prepareRoot creates a store's canonical directory and applies its
-// permissions. Content is never moved into it: an existing directory is the
-// user's, and a store that finds one simply adopts it.
+// prepareRoot creates the canonical directory, repairs the container's
+// ownership/traversal, and applies store permissions. Content is never moved
+// into it: an existing directory is the user's, and a store adopts it.
 func (e *Engine) prepareRoot(fs *StoreState) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	fs.perm = e.resolvePerms(fs)
+	if err := os.MkdirAll(e.cfg.Root, 0o755); err != nil {
+		e.logger.Error("create store root", "store", fs.name, "path", e.cfg.Root, "error", err)
+	}
 	if err := os.MkdirAll(fs.root, 0o755); err != nil {
 		e.logger.Error("create store root", "store", fs.name, "path", fs.root, "error", err)
 	}
+	e.healRoot(fs)
 	e.applyDir(fs, fs.root)
 	fs.refreshLocked()
 	e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state)

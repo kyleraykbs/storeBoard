@@ -36,8 +36,10 @@ Commands:
                   turn a declared symlink path that already holds files
                   into a link to the store, keeping and syncing that content
   send <store> <file>
-                  copy a file into a store: it syncs like any other
-                  change, and a name already taken is parked, not lost
+  space           show how much disk each data category and each
+                  unconfigured store uses
+  cleanup         expire trash and history, collect redundant blobs,
+                  optionally removing data for unconfigured stores
   status          show the daemon's status document
   version         print version information
   help            show this help
@@ -67,6 +69,10 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 			return ErrHandled
 		}
 		return configCheck(configPath, rest[1:], stdout, stderr)
+	case "space":
+		return spaceCmd(ctx, configPath, rest, stdout, stderr)
+	case "cleanup":
+		return cleanupCmd(ctx, configPath, rest, stdout, stderr)
 	case "status":
 		return status(ctx, configPath, rest, stdout, stderr)
 	case "send":
@@ -228,6 +234,110 @@ func status(ctx context.Context, configPath string, args []string, stdout, stder
 	}
 	renderStatus(stdout, &st)
 	return nil
+}
+
+// spaceCmd shows how much disk each category of daemon state uses.
+func spaceCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	jsonOut, err := jsonFlag(args, "space", stderr)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := fetch(ctx, cfg.Socket, "/v1/space")
+	if err != nil {
+		return fmt.Errorf("cannot reach storeboardd at %s: %w (is it running?)", cfg.Socket, err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var sp api.Space
+	if err := json.Unmarshal(body, &sp); err != nil {
+		return fmt.Errorf("parse space document: %w", err)
+	}
+	renderSpace(stdout, &sp)
+	return nil
+}
+
+// cleanupCmd runs expiry, pruning and blob collection. Orphaned store data
+// is reported but never destroyed unless --remove-orphans is passed.
+func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	removeOrphans, jsonOut := false, false
+	for _, arg := range args {
+		switch arg {
+		case "--remove-orphans":
+			removeOrphans = true
+		case "--json":
+			jsonOut = true
+		case "-h", "--help":
+			fmt.Fprintln(stderr, "storeboard: usage: storeboard cleanup [--remove-orphans] [--json]")
+			return ErrHandled
+		default:
+			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n", arg)
+			return ErrHandled
+		}
+	}
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/cleanup", map[string]any{"removeOrphans": removeOrphans})
+	if err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var res api.CleanupResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		return fmt.Errorf("parse cleanup result: %w", err)
+	}
+	renderCleanup(stdout, &res)
+	return nil
+}
+
+// renderSpace prints a human-readable data directory breakdown.
+func renderSpace(w io.Writer, sp *api.Space) {
+	fmt.Fprintf(w, "dataDir: %s (%s)\n", sp.DataDir, humanBytes(sp.TotalBytes))
+	for _, ent := range sp.Entries {
+		orphan := ""
+		if !ent.Configured {
+			orphan = " (not in config)"
+		}
+		fmt.Fprintf(w, "  %-40s %10s%s\n", ent.Path, humanBytes(ent.Bytes), orphan)
+	}
+}
+
+// renderCleanup prints what an explicit cleanup removed.
+func renderCleanup(w io.Writer, res *api.CleanupResult) {
+	fmt.Fprintf(w, "trash expired: %d files (%s)\n", res.TrashFiles, humanBytes(res.TrashBytes))
+	fmt.Fprintf(w, "blobs collected: %d (%s)\n", res.Blobs, humanBytes(res.BlobBytes))
+	if len(res.OrphanStores) > 0 {
+		fmt.Fprintf(w, "orphaned store data (%s):\n", humanBytes(res.OrphanBytes))
+		for _, id := range res.OrphanStores {
+			fmt.Fprintf(w, "  %s\n", id)
+		}
+		fmt.Fprintln(w, "orphan data was left in place; re-run with --remove-orphans to delete it")
+	} else {
+		fmt.Fprintln(w, "orphaned store data: none")
+	}
+}
+
+func humanBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%dB", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // call sends one request to the daemon over its unix socket and returns the

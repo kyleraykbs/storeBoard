@@ -195,3 +195,32 @@ type SendResult struct {
 	Parked string `json:"parked,omitempty"`
 	Size   int64  `json:"size"`
 }
+
+// SpaceEntry reports one on-disk category in the daemon data directory.
+type SpaceEntry struct {
+	Path       string `json:"path"`
+	Bytes      int64  `json:"bytes"`
+	Files      int64  `json:"files"`
+	Configured bool   `json:"configured"`
+}
+
+// Space is a data-directory report. Trash is deleted content retained until
+// its normal retention window expires; orphaned entries are data for stores
+// no longer present in the active config.
+type Space struct {
+	APIVersion int          `json:"apiVersion"`
+	DataDir    string       `json:"dataDir"`
+	TotalBytes int64        `json:"totalBytes"`
+	Entries    []SpaceEntry `json:"entries"`
+}
+
+// CleanupResult reports what an explicit cleanup removed.
+type CleanupResult struct {
+	APIVersion   int      `json:"apiVersion"`
+	TrashFiles   int      `json:"trashFiles"`
+	TrashBytes   int64    `json:"trashBytes"`
+	OrphanStores []string `json:"orphanStores"`
+	OrphanBytes  int64    `json:"orphanBytes"`
+	Blobs        int      `json:"blobs"`
+	BlobBytes    int64    `json:"blobBytes"`
+}

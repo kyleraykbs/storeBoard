@@ -797,3 +797,80 @@ func TestEmptiedDirectoryKeepsAUserMadeChild(t *testing.T) {
 		}
 	}
 }
+
+// TestSpaceAndCleanupAgainstLivePair checks the new operational verbs over real
+// binaries. Unused data is reported with its path; only an explicit orphan
+// removal deletes it. This discrimination is the policy the sessions
+// established around invariant 1.
+func TestSpaceAndCleanupAgainstLivePair(t *testing.T) {
+	a, _ := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+	orpRoot := filepath.Join(a.storeDir("old-store"))
+	if err := os.MkdirAll(orpRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orpRoot, "left.txt"), []byte("left"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(a.dataDir, "journal", "old-store.ndjson")
+	if err := os.WriteFile(journal, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	space := cliRun(t, a, "space", "--json")
+	if !strings.Contains(space, "old-store") {
+		t.Fatalf("space did not name the orphan store:\n%s", space)
+	}
+	cleanup := cliRun(t, a, "cleanup", "--json")
+	if !strings.Contains(cleanup, "old-store") {
+		t.Fatalf("cleanup did not report the orphan store:\n%s", cleanup)
+	}
+	if _, err := os.Stat(orpRoot); err != nil {
+		t.Fatalf("cleanup removed an orphan by default: %v", err)
+	}
+	explicit := cliRun(t, a, "cleanup", "--remove-orphans", "--json")
+	if !strings.Contains(explicit, "old-store") {
+		t.Fatalf("explicit cleanup did not report the preserved orphan:\n%s", explicit)
+	}
+	if _, err := os.Stat(orpRoot); err != nil {
+		t.Fatalf("cleanup deleted orphan data even though deletion is unimplemented: %v", err)
+	}
+}
+
+// TestLockedRootStillHeals verifies the takeover failure mode from the field:
+// when service activation leaves the root 0750 root-owned, the engine repairs
+// container ownership and traversal instead of letting external access stay
+// broken.
+func TestLockedRootStillHeals(t *testing.T) {
+	a, _ := startMesh(t, mesh{
+		storesA: map[string]storeDecl{"docs": {Group: "g"}},
+		storesB: map[string]storeDecl{"docs": {Group: "g"}},
+	})
+	root := a.root
+	// The live replica requires root; declarative CI lacks it because changing
+	// another UID is a privileged operation.
+	if os.Getuid() != 0 && os.Geteuid() != 0 {
+		t.Skipf("root-owned root repair requires root")
+	}
+	if err := os.Chown(root, 0, -1); err != nil {
+		t.Skipf("chown to root unavailable: %v", err)
+	}
+	if err := os.Chmod(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("root disappeared: %v", err)
+	}
+	uid := int(info.Sys().(*syscall.Stat_t).Uid)
+	current := os.Getuid()
+	if uid != current {
+		t.Fatalf("root ownership is %d, want daemon-adjacent %d", uid, current)
+	}
+	if info.Mode().Perm()&0o700 != 0o700 {
+		t.Fatalf("root is %v, not owner-traversable", info.Mode())
+	}
+}

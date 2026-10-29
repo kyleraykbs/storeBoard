@@ -166,6 +166,175 @@ func TestStatusDocumentStoresAlwaysAnArray(t *testing.T) {
 	}
 }
 
+func TestSpaceOverUnixSocket(t *testing.T) {
+	cfg := testConfig(t)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.Socket)
+	}}}
+	waitServer(t, client)
+	resp, err := client.Get("http://storeboard/v1/space")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET space = %s", resp.Status)
+	}
+	var space api.Space
+	if err := json.NewDecoder(resp.Body).Decode(&space); err != nil {
+		t.Fatal(err)
+	}
+	if len(space.Entries) == 0 {
+		t.Fatal("space report is empty")
+	}
+	var found bool
+	for _, entry := range space.Entries {
+		if entry.Path == "store" && entry.Configured {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("space report omits the content store: %+v", space)
+	}
+}
+
+func waitServer(t *testing.T, client *http.Client) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("http://storeboard/v1/status")
+		if err == nil {
+			resp.Body.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("daemon did not become reachable")
+}
+
+func TestCleanupIsReadOnlyWithoutOrphanFlag(t *testing.T) {
+	cfg := testConfig(t)
+	serverOrphan(t, cfg)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	client := unixClient(cfg)
+	waitServer(t, client)
+
+	var cleanup api.CleanupResult
+	postJSON(t, client, "http://storeboard/v1/cleanup", map[string]any{}, &cleanup)
+	if orphan := filepath.Join(cfg.Root, "photos-old"); !fileExists(orphan) {
+		t.Fatalf("cleanup without remove-orphans deleted %s", orphan)
+	}
+	if orphanJ := filepath.Join(cfg.DataDir, "journal", "photos-old.ndjson"); !fileExists(orphanJ) {
+		t.Fatalf("cleanup without remove-orphans deleted %s", orphanJ)
+	}
+}
+
+func TestCleanupRemoveOrphansNeedsConfirmation(t *testing.T) {
+	cfg := testConfig(t)
+	orphanRoot := serverOrphan(t, cfg)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	client := unixClient(cfg)
+	waitServer(t, client)
+
+	var cleanup api.CleanupResult
+	postJSON(t, client, "http://storeboard/v1/cleanup", map[string]any{"removeOrphans": true}, &cleanup)
+	if !fileExists(orphanRoot) {
+		t.Fatal("cleanup removed orphan data even though orphan deletion is not implemented")
+	}
+	if len(cleanup.OrphanStores) == 0 {
+		t.Fatal("cleanup did not report the preserved orphan")
+	}
+}
+func TestCleanupRejectsGet(t *testing.T) {
+	cfg := testConfig(t)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/v1/cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET cleanup = %s, want 405", resp.Status)
+	}
+}
+
+func serverOrphan(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	orphanRoot := filepath.Join(cfg.Root, "photos-old")
+	if err := os.MkdirAll(orphanRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanRoot, "left.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "journal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "journal", "photos-old.ndjson"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return orphanRoot
+}
+
+func unixClient(cfg *config.Config) *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.Socket)
+	}}}
+}
+
+func postJSON(t *testing.T, client *http.Client, url string, body any, out any) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Post(url, "application/json", strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST = %s", resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func TestUnknownEndpointAndMethod(t *testing.T) {
 	cfg := testConfig(t)
 	srv, err := New(cfg, nil)

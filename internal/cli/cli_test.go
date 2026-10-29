@@ -221,6 +221,71 @@ func TestStatusRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSpaceAndCleanupAgainstLiveDaemon(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		ConfigVersion: config.ConfigVersion,
+		Root:          filepath.Join(dir, "Storeboard"),
+		DataDir:       filepath.Join(dir, "data"),
+		Socket:        filepath.Join(dir, "storeboard.sock"),
+		Peer:          "laptop",
+		Peers:         map[string]config.Peer{"laptop": {Endpoints: []string{"127.0.0.1:4242"}}},
+		Groups: map[string]config.Group{
+			"family": {Peers: []string{"laptop"}},
+		},
+		StoreTree:   map[string]config.Store{"photos": {Group: "family"}},
+		Permissions: map[string]config.Permissions{},
+	}
+	srv, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+
+	cfgPath := filepath.Join(dir, "config.json")
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForSocket(t, cfg.Socket)
+
+	var spaceOut, spaceErr bytes.Buffer
+	if err := Run(ctx, []string{"space", "--json"}, cfgPath, &spaceOut, &spaceErr); err != nil {
+		t.Fatalf("space --json: %v (%s)", err, spaceErr.String())
+	}
+	var space api.Space
+	if err := json.Unmarshal(spaceOut.Bytes(), &space); err != nil {
+		t.Fatalf("space is not the daemon's document: %v\n%s", err, spaceOut.String())
+	}
+	var cleanupOut, cleanupErr bytes.Buffer
+	if err := Run(ctx, []string{"cleanup", "--json"}, cfgPath, &cleanupOut, &cleanupErr); err != nil {
+		t.Fatalf("cleanup --json: %v (%s)", err, cleanupErr.String())
+	}
+	var cleanup api.CleanupResult
+	if err := json.Unmarshal(cleanupOut.Bytes(), &cleanup); err != nil {
+		t.Fatalf("cleanup is not the daemon's document: %v\n%s", err, cleanupOut.String())
+	}
+
+	var flagOut, flagErr bytes.Buffer
+	if err := Run(ctx, []string{"cleanup", "--bogus"}, cfgPath, &flagOut, &flagErr); !errors.Is(err, ErrHandled) {
+		t.Fatalf("cleanup accepted a bogus flag: %v", err)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("daemon Run: %v", err)
+	}
+}
+
 func waitForSocket(t *testing.T, socket string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

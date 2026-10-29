@@ -128,6 +128,8 @@ func requestUID(r *http.Request) (int, bool) {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
+	mux.HandleFunc("/v1/space", s.handleSpace)
+	mux.HandleFunc("/v1/cleanup", s.handleCleanup)
 	mux.HandleFunc("/v1/stores/", s.handleStore)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
@@ -135,9 +137,45 @@ func (s *Server) handler() http.Handler {
 	return mux
 }
 
+// handleSpace reports the size of each data category. Space reports are safe
+// because a store's sustained retention (trash aging, history pruning) only
+// touches one store at a time.
+func (s *Server) handleSpace(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.engine.Space())
+}
+
+// handleCleanup runs expiry and content collection, then unconfigured store
+// data only with remove-orphans. POST-only: nothing in GET may mutate state.
+func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	// Any local caller may ask: cleanup repeats exactly what the daemon already
+	// does on its own schedule (hourly trash expiry, collection at startup), so
+	// it grants nothing a timer would not. Orphan store data is never removed.
+	if _, ok := requestUID(r); !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
+		return
+	}
+	var req struct {
+		RemoveOrphans bool `json:"removeOrphans"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	writeJSON(w, http.StatusOK, s.engine.Cleanup(req.RemoveOrphans))
+}
+
 // handleStore serves the store verbs:
 //
-//	GET  /v1/stores/<name>/versions?path=<p>
+//	GET /v1/stores/<name>/versions?path=<p>
 //	POST /v1/stores/<name>/takeover
 //	POST /v1/stores/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
 //	POST /v1/stores/<name>/send      {"source": …, "path"?: …}
