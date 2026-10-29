@@ -266,6 +266,11 @@ in
         ProtectKernelTunables = false;
         ProtectKernelModules = false;
         ProtectControlGroups = false;
+        # ReadWritePaths alone implies PrivateMounts (it is implemented as
+        # bind mounts plus a read-only remount). With ProtectSystem off it has
+        # nothing left to protect, so it goes too - otherwise the daemon keeps
+        # its own namespace no matter what else is disabled.
+        ReadWritePaths = [ ];
         RestrictNamespaces = false;
         AmbientCapabilities = [
           "CAP_CHOWN"
