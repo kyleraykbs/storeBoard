@@ -61,6 +61,20 @@ func (s *Store) Open(sum string) (io.ReadCloser, error) {
 	return os.Open(s.BlobPath(sum))
 }
 
+// Remove deletes a stored blob. Callers only do this when the bytes exist
+// somewhere else on this machine (a materialised file, or a kept version), so
+// removal never destroys the last copy.
+func (s *Store) Remove(sum string) error {
+	if sum == "" {
+		return nil
+	}
+	err := os.Remove(s.BlobPath(sum))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
 // Adopt moves a fully written temp file into the store under sum. The
 // rename is atomic; the parent directories are fsynced so a crash cannot
 // leave a blob that the journal already references but the store lacks.

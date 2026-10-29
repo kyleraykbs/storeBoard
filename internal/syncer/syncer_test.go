@@ -1085,11 +1085,14 @@ func TestRestartedBlobTransferReplacesPartialBytes(t *testing.T) {
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 1, Data: []byte(content[half:])})
 	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: ent.Path, Entry: ent})
 
-	if !n.eng.store.Has(sum) {
-		t.Fatalf("restarted transfer did not verify: %s", lastLines(n.log.String(), 10))
-	}
+	// Verification is what let the apply happen: the bytes on disk are the
+	// restarted stream, not the abandoned one.
 	if got := readFile(t, filepath.Join(fs.root, ent.Path)); got != content {
-		t.Fatalf("materialised %d bytes, want %d", len(got), len(content))
+		t.Fatalf("materialised %d bytes, want %d: %s", len(got), len(content), lastLines(n.log.String(), 10))
+	}
+	// A replica does not keep a second copy of a file it has materialised.
+	if n.eng.store.Has(sum) {
+		t.Fatal("the content store kept a blob the tree already holds")
 	}
 }
 
@@ -1408,4 +1411,191 @@ func TestScanPrunesDirectoriesEmptiedByDeletion(t *testing.T) {
 			t.Fatalf("%s survived its deletion (still a directory: %v)", dir, info.IsDir())
 		}
 	}
+}
+
+// A replica's tree is the copy: once a file is materialised, the content store
+// must not also hold its bytes. Two copies of every file on every machine is
+// the doubling this exists to avoid.
+func TestReplicaReleasesBlobAfterMaterialising(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	const body = "kept once, in the tree"
+	writeFile(t, filepath.Join(fs.root, "once.txt"), body, time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.Sum(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.eng.store.Has(sum) {
+		t.Fatal("the content store kept a second copy of a materialised file")
+	}
+	if got := readFile(t, filepath.Join(fs.root, "once.txt")); got != body {
+		t.Fatalf("the tree copy is wrong: %q", got)
+	}
+}
+
+// A streamed store has no authoritative tree of its own, so its bytes stay in
+// the content store.
+func TestStreamedStoreKeepsBlob(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncRemote},
+	})
+	n.prepareAll()
+	fs := n.store("docs")
+
+	const body = "streamed"
+	writeFile(t, filepath.Join(fs.root, "remote.txt"), body, time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.Sum(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.eng.store.Has(sum) {
+		t.Fatal("a streamed store dropped the bytes it exists to cache")
+	}
+}
+
+// With history on, the version being recorded needs its bytes: the file may be
+// edited or deleted later, and a restore has nothing else to read.
+func TestBackupHistoryKeepsBlobs(t *testing.T) {
+	n := mkBackupNode(t, config.SyncLocal, "")
+	fs := n.store("docs")
+
+	const body = "a version worth keeping"
+	writeFile(t, filepath.Join(fs.root, "keep.txt"), body, time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := store.Sum(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !n.eng.store.Has(sum) {
+		t.Fatal("history dropped the only copy of a recorded version")
+	}
+}
+
+// The collector keeps a blob whose file is not on disk (the blob is the only
+// copy) and drops one the tree already holds.
+func TestCollectKeepsBlobsWithNoFileOnDisk(t *testing.T) {
+	old := recentBlob
+	recentBlob = 0
+	defer func() { recentBlob = old }()
+
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+
+	// An entry whose bytes arrived but whose file was never materialised.
+	onlyBlob := "bytes with no file"
+	sum, err := store.Sum(strings.NewReader(onlyBlob))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.eng.store.Adopt(mkTempFile(t, n.eng, onlyBlob), sum); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "pending.txt", Blob: sum, Size: int64(len(onlyBlob)), Local: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	n.eng.Collect()
+	if !n.eng.store.Has(sum) {
+		t.Fatal("the collector dropped the only copy of a file with no tree entry")
+	}
+
+	// Now the file is materialised: the blob is redundant.
+	writeFile(t, filepath.Join(fs.root, "pending.txt"), onlyBlob, time.Now())
+	info, err := os.Stat(filepath.Join(fs.root, "pending.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ent := fs.db.Get("pending.txt")
+	ent.MTime = info.ModTime().UnixNano()
+	ent.Local = true
+	if err := fs.db.Put(ent); err != nil {
+		t.Fatal(err)
+	}
+	n.eng.Collect()
+	if n.eng.store.Has(sum) {
+		t.Fatal("the collector kept a blob the tree already holds")
+	}
+}
+
+// An unchanged entry must not append another journal line. Peers resend their
+// full index on every reconnect and periodically, and each pass used to write
+// one line per path: an idle mesh grew journals without bound.
+func TestJournalDoesNotRewriteUnchangedEntries(t *testing.T) {
+	db, err := OpenFileDB(filepath.Join(t.TempDir(), "docs.ndjson"), "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ent := &Entry{Path: "same.txt", Blob: strings.Repeat("ab", 32), Size: 4, MTime: 7, Mode: 0o644, VV: map[string]uint64{"a": 1}}
+	if err := db.Put(ent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(db.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 20 {
+		if err := db.Put(ent.clone()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(db.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("20 unchanged writes grew the journal from %d to %d bytes", before.Size(), after.Size())
+	}
+
+	// A real change is still recorded.
+	changed := ent.clone()
+	changed.Size = 5
+	if err := db.Put(changed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	final, err := os.Stat(db.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Size() == after.Size() {
+		t.Fatal("a changed entry was not recorded")
+	}
+}
+
+// mkTempFile writes body to a scratch file in the engine's store.
+func mkTempFile(t *testing.T, e *Engine, body string) string {
+	t.Helper()
+	f, err := e.store.Temp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return f.Name()
 }

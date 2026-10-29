@@ -698,3 +698,134 @@ func TestCrashAndRestartKeepsDataAndResumesSync(t *testing.T) {
 	}
 	waitForSameTree(t, "converged after the crash", a.storeDir("docs"), b.storeDir("docs"))
 }
+
+// --- storage bloat ---------------------------------------------------------
+
+// fileSizes lists every file under dir with its size, for failure messages.
+func fileSizes(t *testing.T, dir string) string {
+	t.Helper()
+	var out []string
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, path)
+		out = append(out, fmt.Sprintf("%d %s", info.Size(), rel))
+		return nil
+	})
+	sort.Strings(out)
+	return strings.Join(out, "\n")
+}
+
+// dirSize sums the bytes under a directory, for growth assertions.
+func dirSize(t *testing.T, dir string) int64 {
+	t.Helper()
+	var total int64
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	return total
+}
+
+// A replica stores each file once: the tree holds it, and the content store
+// does not keep a second copy. This is the doubling that made a 200 GiB tree
+// take 400 GiB per machine.
+func TestReplicaStoresEachFileOnce(t *testing.T) {
+	n := startNetwork(t, map[string]map[string]storeDecl{
+		"alpha": {"docs": {Group: "g"}},
+		"bravo": {"docs": {Group: "g"}},
+	})
+	a, b := n.peer("alpha"), n.peer("bravo")
+
+	// A megabyte, so an accidental second copy is obvious in the numbers.
+	body := strings.Repeat("payload ", 128<<10)
+	write(t, filepath.Join(a.storeDir("docs"), "blob.txt"), body)
+	waitForContent(t, "the file on bravo", filepath.Join(b.storeDir("docs"), "blob.txt"), body)
+
+	for _, p := range []*peer{a, b} {
+		waitFor(t, p.name+" to release the redundant blob", func() bool {
+			return dirSize(t, filepath.Join(p.dataDir, "store")) < int64(len(body))
+		})
+	}
+}
+
+// An idle mesh must not grow its state. Journals are append-only, so a
+// repeated write of an unchanged entry would add disk forever; index resends
+// happen every second in this harness, which makes the check sharp.
+func TestIdleMeshDoesNotGrowState(t *testing.T) {
+	n := startNetwork(t, map[string]map[string]storeDecl{
+		"alpha": {"docs": {Group: "g"}},
+		"bravo": {"docs": {Group: "g"}},
+	})
+	a, b := n.peer("alpha"), n.peer("bravo")
+
+	write(t, filepath.Join(a.storeDir("docs"), "steady.txt"), "unchanged\n")
+	waitForContent(t, "the file on bravo", filepath.Join(b.storeDir("docs"), "steady.txt"), "unchanged\n")
+	time.Sleep(2 * time.Second) // let the first pass settle
+
+	sizes := func() (int64, int64) {
+		data := dirSize(t, a.dataDir)
+		journal := int64(0)
+		for _, name := range []string{"docs.ndjson"} {
+			if info, err := os.Stat(filepath.Join(a.dataDir, "journal", name)); err == nil {
+				journal = info.Size()
+			}
+		}
+		return data, journal
+	}
+	dataBefore, journalBefore := sizes()
+
+	time.Sleep(5 * time.Second) // several scans and index resends with no change
+
+	dataAfter, journalAfter := sizes()
+	if journalAfter != journalBefore {
+		t.Fatalf("the journal grew from %d to %d bytes while nothing changed", journalBefore, journalAfter)
+	}
+	if dataAfter != dataBefore {
+		t.Fatalf("state grew from %d to %d bytes while nothing changed; files:\n%s",
+			dataBefore, dataAfter, fileSizes(t, a.dataDir))
+	}
+}
+
+// A peer can still be served when the blob is gone, because the file is the
+// copy. This is what lets a replica drop its content store at all.
+func TestPeerIsServedFromTheTreeWhenBlobIsGone(t *testing.T) {
+	n := startNetwork(t, map[string]map[string]storeDecl{
+		"alpha": {"docs": {Group: "g"}},
+		"bravo": {"docs": {Group: "g"}},
+	}, "alpha")
+	a, b := n.peer("alpha"), n.peer("bravo")
+
+	const body = "served without a blob\n"
+	write(t, filepath.Join(a.storeDir("docs"), "source.txt"), body)
+	waitFor(t, "alpha to record the file", func() bool {
+		return strings.Contains(journalOf(a, "docs"), "source.txt")
+	})
+	waitFor(t, "alpha to release its blob", func() bool {
+		return dirSize(t, filepath.Join(a.dataDir, "store")) == 0
+	})
+
+	// The only peer arrives after the bytes left the content store.
+	n.start("bravo")
+	waitForContent(t, "the file on the late peer", filepath.Join(b.storeDir("docs"), "source.txt"), body)
+}

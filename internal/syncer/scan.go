@@ -105,7 +105,11 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 			return fs.db.Put(upd)
 		}
 
-		if !e.store.Has(sum) {
+		// Adopt the bytes into the content store only when they are needed
+		// there (a kept version, or a streamed store with no tree of its
+		// own). Copying every local file into the store and then deleting the
+		// copy would double the write for no gain.
+		if e.wantsBlob(fs, rel, sum) && !e.store.Has(sum) {
 			stored, aerr := e.adoptFile(path, sum)
 			if aerr != nil {
 				return aerr
@@ -128,6 +132,7 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 			MTime: info.ModTime().UnixNano(),
 			Mode:  uint32(info.Mode().Perm()),
 			VV:    vv,
+			Local: true, // this machine has the file
 		}
 		if err := fs.db.Put(ent); err != nil {
 			return err
@@ -148,14 +153,15 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 		if !tombstones {
 			continue
 		}
-		// An entry whose blob this machine does not hold was never
-		// materialised here — it is known from the mesh (an index that
-		// arrived before its blobs, or a root that moved before its content
-		// did). Its absence from the walk says nothing, and tombstoning it
-		// would delete the content everywhere: the 448-file incident on
-		// amanita was exactly this, an empty storage root scanned against a
-		// journal full of entries.
-		if ent.Blob != "" && !e.store.Has(ent.Blob) {
+		// An entry this machine never materialised is known from the mesh (an
+		// index that arrived before its bytes, or a journal restored beside a
+		// root that moved). Its absence from the walk says nothing, and
+		// tombstoning it would delete the content everywhere: the 448-file
+		// incident on amanita was exactly this, an empty storage root scanned
+		// against a journal full of entries. Holding the blob was the old
+		// evidence; now that a replica releases blobs once the file is
+		// materialised, the entry records it directly.
+		if !ent.Local && ent.Blob != "" && !e.store.Has(ent.Blob) {
 			unmaterialised++
 			continue
 		}

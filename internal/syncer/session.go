@@ -100,12 +100,13 @@ func (e *Engine) sendIndexTo(peer string, fs *StoreState, entries []*Entry) erro
 
 // --- receiving -------------------------------------------------------------
 
+// needsMaterialization reports whether the canonical file is missing or stale.
+// The tree is the materialisation: a released blob does not mean the file is
+// absent, and treating it that way made a replica re-fetch its own files from
+// its peers on every index exchange.
 func (e *Engine) needsMaterialization(fs *StoreState, ent *Entry) bool {
-	if ent.Deleted {
+	if ent.Deleted || ent.Dir {
 		return false
-	}
-	if ent.Blob == "" || !e.store.Has(ent.Blob) {
-		return true
 	}
 	path := filepath.Join(fs.root, ent.Path)
 	info, err := os.Stat(path)
@@ -135,6 +136,11 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		if rem == nil || !validRel(rem.Path) {
 			continue
 		}
+		// Local is this machine's own knowledge; a peer's claim about it means
+		// nothing and would let a remote entry masquerade as evidence that a
+		// file existed here.
+		rem = rem.clone()
+		rem.Local = false
 		loc := fs.db.Get(rem.Path)
 
 		if rem.Dir {
@@ -200,35 +206,33 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			// file or content-store blob is absent/stale.
 			if loc.Blob == rem.Blob {
 				if e.needsMaterialization(fs, rem) {
-					if !fs.streamed && e.store.Has(rem.Blob) && !e.pathMissing(fs, rem.Path) {
-						// A replica owns its tree. The bytes are here and the
-						// file differs from the journal, which means the user
-						// changed it since the last scan. Fetching the entry's
-						// blob would park that edit as a conflict copy and put
-						// the old content back — an ordinary edit turned into a
-						// conflict by a peer's periodic index resend. The
-						// scanner is about to record the edit with a newer
-						// version; leave the tree alone until it does.
-						continue
-					}
-					if !fs.streamed && e.store.Has(rem.Blob) && e.pathMissing(fs, rem.Path) {
-						// A replica owns its tree. An entry whose file is
-						// gone is a deletion the user just made, not a
-						// pending fetch: asking for the bytes back resurrected
-						// the file before the next scan could record the
-						// deletion, and a peer's periodic index resent did it
-						// every second. Record the deletion here instead, so
-						// it dominates when the scanner next runs.
-						fs.scanMu.Lock()
-						tomb := e.tombstoneEntry(fs, loc)
-						if tomb != nil {
-							e.pruneEmptyParents(fs, rem.Path)
+					if !fs.streamed {
+						// A replica owns its tree. Judge the entry by what is on
+						// disk, not by whether the content store still holds a
+						// copy: a replica releases that copy once the file is
+						// materialised, so its presence says nothing.
+						if !e.pathMissing(fs, rem.Path) {
+							// The file holds different bytes than the journal:
+							// a local edit the next scan will record. Fetching
+							// would park it as a conflict and put the old
+							// content back.
+							continue
 						}
-						fs.scanMu.Unlock()
-						if tomb != nil {
-							e.broadcastIndex(fs, []*Entry{tomb})
+						if loc.Local {
+							// It was here and is gone: a deletion, which the
+							// peer has not heard about yet. Fetching it back
+							// resurrected files the user had just removed.
+							fs.scanMu.Lock()
+							tomb := e.tombstoneEntry(fs, loc)
+							if tomb != nil {
+								e.pruneEmptyParents(fs, rem.Path)
+							}
+							fs.scanMu.Unlock()
+							if tomb != nil {
+								e.broadcastIndex(fs, []*Entry{tomb})
+							}
+							continue
 						}
-						continue
 					}
 					e.request(peer, fs, rem, &pending{entry: rem})
 					continue
@@ -385,9 +389,69 @@ func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) *Entry {
 		MTime: info.ModTime().UnixNano(),
 		Mode:  uint32(info.Mode().Perm()),
 		VV:    map[string]uint64{e.me: fs.db.Next()},
+		Local: true,
 	}
 	_ = fs.db.Put(ent)
 	return ent
+}
+
+// openEntryBlob opens the bytes of an entry, preferring the content store and
+// falling back to the canonical file, which is hashed first so a peer never
+// receives bytes that do not match the entry it asked for.
+func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error) {
+	if ent.Blob != "" && e.store.Has(ent.Blob) {
+		return e.store.Open(ent.Blob)
+	}
+	path := filepath.Join(fs.root, ent.Path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", ent.Path)
+	}
+	sum, err := store.SumFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if sum != ent.Blob || info.Size() != ent.Size {
+		return nil, fmt.Errorf("%s does not match the entry (%s)", ent.Path, sum)
+	}
+	return os.Open(path)
+}
+
+// wantsBlob reports whether the content store must keep a copy of a file: a
+// kept history version needs those bytes, and a streamed store has no
+// authoritative tree of its own. A plain replica does not — its canonical file
+// is the copy, and the blob is redundant.
+func (e *Engine) wantsBlob(fs *StoreState, path, sum string) bool {
+	if fs.streamed {
+		return true
+	}
+	// With history on, every version this machine records has to keep its
+	// bytes, and the version being recorded right now is one of them.
+	return fs.hist != nil
+}
+
+// releaseBlob removes the content-store copy of a file that is materialised
+// here and does not need the bytes kept for history. Half the point of a
+// content-addressed store is sharing bytes between peers; keeping a second
+// copy of every file on every replica is not sharing, it is doubling.
+func (e *Engine) releaseBlob(fs *StoreState, ent *Entry) {
+	if ent == nil || ent.Blob == "" || ent.Dir {
+		return
+	}
+	if e.wantsBlob(fs, ent.Path, ent.Blob) {
+		return
+	}
+	path := filepath.Join(fs.root, ent.Path)
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != ent.Size || info.ModTime().UnixNano() != ent.MTime {
+		return // no verifiable copy on disk: the blob is the only one
+	}
+	if err := e.store.Remove(ent.Blob); err != nil {
+		e.logger.Warn("release blob", "store", fs.name, "path", ent.Path, "error", err)
+	}
 }
 
 // pathMissing reports whether a store's canonical file is absent. Used to tell
@@ -419,9 +483,9 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 	if ent == nil || ent.Deleted || ent.Blob == "" {
 		return
 	}
-	blob, err := e.store.Open(ent.Blob)
+	blob, err := e.openEntryBlob(fs, ent)
 	if err != nil {
-		e.logger.Warn("blob missing for want", "store", fs.name, "path", fr.Path, "blob", ent.Blob)
+		e.logger.Warn("no readable copy for want", "store", fs.name, "path", fr.Path, "blob", ent.Blob, "error", err)
 		return
 	}
 	defer blob.Close()
@@ -654,6 +718,7 @@ func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
 		MTime: ent.MTime,
 		Mode:  ent.Mode,
 		VV:    map[string]uint64{e.me: fs.db.Next()},
+		Local: true,
 	}
 	_ = fs.db.Put(copyEnt)
 	e.broadcastIndex(fs, []*Entry{copyEnt})
@@ -727,8 +792,14 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
 		return err
 	}
+	// The file is now here: from now on its absence means a deletion rather
+	// than "the bytes never arrived".
+	ent.Local = true
 	_ = fs.db.Put(ent)
 	e.record(fs, ent)
+	// The tree holds these bytes; keeping the content-store copy as well
+	// would store every file twice on this machine.
+	e.releaseBlob(fs, ent)
 	return nil
 }
 

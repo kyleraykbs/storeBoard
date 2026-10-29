@@ -26,6 +26,12 @@ type Entry struct {
 	// made, or one holding nothing but empty directories — is recorded, so it
 	// exists on every peer instead of being silently local.
 	Dir bool `json:"dir,omitempty"`
+	// Local records that this machine materialised the file. It is evidence a
+	// deletion can be trusted: a file that used to be here and is now gone is
+	// a deletion, while an entry this machine never held may simply have
+	// arrived before its bytes. It is never trusted off the wire — a peer's
+	// entries are decoded with it cleared.
+	Local bool `json:"local,omitempty"`
 }
 
 func (e *Entry) clone() *Entry {
@@ -158,6 +164,14 @@ func (d *FileDB) Put(e *Entry) error {
 }
 
 func (d *FileDB) putLocked(e *Entry) error {
+	// Rewriting a journal line for a state that did not change is pure bloat.
+	// Peers exchange their full index on every reconnect and resend it
+	// periodically, and each of those passes used to append a line per path:
+	// an idle mesh grew journals by megabytes a minute, and a store with a
+	// few thousand files collected gigabytes of identical lines.
+	if prev := d.entries[e.Path]; prev != nil && sameEntry(prev, e) {
+		return nil
+	}
 	d.entries[e.Path] = e.clone()
 	if d.closed {
 		// Shutdown raced a scan: the in-memory state is updated, the log
@@ -174,6 +188,28 @@ func (d *FileDB) putLocked(e *Entry) error {
 		return err
 	}
 	return nil
+}
+
+// sameEntry reports whether two entries record the same state: same content,
+// same shape, same version vector. Timestamps are part of the state (the
+// scanner's fast path is size and mtime), so they are compared too.
+func sameEntry(a, b *Entry) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Blob != b.Blob || a.Size != b.Size || a.MTime != b.MTime ||
+		a.Mode != b.Mode || a.Deleted != b.Deleted || a.Dir != b.Dir || a.Local != b.Local {
+		return false
+	}
+	if len(a.VV) != len(b.VV) {
+		return false
+	}
+	for k, v := range a.VV {
+		if b.VV[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // Get returns a copy of the entry, or nil.

@@ -216,12 +216,11 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	if !eng.store.Has(orphan) {
 		t.Fatal("collector freed a blob an orphan journal references")
 	}
-	live, err := store.SumFile(filepath.Join(fs.root, "old.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !eng.store.Has(live) {
-		t.Fatal("collector freed a blob the journal references")
+	// The live file is materialised, so its blob is a second copy: the
+	// collector is allowed to drop it. That is the whole point of not
+	// doubling a replica.
+	if eng.store.Has(oldBlob) {
+		t.Fatal("collector kept a blob the tree already holds")
 	}
 	// And a blob nobody references is gone.
 	stranded := strings.Repeat("ef", 32)
@@ -233,9 +232,6 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	}
 	if eng.store.Has(stranded) {
 		t.Fatal("unreferenced blob survived the collector")
-	}
-	if !eng.store.Has(oldBlob) {
-		t.Fatal("collector freed the file's own content")
 	}
 	eng.Close()
 }

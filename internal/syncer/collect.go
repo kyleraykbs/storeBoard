@@ -26,23 +26,33 @@ var recentBlob = 10 * time.Minute
 // source cannot be read, because a blob it cannot account for is kept, and a
 // blob it wrongly drops is a deleted file.
 func (e *Engine) Collect() (removed int, freed int64) {
-	refs := map[string]bool{}
+	keep := map[string]bool{}
 
-	// Live journals: everything a store's current state needs.
+	// Every retained version needs its bytes: that is the whole point of the
+	// history, and the file itself may be gone.
 	for _, fs := range e.stores {
-		for _, ent := range fs.db.All() {
-			if ent.Blob != "" {
-				refs[ent.Blob] = true
+		if fs.hist == nil {
+			continue
+		}
+		for _, path := range fs.hist.Paths() {
+			for _, v := range fs.hist.Versions(path) {
+				if v.Blob != "" {
+					keep[v.Blob] = true
+				}
 			}
 		}
-		// Every kept version.
-		if fs.hist != nil {
-			for _, path := range fs.hist.Paths() {
-				for _, v := range fs.hist.Versions(path) {
-					if v.Blob != "" {
-						refs[v.Blob] = true
-					}
-				}
+	}
+
+	// A blob is also the only copy of a file this machine does not hold on
+	// disk: a streamed store's cache, or an entry whose file is missing or
+	// stale. Everything else is duplicated by the tree and can go.
+	for _, fs := range e.stores {
+		for _, ent := range fs.db.All() {
+			if ent.Blob == "" || ent.Dir {
+				continue
+			}
+			if fs.streamed || !e.materialised(fs, ent) {
+				keep[ent.Blob] = true
 			}
 		}
 	}
@@ -60,7 +70,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 			if _, loaded := e.byName[store]; loaded {
 				continue
 			}
-			if err := refsFromJournal(filepath.Join(journalDir, name), refs); err != nil {
+			if err := refsFromJournal(filepath.Join(journalDir, name), keep); err != nil {
 				e.logger.Warn("collector: cannot read a journal; keeping everything", "journal", name, "error", err)
 				return 0, 0
 			}
@@ -77,7 +87,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 			if filepath.Ext(name) != ".ndjson" {
 				continue
 			}
-			if err := refsFromHistory(filepath.Join(historyDir, name), refs); err != nil {
+			if err := refsFromHistory(filepath.Join(historyDir, name), keep); err != nil {
 				e.logger.Warn("collector: cannot read a history; keeping everything", "history", name, "error", err)
 				return 0, 0
 			}
@@ -91,7 +101,7 @@ func (e *Engine) Collect() (removed int, freed int64) {
 		for _, cd := range listDir(abPath) {
 			cdPath := filepath.Join(abPath, cd)
 			for _, sum := range listDir(cdPath) {
-				if refs[sum] {
+				if keep[sum] {
 					continue
 				}
 				p := filepath.Join(cdPath, sum)
@@ -121,6 +131,18 @@ func (e *Engine) Collect() (removed int, freed int64) {
 		e.logger.Info("collected unreferenced content", "blobs", removed, "bytes", freed)
 	}
 	return removed, freed
+}
+
+// materialised reports whether a store's canonical file is present and looks
+// like the entry's version: same kind, size and mtime. It is the evidence the
+// collector needs before dropping the blob, and the same test the scanner uses
+// to skip hashing an untouched file.
+func (e *Engine) materialised(fs *StoreState, ent *Entry) bool {
+	info, err := os.Stat(filepath.Join(fs.root, ent.Path))
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return info.Size() == ent.Size && (ent.MTime == 0 || info.ModTime().UnixNano() == ent.MTime)
 }
 
 // refsFromJournal adds the blobs a journal file references.
