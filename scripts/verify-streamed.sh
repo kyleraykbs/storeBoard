@@ -113,8 +113,9 @@ holder "test -d '$holder_root/$store'" || die "holder has no $holder_root/$store
 
 # --- 1. read: the holder's bytes arrive through the mount ------------------
 name="verify-read-$$.txt"
-printf 'read path %s\n' "$(date -Is)" > "/tmp/$name"
-holder "cp '/tmp/$name' '$holder_root/$store/$name' && rm '/tmp/$name'"
+stamp="$(date -Is)"
+# The file is created ON the holder: this machine cannot write its disk.
+holder "printf 'read path %s\n' '$stamp' > '$holder_root/$store/$name'"
 wait_for "the entry to appear in the mount" 120 test -f "$root/$name"
 [ "$(sum "$root/$name")" = "$(hsum "$holder_root/$store/$name")" ] ||
 	die "content differs between the mount and the holder"
