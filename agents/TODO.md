@@ -47,10 +47,16 @@
   streamed store: send is a write through the mount, the other two are
   forwarded to a holder.
 - Remaining: the mobile on-demand fetch API; Android does not mount FUSE.
-- Remaining: a scratch store on the real fleet (reads, writes, failover,
-  reconnect) before BulkPictures switches; hash-verify its 69 GiB mirror
-  before eviction. Unit coverage exists for each of those paths, but nothing
-  has run across two machines yet.
+- Proved locally (2026-10-29): two real `storeboardd` processes on loopback,
+  `a` local and `b` streamed. Read through b's mount, wrote through it (a
+  received the file, b's blob store stayed empty, the queue drained), stopped
+  a, wrote offline (queue held the bytes), restarted a (the write landed),
+  deleted through the mount (a trashed its copy), and `send` / `backup list`
+  from b. Unit tests cover the same paths plus readonly, capped, failover and
+  rename.
+- Remaining: the same scratch store on the real fleet before BulkPictures
+  switches — same-machine loopback does not exercise a second host's user,
+  clock or network. Hash-verify the 69 GiB mirror before eviction.
 - Once the scratch store passes, flip `remote` to the same behaviour and keep
   `stream` as its explicit spelling.
 
