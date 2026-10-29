@@ -70,7 +70,7 @@
             # import (mobile/tools.go keeps the requirement tidy-clean).
             # Nothing in a normal build imports it — hence a vendor hash
             # rather than a committed vendor tree.
-            vendorHash = "sha256-k4bJn1ggVnYW4boipdt4p94ZIHlkxFRz+zfIsPTY6BU=";
+            vendorHash = "sha256-RLYL4IFjYwvvJCJGvB3XmdyBpkytSyvXT8jzLG0v1ao=";
             subPackages = [
               "cmd/storeboard"
               "cmd/storeboardd"

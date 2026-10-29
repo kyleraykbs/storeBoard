@@ -1620,3 +1620,53 @@ func mkTempFile(t *testing.T, e *Engine, body string) string {
 	}
 	return f.Name()
 }
+
+// A delete that reaches a machine whose file was edited since the last scan
+// must not destroy that edit: the version the mesh has not seen is parked as a
+// conflict copy, and the path goes. Without this, "delete on one machine while
+// editing on another" lost the edit whenever the delete won the race to the
+// scanner — the file simply vanished with no copy anywhere.
+func TestDeleteParksAnUnsyncedEdit(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	path := filepath.Join(fs.root, "contested.txt")
+
+	const original = "original\n"
+	writeFile(t, path, original, time.Now().Add(-time.Hour))
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	entry := fs.db.Get("contested.txt")
+	if entry == nil {
+		t.Fatal("scan did not index the file")
+	}
+
+	// Edited on disk after the scan, so the journal still describes "original".
+	const edited = "edited while the peer deleted it\n"
+	writeFile(t, path, edited, time.Now())
+
+	// The peer's tombstone dominates the recorded version.
+	tomb := entry.clone()
+	tomb.Deleted = true
+	tomb.Blob = ""
+	tomb.Size = 0
+	tomb.VV = map[string]uint64{"b": entry.VV["a"] + 1}
+	if err := n.eng.applyDelete(fs, tomb); err != nil {
+		t.Fatalf("applyDelete: %v", err)
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the path still holds a file after the delete: %v", err)
+	}
+	copies, err := filepath.Glob(path + ".conflict-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(copies) != 1 {
+		t.Fatalf("expected one parked copy, found %v", copies)
+	}
+	if got := readFile(t, copies[0]); got != edited {
+		t.Fatalf("parked content = %q, want the edit", got)
+	}
+}

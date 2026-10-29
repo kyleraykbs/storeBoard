@@ -273,10 +273,18 @@ func TestConcurrentCreatesConflict(t *testing.T) {
 
 	a, b := n.peer("alpha"), n.peer("bravo")
 	waitForSameTree(t, "converged create conflict", a.storeDir("docs"), b.storeDir("docs"))
-	waitFor(t, "a conflict copy on each side", func() bool {
-		return len(conflictCopies(t, a.storeDir("docs"), base)) == 1 &&
-			len(conflictCopies(t, b.storeDir("docs"), base)) == 1
-	})
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if len(conflictCopies(t, a.storeDir("docs"), base)) == 1 &&
+			len(conflictCopies(t, b.storeDir("docs"), base)) == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if ca, cb := conflictCopies(t, a.storeDir("docs"), base), conflictCopies(t, b.storeDir("docs"), base); len(ca) != 1 || len(cb) != 1 {
+		t.Fatalf("conflict copies: alpha=%v bravo=%v\nalpha journal:\n%s\nbravo journal:\n%s",
+			ca, cb, journalOf(a, "docs"), journalOf(b, "docs"))
+	}
 	if got := read(t, filepath.Join(a.storeDir("docs"), conflictCopies(t, a.storeDir("docs"), base)[0])); got != "bravo bytes\n" && got != "alpha bytes\n" {
 		t.Fatalf("conflict copy holds %q", got)
 	}
@@ -310,29 +318,31 @@ func TestIdenticalConcurrentEditsMergeWithoutConflict(t *testing.T) {
 }
 
 // A deletion that races an edit must not destroy the edited file: the data
-// that still exists wins, and both machines keep it.
+// that still exists is parked as a conflict copy, and both machines retain it.
 func TestConcurrentDeleteAndEditKeepsTheFile(t *testing.T) {
 	n := startNetwork(t, map[string]map[string]storeDecl{
 		"alpha": {"docs": {Group: "g"}},
 		"bravo": {"docs": {Group: "g"}},
 	})
-
 	const base = "contested.txt"
 	write(t, filepath.Join(n.peer("alpha").storeDir("docs"), base), "original\n")
 	waitForContent(t, "base on bravo", filepath.Join(n.peer("bravo").storeDir("docs"), base), "original\n")
-
 	n.stop("bravo")
 	if err := os.Remove(filepath.Join(n.peer("alpha").storeDir("docs"), base)); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(n.peer("bravo").storeDir("docs"), base), "edited while alpha deleted\n")
+	const edited = "edited while alpha deleted\n"
+	write(t, filepath.Join(n.peer("bravo").storeDir("docs"), base), edited)
 	n.start("bravo")
-
 	a, b := n.peer("alpha"), n.peer("bravo")
-	waitFor(t, "the edited file to survive on both", func() bool {
-		_, e1 := os.Stat(filepath.Join(a.storeDir("docs"), base))
-		_, e2 := os.Stat(filepath.Join(b.storeDir("docs"), base))
-		return e1 == nil && e2 == nil
+	waitFor(t, "the edited conflict copy on both", func() bool {
+		for _, p := range []*peer{a, b} {
+			copies := conflictCopies(t, p.storeDir("docs"), base)
+			if len(copies) != 1 || read(t, filepath.Join(p.storeDir("docs"), copies[0])) != edited {
+				return false
+			}
+		}
+		return true
 	})
 	waitForSameTree(t, "converged delete/edit race", a.storeDir("docs"), b.storeDir("docs"))
 }

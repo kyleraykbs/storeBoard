@@ -17,7 +17,17 @@ func main() {
 	configPath := flag.String("config", "", "path to config file (default: $STOREBOARD_CONFIG, else $XDG_CONFIG_HOME/storeboard/config.json)")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// STOREBOARD_LOG_LEVEL=debug turns on the connection-level detail
+	// (dial attempts, rejected handshakes, frame errors). The default stays
+	// INFO: a home mesh does not need a line per dial.
+	level := slog.LevelInfo
+	if v := os.Getenv("STOREBOARD_LOG_LEVEL"); v != "" {
+		if err := level.UnmarshalText([]byte(v)); err != nil {
+			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+			logger.Warn("ignoring STOREBOARD_LOG_LEVEL", "value", v, "error", err)
+		}
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	cfg, err := config.Load(config.ResolvePath(*configPath))
 	if err != nil {

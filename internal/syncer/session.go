@@ -910,6 +910,23 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 		e.pruneEmptyParents(fs, loc.Path)
 		return nil
 	}
+	// A delete only removes the version the journal knows. If the file on disk
+	// has moved on since the last scan, that is an edit the mesh has not seen,
+	// and a tombstone that merely dominates the old version must not throw it
+	// away: park it as a conflict copy first, exactly as applyEntry does for a
+	// remote update. Without this, deleting on one machine while another edits
+	// lost the edit whenever the delete won the race to the scanner.
+	// Only compare when the journal actually recorded a version; an entry with
+	// no size and no mtime describes nothing to compare against.
+	recorded := loc.Size != 0 || loc.MTime != 0
+	if recorded && (info.Size() != loc.Size || info.ModTime().UnixNano() != loc.MTime) {
+		if copyEnt := e.saveLocalConflictLocked(fs, loc); copyEnt != nil {
+			e.broadcastIndex(fs, []*Entry{copyEnt})
+			// The rename moved the file; the path is free and the caller's
+			// tombstone stands. Nothing left to trash.
+			return nil
+		}
+	}
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
 	dst := filepath.Join(trash, loc.Path)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {

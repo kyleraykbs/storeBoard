@@ -7,6 +7,7 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -61,14 +62,35 @@ func moduleRoot() string {
 }
 
 // freePort returns a loopback address nothing is listening on.
-func freePort(t *testing.T) string {
+// freePorts returns n distinct loopback addresses, all below the kernel's
+// ephemeral range (32768-60999 here). Asking the kernel for port 0 hands back
+// an address it may immediately reuse as an outbound source port, including
+// for a daemon's own dial to its peer: the listener then fails to bind and the
+// peer sits in "dialing" until the test gives up. Picking from a range the
+// kernel never assigns automatically removes that whole class of flake.
+func freePorts(t *testing.T, n int) []string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	const base, span = 20000, 9000
+	listeners := make([]net.Listener, 0, n)
+	addrs := make([]string, 0, n)
+	start := base + rand.IntN(span)
+	for attempt := 0; len(addrs) < n && attempt < span; attempt++ {
+		port := base + (start-base+attempt)%span
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		listeners = append(listeners, ln)
+		addrs = append(addrs, addr)
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
+	if len(addrs) != n {
+		t.Fatalf("could not allocate %d test ports below the ephemeral range", n)
+	}
+	return addrs
 }
 
 // peer is one daemon under test.
@@ -126,11 +148,10 @@ func startNetworkWith(t *testing.T, specs map[string]map[string]storeDecl, extra
 	}
 	sort.Strings(n.order)
 
+	ports := freePorts(t, len(n.order))
 	eps := make([]endpoint, 0, len(n.order))
-	addrs := map[string]string{}
-	for _, name := range n.order {
-		addrs[name] = freePort(t)
-		eps = append(eps, endpoint{name, addrs[name]})
+	for i, name := range n.order {
+		eps = append(eps, endpoint{name, ports[i]})
 		n.peers[name] = &peer{
 			name:    name,
 			root:    filepath.Join(dir, name, "root"),
@@ -152,12 +173,58 @@ func startNetworkWith(t *testing.T, specs map[string]map[string]storeDecl, extra
 	for _, name := range start {
 		n.start(name)
 	}
+	n.waitConnected(start)
 	t.Cleanup(func() {
 		for _, name := range n.order {
 			stop(n.peers[name])
 		}
 	})
 	return n
+}
+
+// waitConnected blocks until every launched peer reports a live link to every
+// other launched peer. A test that writes into a store before the mesh is up
+// is racing the handshake, and a failure there reads as a sync bug.
+func (n *network) waitConnected(launched []string) {
+	if len(launched) < 2 {
+		return
+	}
+	for _, name := range launched {
+		p := n.peers[name]
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			connected := 0
+			for _, c := range statusOf(n.t, p).Connections {
+				if c.State == "connected" {
+					connected++
+				}
+			}
+			if connected >= len(launched)-1 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		status := statusOf(n.t, p)
+		connected := 0
+		for _, c := range status.Connections {
+			if c.State == "connected" {
+				connected++
+			}
+		}
+		if connected < len(launched)-1 {
+			var others []string
+			for _, other := range launched {
+				if other == name {
+					continue
+				}
+				op := n.peers[other]
+				ost := statusOf(n.t, op)
+				others = append(others, fmt.Sprintf("%s: peer=%q conns=%+v", other, ost.Peer, ost.Connections))
+			}
+			n.t.Fatalf("%s never connected to the rest of the mesh: self=%q conns=%+v\nothers: %v\ntransport lines:\n%s",
+				name, status.Peer, status.Connections, others, grepLog(p, "transport"))
+		}
+	}
 }
 
 func (n *network) start(name string) { startDaemon(n.t, n.daemon, n.peers[name]) }
@@ -255,6 +322,9 @@ func startDaemon(t *testing.T, daemon string, p *peer) {
 		"STOREBOARD_SCAN_INTERVAL=200ms",
 		"STOREBOARD_LINK_INTERVAL=200ms",
 		"STOREBOARD_INDEX_INTERVAL=1s",
+		// Connection failures are DEBUG; without them a mesh that never
+		// connects fails with no explanation at all.
+		"STOREBOARD_LOG_LEVEL=debug",
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -265,6 +335,48 @@ func startDaemon(t *testing.T, daemon string, p *peer) {
 		_, err := os.Stat(p.socket)
 		return err == nil
 	})
+	// A daemon whose listener never binds answers the socket but never accepts
+	// a peer, which shows up much later as a mysterious "dialing" timeout.
+	// Waiting for the log line turns that into an immediate, named failure.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.logContains("transport listening") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("daemon %s never started its listener\nlog:\n%s", p.name, tailLog(p))
+}
+
+// grepLog returns the log lines containing substr.
+func grepLog(p *peer, substr string) string {
+	if p.log == nil {
+		return ""
+	}
+	raw, err := os.ReadFile(p.log.Name())
+	if err != nil {
+		return err.Error()
+	}
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// logContains reports whether the daemon's captured output has a line with
+// substr in it.
+func (p *peer) logContains(substr string) bool {
+	if p.log == nil {
+		return false
+	}
+	raw, err := os.ReadFile(p.log.Name())
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(raw), substr)
 }
 
 func stop(p *peer) {

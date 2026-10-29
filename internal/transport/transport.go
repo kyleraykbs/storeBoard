@@ -507,10 +507,13 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	preferred := m.preferredDirection(h.Name)
 	p.mu.Lock()
 	if p.conn == nil && direction != preferred {
-		p.mu.Unlock()
-		m.logger.Debug("noncanonical link dropped", "peer", h.Name, "direction", direction, "want", preferred)
-		c.Close()
-		return
+		// Two peers dialling each other can both reject the other's link as
+		// noncanonical while neither holds one, and then both retry: a
+		// livelock that only the retry timing breaks, which under load can
+		// last minutes. Direction is a tie-break for choosing between two
+		// links, not a reason to refuse the only one. Accept it; a canonical
+		// link arriving later replaces it below.
+		m.logger.Debug("noncanonical link accepted as the only one", "peer", h.Name, "direction", direction, "preferred", preferred)
 	}
 	if p.conn != nil && p.conn != c {
 		old := p.conn
