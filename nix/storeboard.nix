@@ -249,7 +249,16 @@ in
         # A streamed store is a FUSE mount. This block is after the hardening
         # one on purpose: these keys merge last, so they win. The device and
         # the capability are only granted where a store actually streams.
+        #
+        # ProtectSystem and PrivateTmp are implemented through a private mount
+        # namespace, which would make the mount invisible to every process
+        # outside the unit - the daemon reported mount=true while the host saw
+        # nothing. Mounts have to land in the host's namespace, so those three
+        # are dropped on a streaming host and the rest of the sandbox stays.
         PrivateDevices = false;
+        PrivateMounts = false;
+        PrivateTmp = false;
+        ProtectSystem = false;
         RestrictNamespaces = false;
         AmbientCapabilities = [
           "CAP_CHOWN"

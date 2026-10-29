@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
@@ -265,9 +266,19 @@ func (e *Engine) mountStream(fs *StoreState) {
 		return
 	}
 	if fstype := mountFSType(fs.root); fstype != "" {
-		e.logger.Warn("streamed store path is already a mount; leaving it alone",
-			"store", fs.name, "path", fs.root, "fstype", fstype)
-		return
+		if fstype != "fuse.storeboard" {
+			e.logger.Warn("streamed store path is another filesystem's mount; leaving it alone",
+				"store", fs.name, "path", fs.root, "fstype", fstype)
+			return
+		}
+		// Our own mount, left behind by a daemon that died without releasing
+		// it. Its server is gone, so no reader can use it: detach and mount
+		// fresh rather than serving a dead filesystem forever.
+		if err := syscall.Unmount(fs.root, syscall.MNT_DETACH); err != nil {
+			e.logger.Error("detach a stale streamed mount", "store", fs.name, "path", fs.root, "error", err)
+			return
+		}
+		e.logger.Info("detached a stale streamed mount", "store", fs.name, "path", fs.root)
 	}
 	if err := os.MkdirAll(fs.root, 0o755); err != nil {
 		e.logger.Error("create streamed mountpoint", "store", fs.name, "path", fs.root, "error", err)
