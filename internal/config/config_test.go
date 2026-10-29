@@ -69,7 +69,7 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 }
 
 func TestLoadFillsDefaultsAndClaimsHostname(t *testing.T) {
-	dataHome, runtimeDir := setXDG(t)
+	_, runtimeDir := setXDG(t)
 	path := writeConfig(t, `{}`)
 
 	cfg, err := Load(path)
@@ -83,7 +83,9 @@ func TestLoadFillsDefaultsAndClaimsHostname(t *testing.T) {
 	if want := filepath.Join(home, "Storeboard"); cfg.Root != want {
 		t.Errorf("root = %q, want %q", cfg.Root, want)
 	}
-	if want := filepath.Join(dataHome, "storeboard"); cfg.DataDir != want {
+	// State follows the root: a store's blobs, journals and history belong
+	// with the store, not on whatever disk the XDG default names.
+	if want := filepath.Join(cfg.Root, StateDirName); cfg.DataDir != want {
 		t.Errorf("dataDir = %q, want %q", cfg.DataDir, want)
 	}
 	if want := filepath.Join(runtimeDir, "storeboard.sock"); cfg.Socket != want {

@@ -108,9 +108,19 @@ in
       description = "Apply the systemd sandboxing options.";
     };
 
+    # Daemon state lives with the stores, not on the system disk: blobs,
+    # journals, history and trash are all part of the store's data, so the
+    # default puts them inside the store location. A store root on a pool then
+    # keeps everything on that pool.
+    dataDir = lib.mkOption {
+      type = lib.types.str;
+      default = "${config.services.storeboard.root}/.storeboard";
+      defaultText = lib.literalExpression ''"\${config.services.storeboard.root}/.storeboard"'';
+      description = "The one storage directory for daemon state: blobs, journals, history.";
+    };
+
     inherit (opts)
       socket
-      dataDir
       root
       peer
       peers
@@ -153,6 +163,11 @@ in
       ${cfg.group} = { };
     };
 
+    systemd.tmpfiles.rules = [
+      "d ${cfg.root} 0750 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
+    ];
+
     systemd.services.storeboard = {
       description = "Storeboard sync daemon";
       wantedBy = [ "multi-user.target" ];
@@ -165,8 +180,10 @@ in
         Group = cfg.group;
         Restart = "on-failure";
         RestartSec = 2;
-        StateDirectory = "storeboard";
-        StateDirectoryMode = "0750";
+        # No StateDirectory: the state directory is cfg.dataDir, which lives
+        # under the store root. tmpfiles creates both before the unit starts,
+        # so WorkingDirectory and ReadWritePaths resolve.
+
         # The CLI runs as an arbitrary user, so the socket's directory is
         # traversable; the socket file's own mode is the daemon's to set.
         RuntimeDirectory = "storeboard";

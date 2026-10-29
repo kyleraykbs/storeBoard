@@ -24,8 +24,10 @@
 - **inheritance** → undeclared follows the parent: group, sync, permissions,
   backup opt-out. Declared means its own thing.
 - **storage directory** → `dataDir`: the one directory holding daemon state
-  (blobs, journals, history, trash). Not user-facing; content does not live
-  here.
+  (blobs, journals, history, trash). It lives inside the root by default —
+  `<root>/.storeboard` — because that state is store data, not user data, and
+  a root on a pool then keeps every byte of a store on that pool. Not
+  user-facing; content does not live here.
 - **endpoint** → a declared `host:port` address other peers dial; bare
   hostnames are rejected until the protocol picks a default port.
 - **send** → copy a local file into one of this machine's stores so it syncs

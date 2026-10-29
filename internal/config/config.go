@@ -275,6 +275,14 @@ func DefaultPath() string {
 
 // DefaultDataDir is $XDG_DATA_HOME/storeboard. It is empty when no data
 // directory can be determined.
+// StateDirName is the directory inside a store root that holds the daemon's
+// state: blobs, journals, history and trash. It sits under the root so a
+// store's data is entirely in one place. Store names may not begin with a
+// dot, so it can never be mistaken for a store.
+const StateDirName = ".storeboard"
+
+// DefaultDataDir is the XDG state location, used when a config names neither
+// root nor dataDir (the CLI only needs a socket).
 func DefaultDataDir() string {
 	dir := os.Getenv("XDG_DATA_HOME")
 	if dir == "" {
@@ -381,8 +389,13 @@ func Parse(raw []byte) (*Config, error) {
 	if cfg.Root == "" {
 		cfg.Root = DefaultRoot()
 	}
+	// Daemon state belongs with the stores: blobs, journals, history and trash
+	// are store data, not user data, so an unset dataDir follows the root
+	// instead of the XDG guess. A store root on a pool then keeps everything
+	// on that pool, and no part of a store can land on another disk because a
+	// separate default said so.
 	if cfg.DataDir == "" {
-		cfg.DataDir = DefaultDataDir()
+		cfg.DataDir = filepath.Join(cfg.Root, StateDirName)
 	}
 	if cfg.Socket == "" {
 		cfg.Socket = DefaultSocketPath()
