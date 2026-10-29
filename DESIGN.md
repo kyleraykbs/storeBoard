@@ -136,6 +136,29 @@ one, it changes here first, deliberately, with a decision log entry.
 - Symlinks, sockets and fifos are not content: they are skipped, and never
   followed. The declared links are the daemon's to create and repair, from
   config.
+
+### Streamed stores (decided 2026-10-29, not yet built)
+
+A store declared `stream` is not a mirror: the canonical path is a FUSE mount
+owned by storeboard, and the bytes are never written to this machine's disk.
+
+- The journal stays local and is the whole truth about the tree. Directories
+  are synthesised from it, so structure exists even with no holder.
+- A read opens the file from the fastest reachable holder for that store.
+  Holders are the peers declaring the store `local`; throughput is measured
+  from real transfers (seeded by one small probe on connect) and an optional
+  pinned preference wins over the measurement.
+- A read that fails on the chosen holder is retried on the next one **before**
+  the caller sees an error; only when every holder has failed does the read
+  fail.
+- Writes go through to the chosen holder, so the write path is online-only.
+  When no holder is reachable the mount still presents the directory tree and
+  accepts writes; they are queued locally and merged on reconnect, where the
+  ordinary conflict rules apply (a taken name is parked, never overwritten).
+- There is no read cache: a file is fetched per open. Disk cost is metadata
+  only, which is the point.
+- A detached streamed store never tombstones: absence is not deletion (rule
+  16), and the journal is authoritative.
 - Peers exchange index deltas; a side that lacks or is behind a version asks
   for the blob (`want` → `blob` chunks → `blobEnd`); a side that is ahead
   pushes its index entry. Concurrent edits resolve deterministically (newer

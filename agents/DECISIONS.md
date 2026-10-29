@@ -360,3 +360,24 @@
   each pass wrote one line per path: amanita's journal had reached 8.5 GiB.
 - **Reversible:** yes — set `dataDir` explicitly and the old layout works; the
   blob store refills from the tree on demand.
+
+## 2026-10-29 — Streamed stores: a FUSE mount, no local bytes
+- **Decision:** a new `stream` sync mode. The canonical path is a FUSE mount
+  backed by the journal; reads fetch from the fastest reachable holder, writes
+  go through to it, and offline the mount still shows the directory tree and
+  queues writes for merge on reconnect. No read cache.
+- **Why:** Kyle: "when I say remote I mean the files aren't stored here ...
+  something similar to how a samba share works ... if no hosts are reachable
+  replace what was a symlink to a now dead netmount with a symlink to an empty
+  folder". Today `remote` still materialises every entry, which is why
+  psilocybe held 69 GiB of BulkPictures.
+- **Not a rename yet:** `remote` keeps its present meaning until the streamed
+  path is proven, because flipping it would put 3,965 of Kyle's photos behind
+  an unproven code path and evict the only local copy on psilocybe. Migration
+  of BulkPictures is a separate, explicit step.
+- **Rejected:** external SMB/NFS exports (a second service and credential
+  store to own); sparse local cache without a mount (still a copy).
+- **Open:** go-fuse becomes the project's second dependency; the unit needs
+  /dev/fuse and a relaxed sandbox (/dev/fuse, RestrictNamespaces).
+- **Reversible:** yes — `stream` is a new value; `remote` behaviour is
+  untouched.
