@@ -14,6 +14,12 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
 )
 
+// readTimeout bounds one ranged read. Without it a peer that stops answering
+// - a link replaced by the cross-dial tie-break, a holder that hung - leaves
+// the caller's read blocked forever: the image viewer shows a half-decoded
+// picture and the application gives up. Tests shorten it.
+var readTimeout = 20 * time.Second
+
 // maxReadChunk bounds one ranged read. A FUSE read is at most a few hundred
 // kilobytes, so this only stops a caller from asking one frame to carry a
 // whole file.
@@ -140,11 +146,15 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 	if err := e.sendTo(peer, frame{Type: "read", ID: id, Store: fs.name, Path: path, Offset: offset, Length: length}); err != nil {
 		return nil, err
 	}
+	timer := time.NewTimer(readTimeout)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-e.closed:
 		return nil, errors.New("engine closed")
+	case <-timer.C:
+		return nil, fmt.Errorf("%s: holder %s did not answer within %s", path, peer, readTimeout)
 	case r := <-ch:
 		if r.err != nil {
 			return nil, r.err

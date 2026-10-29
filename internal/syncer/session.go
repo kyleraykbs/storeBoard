@@ -445,14 +445,55 @@ func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", ent.Path)
 	}
-	sum, err := store.SumFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if sum != ent.Blob || info.Size() != ent.Size {
-		return nil, fmt.Errorf("%s does not match the entry (%s)", ent.Path, sum)
+	// Verifying costs a hash of the whole file, and a reader asks for it in
+	// ~128 KiB pieces: without this cache one image load re-hashed the file
+	// a hundred times, on the one worker that also serves indexes.
+	if ent.Blob != "" && !e.verifiedRecently(path, info, ent.Blob) {
+		sum, err := store.SumFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if sum != ent.Blob {
+			return nil, fmt.Errorf("%s does not match the entry (%s)", ent.Path, sum)
+		}
+		e.rememberVerified(path, info, ent.Blob)
 	}
 	return os.Open(path)
+}
+
+// verifiedFile is one confirmed canonical file: a match between the bytes on
+// disk and the journal's blob, kept until the file's size or mtime moves.
+type verifiedFile struct {
+	size  int64
+	mtime int64
+	blob  string
+	at    time.Time
+}
+
+// verifiedLately reports whether this file was hashed against this blob
+// recently enough to serve ranges without hashing it again.
+func (e *Engine) verifiedRecently(path string, info os.FileInfo, blob string) bool {
+	e.mu.Lock()
+	v, ok := e.verified[path]
+	e.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if v.blob != blob || v.size != info.Size() || v.mtime != info.ModTime().UnixNano() {
+		return false
+	}
+	return time.Since(v.at) < 5*time.Minute
+}
+
+func (e *Engine) rememberVerified(path string, info os.FileInfo, blob string) {
+	e.mu.Lock()
+	e.verified[path] = verifiedFile{
+		size:  info.Size(),
+		mtime: info.ModTime().UnixNano(),
+		blob:  blob,
+		at:    time.Now(),
+	}
+	e.mu.Unlock()
 }
 
 // wantsBlob reports whether the content store must keep a copy of a file: a

@@ -193,6 +193,7 @@ type Engine struct {
 	reads          map[int64]chan readReply
 	readSeq        int64
 	holderRates    map[string]holderRate
+	verified       map[string]verifiedFile
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
@@ -321,6 +322,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		incoming:    map[string]*incomingBlob{},
 		reads:       map[int64]chan readReply{},
 		holderRates: map[string]holderRate{},
+		verified:    map[string]verifiedFile{},
 		closed:      make(chan struct{}),
 	}
 

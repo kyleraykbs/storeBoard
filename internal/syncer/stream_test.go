@@ -191,3 +191,37 @@ func TestStreamedApplyRecordsWithoutWritingBytes(t *testing.T) {
 		t.Fatal("streamed apply stored the blob")
 	}
 }
+
+// A holder that stops answering must not hang the caller: the read times out
+// and the store reports it, instead of leaving an application stuck on a
+// half-decoded file forever.
+func TestRangedReadTimesOutWhenTheHolderGoesQuiet(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	// A registered peer that never replies, which is what a link replaced
+	// mid-transfer looks like from here.
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = silentSender{}
+	n.eng.mu.Unlock()
+
+	old := readTimeout
+	readTimeout = 150 * time.Millisecond
+	defer func() { readTimeout = old }()
+
+	fetch := &streamFetcher{e: n.eng, fs: n.store("docs")}
+	start := time.Now()
+	_, err := fetch.ReadRange(context.Background(), streamfs.Entry{Path: "clip.bin", Blob: "b", Size: 4}, 0, 4)
+	if err == nil {
+		t.Fatal("a silent holder reported success")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("read took %s; the timeout did not fire", took)
+	}
+}
+
+// silentSender accepts frames and never answers.
+type silentSender struct{}
+
+func (silentSender) Send([]byte) error     { return nil }
+func (silentSender) SendBulk([]byte) error { return nil }
