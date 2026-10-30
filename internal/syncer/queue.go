@@ -43,6 +43,7 @@ type queueOp struct {
 	Size  int64             `json:"size,omitempty"`
 	Blob  string            `json:"blob,omitempty"`
 	VV    map[string]uint64 `json:"vv,omitempty"`
+	Dir   bool              `json:"dir,omitempty"`
 }
 
 func queueIndexPath(dataDir, storeName string) string {
@@ -189,7 +190,7 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 				e.dropQueued(fs, op.ID)
 			}
 		case opRename:
-			if rem.Path == op.To && !rem.Deleted && vvCovers(rem.VV, op.VV) {
+			if (rem.Path == op.To || strings.HasPrefix(rem.Path, op.To+"/")) && !rem.Deleted && vvCovers(rem.VV, op.VV) {
 				e.dropQueued(fs, op.ID)
 			}
 		}
@@ -223,7 +224,7 @@ func (e *Engine) flushQueue(fs *StoreState) {
 	fs.queueMu.Unlock()
 	for _, op := range ops {
 		if op.Op == opRename {
-			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Entry: &Entry{Path: op.To, VV: op.VV}}
+			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Entry: &Entry{Path: op.To, VV: op.VV, Dir: op.Dir}}
 			if err := e.sendTo(peer, fr); err != nil {
 				e.logger.Debug("flush rename", "store", fs.name, "path", op.Path, "error", err)
 				return
@@ -508,29 +509,52 @@ func (m *storeMutator) Rename(from, to string) error {
 	if err := m.refuse(); err != nil {
 		return err
 	}
+	if from == "" || to == "" || !validRel(from) || !validRel(to) {
+		return os.ErrInvalid
+	}
 	m.fs.scanMu.Lock()
 	defer m.fs.scanMu.Unlock()
-	ent := m.fs.db.Get(from)
-	if ent == nil || ent.Deleted {
+	prefix := from + "/"
+	var entries []*Entry
+	for _, ent := range m.fs.db.All() {
+		if ent.Deleted || (ent.Path != from && !strings.HasPrefix(ent.Path, prefix)) {
+			continue
+		}
+		entries = append(entries, ent)
+	}
+	if len(entries) == 0 {
 		return os.ErrNotExist
 	}
-	if dst := m.fs.db.Get(to); dst != nil && !dst.Deleted {
-		return os.ErrExist
+	for _, ent := range entries {
+		newPath := to
+		if ent.Path != from {
+			newPath = to + strings.TrimPrefix(ent.Path, from)
+		}
+		if dst := m.fs.db.Get(newPath); dst != nil && !dst.Deleted {
+			return os.ErrExist
+		}
 	}
-	vv := m.e.nextVV(m.fs, ent)
-	old := &Entry{Path: from, Deleted: true, Dir: ent.Dir, VV: vv}
-	moved := ent.clone()
-	moved.Path = to
-	moved.VV = vv
-	_ = m.fs.db.Put(old)
-	_ = m.fs.db.Put(moved)
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, VV: vv}); err != nil {
+	vv := m.e.nextVV(m.fs, entries[0])
+	for _, ent := range entries {
+		newPath := to
+		if ent.Path != from {
+			newPath = to + strings.TrimPrefix(ent.Path, from)
+		}
+		oldVV := vv
+		if ent != entries[0] {
+			oldVV = m.e.nextVV(m.fs, ent)
+		}
+		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: oldVV}
+		moved := ent.clone()
+		moved.Path = newPath
+		moved.VV = oldVV
+		_ = m.fs.db.Put(old)
+		_ = m.fs.db.Put(moved)
+	}
+	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, VV: vv, Dir: true}); err != nil {
 		return err
 	}
 	m.e.refreshTree(m.fs)
-	// Only the rename frame: an index pair would race it, and a peer that saw
-	// the tombstone first would trash the file before the move arrived. The
-	// holder journals both paths and broadcasts them itself.
 	go m.e.flushQueue(m.fs)
 	return nil
 }

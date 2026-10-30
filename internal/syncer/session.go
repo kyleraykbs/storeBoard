@@ -576,39 +576,51 @@ func (e *Engine) handleRename(peer string, fr *frame) {
 		return
 	}
 	if fs.stream {
-		// A streamed peer has no tree of its own to rename; the journal
-		// records it locally already.
 		return
 	}
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
-	ent := fs.db.Get(fr.Path)
-	if ent == nil || ent.Deleted {
+	prefix := fr.Path + "/"
+	var entries []*Entry
+	for _, ent := range fs.db.All() {
+		if ent.Deleted || (ent.Path != fr.Path && !strings.HasPrefix(ent.Path, prefix)) {
+			continue
+		}
+		entries = append(entries, ent)
+	}
+	if len(entries) == 0 {
 		return
 	}
-	from := filepath.Join(fs.root, ent.Path)
-	to := filepath.Join(fs.root, fr.To)
-	if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
-		e.logger.Warn("rename: create parent", "store", fs.name, "path", fr.To, "error", err)
+	if err := e.ensureDir(fs, filepath.Dir(filepath.Join(fs.root, fr.To))); err != nil {
 		return
 	}
-	if err := os.Rename(from, to); err != nil {
-		e.logger.Warn("rename on holder", "store", fs.name, "path", fr.Path, "to", fr.To, "error", err)
-		return
+	for _, ent := range entries {
+		newPath := fr.To
+		if ent.Path != fr.Path {
+			newPath = fr.To + strings.TrimPrefix(ent.Path, fr.Path)
+		}
+		from := filepath.Join(fs.root, ent.Path)
+		to := filepath.Join(fs.root, newPath)
+		if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
+			return
+		}
+		if err := os.Rename(from, to); err != nil {
+			e.logger.Warn("rename on holder", "store", fs.name, "path", ent.Path, "to", newPath, "error", err)
+			return
+		}
+		e.chownPath(fs, to)
+		vv := fr.Entry.VV
+		if len(vv) == 0 {
+			vv = map[string]uint64{e.me: fs.db.Next()}
+		}
+		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
+		moved := ent.clone()
+		moved.Path = newPath
+		moved.VV = vv
+		_ = fs.db.Put(old)
+		_ = fs.db.Put(moved)
 	}
-	e.chownPath(fs, to)
-
-	vv := fr.Entry.VV
-	if len(vv) == 0 {
-		vv = map[string]uint64{e.me: fs.db.Next()}
-	}
-	old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
-	moved := ent.clone()
-	moved.Path = fr.To
-	moved.VV = vv
-	_ = fs.db.Put(old)
-	_ = fs.db.Put(moved)
-	e.broadcastIndex(fs, []*Entry{old, moved})
+	e.broadcastIndex(fs, fs.db.All())
 }
 
 // --- serving ---------------------------------------------------------------

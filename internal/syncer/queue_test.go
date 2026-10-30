@@ -550,3 +550,33 @@ func TestReadWriteOpenDoesNotFetchUntilWritten(t *testing.T) {
 		t.Fatalf("journal entry changed: %+v", ent)
 	}
 }
+
+func TestStreamedRenameMovesImpliedDirectorySubtree(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	if err := fs.db.Put(&Entry{Path: "Adventures/one.txt", Blob: "one", Size: 3, VV: map[string]uint64{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "Adventures/two.txt", Blob: "two", Size: 3, VV: map[string]uint64{"a": 2}}); err != nil {
+		t.Fatal(err)
+	}
+	n.eng.refreshTree(fs)
+	m := &storeMutator{e: n.eng, fs: fs}
+	if err := m.Rename("Adventures", "Renamed"); err != nil {
+		t.Fatalf("rename implied directory: %v", err)
+	}
+	for _, path := range []string{"Adventures/one.txt", "Adventures/two.txt"} {
+		if ent := fs.db.Get(path); ent == nil || !ent.Deleted {
+			t.Fatalf("old path not deleted: %s => %+v", path, ent)
+		}
+	}
+	for _, path := range []string{"Renamed/one.txt", "Renamed/two.txt"} {
+		if ent := fs.db.Get(path); ent == nil || ent.Deleted {
+			t.Fatalf("new path missing: %s => %+v", path, ent)
+		}
+	}
+}
