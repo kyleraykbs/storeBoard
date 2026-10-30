@@ -73,6 +73,9 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 	var firstErr error
 	for _, peer := range peers {
 		data, err := f.e.readRangeFrom(ctx, peer, f.fs, entry.Path, offset, length)
+		if err == nil && int64(len(data)) != length {
+			err = fmt.Errorf("%s: holder %s returned %d of %d requested bytes", entry.Path, peer, len(data), length)
+		}
 		if err == nil {
 			return data, nil
 		}
@@ -221,11 +224,11 @@ func (e *Engine) handleRead(peer string, fr *frame) {
 	}
 	buf := make([]byte, length)
 	n, err := io.ReadFull(blob, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		e.replyReadErr(peer, fr, "read failed")
+	if err != nil {
+		e.replyReadErr(peer, fr, fmt.Sprintf("short holder file: read %d of %d bytes", n, length))
 		return
 	}
-	if err := e.sendBulkTo(peer, frame{Type: "readData", ID: fr.ID, Store: fs.name, Path: fr.Path, Offset: fr.Offset, Data: buf[:n]}); err != nil {
+	if err := e.sendBulkTo(peer, frame{Type: "readData", ID: fr.ID, Store: fs.name, Path: fr.Path, Offset: fr.Offset, Data: buf}); err != nil {
 		e.logger.Debug("read reply", "peer", peer, "store", fs.name, "path", fr.Path, "error", err)
 	}
 }
