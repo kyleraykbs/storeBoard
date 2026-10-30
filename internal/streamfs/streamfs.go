@@ -152,6 +152,8 @@ func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 			return nil, syscall.ENOENT
 		}
 	}
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(0)
 	if in := d.GetChild(name); in != nil {
 		// The kernel still holds this name, so keep the identity and just
 		// refresh what the journal says about it.
@@ -340,6 +342,12 @@ func (f *fileNode) Setattr(ctx context.Context, h fs.FileHandle, in *fuse.SetAtt
 
 // Getattr reports the size the journal recorded.
 func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	// The inode may have survived a journal replacement. Refresh the entry
+	// here as well as in Lookup: the kernel can satisfy a cached dentry's
+	// attribute request without asking the parent to look it up again.
+	if current, ok := f.fsys.tree.Get(f.path); ok {
+		f.entry = current
+	}
 	mode := f.entry.Mode
 	if mode == 0 {
 		mode = 0o644
