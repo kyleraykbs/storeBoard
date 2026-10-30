@@ -53,9 +53,9 @@ type streamFetcher struct {
 	fs *StoreState
 }
 
-// ReadRange fetches a byte window from the fastest reachable holder, trying
-// the next one when a holder fails mid-read. A store with no holder reachable
-// reports ENOENT: the tree exists, the bytes do not.
+// ReadRange retries a failed range after a holder reconnects. The peer link
+// can briefly drop while the transport redials; returning a short read or
+// giving up after one connection turns that transient into a truncated photo.
 func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, offset, length int64) ([]byte, error) {
 	if entry.Dir || entry.Blob == "" {
 		return nil, fmt.Errorf("%s: no content to read", entry.Path)
@@ -66,24 +66,44 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 	if length > maxReadChunk {
 		length = maxReadChunk
 	}
-	peers := f.e.holdersFor(f.fs)
-	if len(peers) == 0 {
-		return nil, fmt.Errorf("no holder reachable for store %q: %w", f.fs.name, os.ErrNotExist)
-	}
+	deadline := time.Now().Add(readTimeout)
 	var firstErr error
-	for _, peer := range peers {
-		data, err := f.e.readRangeFrom(ctx, peer, f.fs, entry.Path, offset, length)
-		if err == nil && int64(len(data)) != length {
-			err = fmt.Errorf("%s: holder %s returned %d of %d requested bytes", entry.Path, peer, len(data), length)
+	for {
+		peers := f.e.holdersFor(f.fs)
+		for _, peer := range peers {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, min(remaining, readTimeout/2))
+			data, err := f.e.readRangeFrom(attemptCtx, peer, f.fs, entry.Path, offset, length)
+			cancel()
+			if err == nil && int64(len(data)) != length {
+				err = fmt.Errorf("%s: holder %s returned %d of %d requested bytes", entry.Path, peer, len(data), length)
+			}
+			if err == nil {
+				return data, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
-		if err == nil {
-			return data, nil
+		if !time.Now().Before(deadline) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: no holder reachable for store %q", entry.Path, f.fs.name)
+			}
+			return nil, firstErr
 		}
-		if firstErr == nil {
-			firstErr = err
+		// The link can be down for a short reconnect window. Retry the same
+		// range against the new connection, bounded by the overall deadline.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.e.closed:
+			return nil, errors.New("engine closed")
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return nil, firstErr
 }
 
 // holdersFor orders the peers that could serve this store: the declared

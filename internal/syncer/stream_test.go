@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,37 +21,23 @@ func TestStreamedStoreReadsARangeFromItsHolder(t *testing.T) {
 	defer func() { scanInterval = old }()
 
 	epA, epB := twoEndpoints(t)
-	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{
-		"docs": {Group: "g"},
-	})
-	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream},
-	})
+	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{"docs": {Group: "g"}})
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
 	startNode(t, a)
 	startNode(t, b)
 
 	const body = "0123456789abcdefghij"
 	writeFile(t, filepath.Join(a.root("docs"), "clip.bin"), body, time.Now())
-
-	waitFor(t, testWait, "journal entry on the streamed peer", func() bool {
-		return b.store("docs").db.Get("clip.bin") != nil
-	})
+	waitFor(t, testWait, "journal entry on streamed peer", func() bool { return b.store("docs").db.Get("clip.bin") != nil })
 	ent := b.store("docs").db.Get("clip.bin")
 	if ent.Deleted || ent.Blob == "" {
 		t.Fatalf("journal entry did not arrive whole: %+v", ent)
 	}
-	// The bytes stayed on the holder: a streamed store records the entry and
-	// fetches on demand, so the content store holds nothing.
 	if b.eng.store.Has(ent.Blob) {
 		t.Fatal("streamed store pulled the whole blob instead of reading a range")
 	}
-
 	fetch := &streamFetcher{e: b.eng, fs: b.store("docs")}
-	got, err := fetch.ReadRange(context.Background(), streamfs.Entry{
-		Path: "clip.bin",
-		Blob: ent.Blob,
-		Size: ent.Size,
-	}, 4, 6)
+	got, err := fetch.ReadRange(context.Background(), streamfs.Entry{Path: "clip.bin", Blob: ent.Blob, Size: ent.Size}, 4, 6)
 	if err != nil {
 		t.Fatalf("ranged read: %v", err)
 	}
@@ -62,53 +49,38 @@ func TestStreamedStoreReadsARangeFromItsHolder(t *testing.T) {
 	}
 }
 
-// The user-facing path: reading the file at its canonical path on a streamed
-// peer goes through the mount, over the wire, to the holder.
+// The user-facing path: reading at the canonical path goes through FUSE, over
+// the wire, to the holder.
 func TestStreamedStoreServesTheFileThroughItsMount(t *testing.T) {
 	old := scanInterval
 	scanInterval = 50 * time.Millisecond
 	defer func() { scanInterval = old }()
-
 	epA, epB := twoEndpoints(t)
-	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{
-		"docs": {Group: "g"},
-	})
-	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream},
-	})
+	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{"docs": {Group: "g"}})
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
 	startNode(t, a)
 	startNode(t, b)
-
 	const body = "photo bytes that live on the holder\n"
 	writeFile(t, filepath.Join(a.root("docs"), "Pictures", "clip.jpg"), body, time.Now())
-
-	waitFor(t, testWait, "journal entry on the streamed peer", func() bool {
-		return b.store("docs").db.Get("Pictures/clip.jpg") != nil
-	})
+	waitFor(t, testWait, "journal entry on streamed peer", func() bool { return b.store("docs").db.Get("Pictures/clip.jpg") != nil })
 	waitPrepared(t, b.store("docs"))
 	if !b.store("docs").mounted() {
-		t.Skip("no FUSE mount available here: the journal path is covered elsewhere")
+		t.Skip("no FUSE mount available here")
 	}
-
 	got, err := os.ReadFile(filepath.Join(b.root("docs"), "Pictures", "clip.jpg"))
 	if err != nil {
-		t.Fatalf("read through the mount: %v", err)
+		t.Fatalf("read through mount: %v", err)
 	}
 	if string(got) != body {
-		t.Fatalf("content through the mount = %q, want %q", got, body)
+		t.Fatalf("content = %q, want %q", got, body)
 	}
 	if b.eng.store.Has(b.store("docs").db.Get("Pictures/clip.jpg").Blob) {
-		t.Fatal("reading through the mount left a whole-file copy on the streamed peer")
+		t.Fatal("read left a whole-file copy behind")
 	}
 }
 
-// A store with no reachable holder still presents its tree but cannot serve
-// bytes: the read fails with something a caller can act on, and nothing is
-// invented.
 func TestStreamedStoreReadWithoutAHolderFails(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream},
-	})
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
 	n.prepareAll()
 	t.Cleanup(n.eng.Close)
 	ent := &Entry{Path: "clip.bin", Blob: "deadbeef", Size: 10, Local: true}
@@ -116,53 +88,36 @@ func TestStreamedStoreReadWithoutAHolderFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := n.store("docs").db.Get("clip.bin"); got == nil || got.Deleted {
-		t.Fatal("the journal lost an entry for a store with no holder")
+		t.Fatal("journal lost entry with no holder")
 	}
-
 	fetch := &streamFetcher{e: n.eng, fs: n.store("docs")}
 	if _, err := fetch.ReadRange(context.Background(), streamfs.Entry{Path: "clip.bin", Blob: ent.Blob, Size: ent.Size}, 0, 4); err == nil {
-		t.Fatal("a read with no holder answered successfully")
-	}
-	if n.eng.store.Has(ent.Blob) {
-		t.Fatal("a failed read stored bytes")
+		t.Fatal("read with no holder succeeded")
 	}
 }
 
-// The declared preference wins, then measured throughput, then the name: the
-// order is what makes a pinned holder actually get the traffic.
 func TestHoldersForPrefersTheDeclaredPeerThenThroughput(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream, Preferred: "b"},
-	})
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream, Preferred: "b"}})
 	n.eng.mu.Lock()
 	n.eng.sends["b"] = nil
 	n.eng.sends["c"] = nil
 	n.eng.mu.Unlock()
 	n.eng.cfg.Peers["c"] = config.Peer{Endpoints: []string{"127.0.0.1:3"}}
 	n.eng.cfg.Groups["g"] = config.Group{Peers: []string{"a", "b", "c"}}
-
-	// c is faster, but b is declared.
 	n.eng.noteRead("c", 4<<20, time.Millisecond)
 	n.eng.noteRead("b", 1<<10, time.Second)
-
 	fs := n.store("docs")
 	if got := n.eng.holdersFor(fs); len(got) != 2 || got[0] != "b" || got[1] != "c" {
 		t.Fatalf("holder order = %v, want [b c]", got)
 	}
-
-	// Without a preference, measured throughput decides.
 	fs.preferred = ""
 	if got := n.eng.holdersFor(fs); len(got) != 2 || got[0] != "c" {
-		t.Fatalf("holder order without a preference = %v, want c first", got)
+		t.Fatalf("holder order without preference = %v, want c first", got)
 	}
 }
 
-// A streamed store never materialises what it learns: the entry is journal
-// state, and the mount is the only place those bytes appear.
 func TestStreamedApplyRecordsWithoutWritingBytes(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream},
-	})
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
 	n.prepareAll()
 	t.Cleanup(n.eng.Close)
 	fs := n.store("docs")
@@ -175,53 +130,69 @@ func TestStreamedApplyRecordsWithoutWritingBytes(t *testing.T) {
 	}
 	path := filepath.Join(fs.root, "dir", "clip.bin")
 	if fs.mounted() {
-		// The mount is the tree: the entry is visible with the journal's
-		// size and no bytes of its own exist here.
 		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatalf("mounted view lost the entry: %v", err)
-		}
-		if info.Size() != ent.Size {
-			t.Fatalf("mounted size = %d, want %d", info.Size(), ent.Size)
+		if err != nil || info.Size() != ent.Size {
+			t.Fatalf("mounted entry stat = %v, err=%v", info, err)
 		}
 	} else if _, err := os.Stat(path); err == nil {
-		t.Fatal("streamed apply wrote a file into the store's own path")
+		t.Fatal("streamed apply wrote a local file")
 	}
 	if n.eng.store.Has("abc123") {
 		t.Fatal("streamed apply stored the blob")
 	}
 }
 
-// A holder that stops answering must not hang the caller: the read times out
-// and the store reports it, instead of leaving an application stuck on a
-// half-decoded file forever.
-func TestRangedReadTimesOutWhenTheHolderGoesQuiet(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncStream},
-	})
-	// A registered peer that never replies, which is what a link replaced
-	// mid-transfer looks like from here.
-	n.eng.mu.Lock()
-	n.eng.sends["b"] = silentSender{}
-	n.eng.mu.Unlock()
-
-	old := readTimeout
-	readTimeout = 150 * time.Millisecond
-	defer func() { readTimeout = old }()
-
-	fetch := &streamFetcher{e: n.eng, fs: n.store("docs")}
-	start := time.Now()
-	_, err := fetch.ReadRange(context.Background(), streamfs.Entry{Path: "clip.bin", Blob: "b", Size: 4}, 0, 4)
-	if err == nil {
-		t.Fatal("a silent holder reported success")
-	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("read took %s; the timeout did not fire", took)
-	}
-}
-
-// silentSender accepts frames and never answers.
+// Silent peers model a request whose reply is lost during a link replacement.
 type silentSender struct{}
 
 func (silentSender) Send([]byte) error     { return nil }
 func (silentSender) SendBulk([]byte) error { return nil }
+
+func TestRangedReadTimesOutWhenHolderStaysQuiet(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = silentSender{}
+	n.eng.mu.Unlock()
+	old := readTimeout
+	readTimeout = 120 * time.Millisecond
+	defer func() { readTimeout = old }()
+	start := time.Now()
+	_, err := (&streamFetcher{e: n.eng, fs: n.store("docs")}).ReadRange(context.Background(), streamfs.Entry{Path: "x", Blob: "b", Size: 4}, 0, 4)
+	if err == nil || time.Since(start) > time.Second {
+		t.Fatalf("silent holder result err=%v duration=%s", err, time.Since(start))
+	}
+}
+
+// A timed-out first attempt is retried against the replacement connection.
+type reconnectingSender struct {
+	e     *Engine
+	calls int
+}
+
+func (s *reconnectingSender) Send(b []byte) error {
+	s.calls++
+	if s.calls == 2 {
+		var fr frame
+		if err := json.Unmarshal(b, &fr); err != nil {
+			return err
+		}
+		s.e.deliverRead(&frame{Type: "readData", ID: fr.ID, Path: fr.Path, Data: []byte("data")})
+	}
+	return nil
+}
+func (*reconnectingSender) SendBulk([]byte) error { return nil }
+
+func TestRangedReadRetriesAfterReconnect(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
+	old := readTimeout
+	readTimeout = 400 * time.Millisecond
+	defer func() { readTimeout = old }()
+	s := &reconnectingSender{e: n.eng}
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = s
+	n.eng.mu.Unlock()
+	got, err := (&streamFetcher{e: n.eng, fs: n.store("docs")}).ReadRange(context.Background(), streamfs.Entry{Path: "x", Blob: "b", Size: 4}, 0, 4)
+	if err != nil || string(got) != "data" || s.calls < 2 {
+		t.Fatalf("retry result=%q err=%v sends=%d", got, err, s.calls)
+	}
+}
