@@ -200,6 +200,7 @@ type Engine struct {
 	frameWG        sync.WaitGroup
 	indexFrames    map[string]chan peerFrame
 	wantFrames     map[string]chan peerFrame
+	readFrames     map[string]chan peerFrame
 	blobFrames     chan peerFrame
 }
 
@@ -214,8 +215,9 @@ func (e *Engine) startFrameWorkers() {
 	e.frameStartOnce.Do(func() {
 		e.indexFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.wantFrames = make(map[string]chan peerFrame, len(e.stores))
+		e.readFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.blobFrames = make(chan peerFrame, syncFrameQueue)
-		e.frameWG.Add(1 + 2*len(e.stores))
+		e.frameWG.Add(1 + 3*len(e.stores))
 		// One worker per store for each class: a slow store delays only
 		// itself, and serving a multi-gigabyte blob cannot hold another
 		// store's index frames hostage.
@@ -243,8 +245,6 @@ func (e *Engine) startFrameWorkers() {
 						return
 					case pf := <-ch:
 						switch pf.fr.Type {
-						case "read":
-							e.handleRead(pf.peer, &pf.fr)
 						case "rename":
 							e.handleRename(pf.peer, &pf.fr)
 						case "verbs":
@@ -255,6 +255,20 @@ func (e *Engine) startFrameWorkers() {
 					}
 				}
 			}(want)
+
+			reads := make(chan peerFrame, syncFrameQueue)
+			e.readFrames[fs.name] = reads
+			go func(ch chan peerFrame) {
+				defer e.frameWG.Done()
+				for {
+					select {
+					case <-e.closed:
+						return
+					case pf := <-ch:
+						e.handleRead(pf.peer, &pf.fr)
+					}
+				}
+			}(reads)
 		}
 		go func() {
 			defer e.frameWG.Done()
@@ -674,7 +688,13 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 			return // a store this machine does not carry
 		}
 		e.enqueueFrame(ch, pf)
-	case "want", "read", "rename", "verbs":
+	case "read":
+		ch, ok := e.readFrames[fr.Store]
+		if !ok {
+			return
+		}
+		e.enqueueFrame(ch, pf)
+	case "want", "rename", "verbs":
 		ch, ok := e.wantFrames[fr.Store]
 		if !ok {
 			return // a store this machine does not carry

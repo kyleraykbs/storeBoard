@@ -87,6 +87,14 @@ func (t *Tree) Replace(entries map[string]Entry) {
 	t.mu.Unlock()
 }
 
+func cloneEntries(entries map[string]Entry) map[string]Entry {
+	next := make(map[string]Entry, len(entries))
+	for p, entry := range entries {
+		next[p] = entry
+	}
+	return next
+}
+
 // Get returns one entry.
 func (t *Tree) Get(p string) (Entry, bool) {
 	t.mu.RLock()
@@ -126,11 +134,20 @@ func (t *Tree) children(dir string) map[string]Entry {
 	return out
 }
 
-// dirNode is a directory backed by the tree.
 type dirNode struct {
 	fs.Inode
 	fsys *FS
 	path string
+}
+
+var _ = (fs.NodeOnAdder)((*dirNode)(nil))
+
+// OnAdd registers this directory's inode so a journal replacement can
+// invalidate the exact parent/name entries the kernel may have cached.
+func (d *dirNode) OnAdd(ctx context.Context) {
+	d.fsys.mu.Lock()
+	d.fsys.dirs[d.path] = d.EmbeddedInode()
+	d.fsys.mu.Unlock()
 }
 
 var _ = (fs.NodeLookuper)((*dirNode)(nil))
@@ -152,7 +169,9 @@ func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 			return nil, syscall.ENOENT
 		}
 	}
-	out.SetEntryTimeout(0)
+	out.SetEntryTimeout(time.Second)
+	// File sizes and mtimes can change when a journal update arrives; keep
+	// directory entries briefly, but always ask Getattr for live attributes.
 	out.SetAttrTimeout(0)
 	if in := d.GetChild(name); in != nil {
 		// The kernel still holds this name, so keep the identity and just
@@ -539,12 +558,16 @@ type FS struct {
 	uid     uint32
 	gid     uint32
 	server  *fuse.Server
+	mu      sync.Mutex
+	root    *fs.Inode
+	dirs    map[string]*fs.Inode
+	entries map[string]Entry
 }
 
 // Mount serves tree at mountpoint until Unmount is called. The mountpoint must
 // exist and be empty; the caller owns its lifetime.
 func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
-	f := &FS{tree: tree, fetcher: opts.Fetcher, mutator: opts.Mutator, uid: opts.UID, gid: opts.GID}
+	f := &FS{tree: tree, fetcher: opts.Fetcher, mutator: opts.Mutator, uid: opts.UID, gid: opts.GID, dirs: map[string]*fs.Inode{}, entries: cloneEntries(tree.entries)}
 	root := &dirNode{fsys: f}
 	serverOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
@@ -571,6 +594,7 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 			DirectMount: os.Geteuid() == 0,
 		},
 	}
+
 	server, err := fs.Mount(mountpoint, root, serverOpts)
 	if err != nil {
 		return nil, err
@@ -583,8 +607,46 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 // Existing open handles keep their current range fetch; new lookups see this
 // snapshot.
 func (f *FS) Replace(entries map[string]Entry) {
-	if f != nil && f.tree != nil {
-		f.tree.Replace(entries)
+	if f == nil || f.tree == nil {
+		return
+	}
+	old := f.entries
+	next := cloneEntries(entries)
+	f.tree.Replace(next)
+	f.mu.Lock()
+	old = f.entries
+	f.entries = next
+	root := f.root
+	dirs := make(map[string]*fs.Inode, len(f.dirs))
+	for p, inode := range f.dirs {
+		dirs[p] = inode
+	}
+	f.mu.Unlock()
+	if root == nil {
+		return
+	}
+	changed := map[string]struct{}{}
+	for p, before := range old {
+		after, ok := next[p]
+		if !ok || before != after {
+			changed[p] = struct{}{}
+		}
+	}
+	for p, after := range next {
+		if before, ok := old[p]; !ok || before != after {
+			changed[p] = struct{}{}
+		}
+	}
+	for p := range changed {
+		parent, name := path.Split(p)
+		parent = strings.TrimSuffix(parent, "/")
+		dir := dirs[parent]
+		if parent == "" {
+			dir = root
+		}
+		if dir != nil {
+			_ = dir.NotifyEntry(name)
+		}
 	}
 }
 

@@ -397,3 +397,41 @@ func TestInodeNumbersAreStableAcrossLookups(t *testing.T) {
 		t.Fatal("two directories share an inode number")
 	}
 }
+
+// A cached FUSE inode must report journal updates after the tree changes. A
+// directory listing or previous stat must not pin a zero-byte placeholder on
+// the inode and make a later open look empty.
+func TestReplaceRefreshesCachedFileAttributes(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tree := NewTree(map[string]Entry{"Adventures/clip.jpg": {Path: "Adventures/clip.jpg", Blob: "old", Size: 0}})
+	mounted, err := Mount(mnt, tree, Options{Fetcher: &memoryFetcher{bodies: map[string]string{"new": "photo"}}})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	p := filepath.Join(mnt, "Adventures", "clip.jpg")
+	if info, err := os.Stat(p); err != nil || info.Size() != 0 {
+		t.Fatalf("initial size: info=%v err=%v", info, err)
+	}
+	mounted.Replace(map[string]Entry{"Adventures/clip.jpg": {Path: "Adventures/clip.jpg", Blob: "new", Size: 5}})
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat after Replace: %v", err)
+	}
+	if info.Size() != 5 {
+		t.Fatalf("cached size after Replace = %d, want 5", info.Size())
+	}
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read after Replace: %v", err)
+	}
+	if string(got) != "photo" {
+		t.Fatalf("content = %q, want photo", got)
+	}
+}

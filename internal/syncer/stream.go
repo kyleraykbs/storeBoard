@@ -169,15 +169,27 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 	if err := e.sendTo(peer, frame{Type: "read", ID: id, Store: fs.name, Path: path, Offset: offset, Length: length}); err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(readTimeout)
-	defer timer.Stop()
+	var timer <-chan time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		timer = t.C
+	} else {
+		t := time.NewTimer(readTimeout)
+		defer t.Stop()
+		timer = t.C
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-e.closed:
 		return nil, errors.New("engine closed")
-	case <-timer.C:
-		return nil, fmt.Errorf("%s: holder %s did not answer within %s", path, peer, readTimeout)
+	case <-timer:
+		return nil, fmt.Errorf("%s: holder %s did not answer within read deadline", path, peer)
 	case r := <-ch:
 		if r.err != nil {
 			return nil, r.err
