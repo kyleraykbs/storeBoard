@@ -208,30 +208,42 @@ type Engine struct {
 }
 
 func (e *Engine) registerPending(p *pendingFile) {
+	p.mu.Lock()
+	path := p.path
+	p.mu.Unlock()
 	e.pendingMu.Lock()
-	e.pending[p.path] = p
+	e.pending[path] = p
 	e.pendingMu.Unlock()
 }
 
 func (e *Engine) repathPending(from, to string) bool {
 	e.pendingMu.Lock()
-	defer e.pendingMu.Unlock()
 	p := e.pending[from]
+	e.pendingMu.Unlock()
 	if p == nil {
 		return false
 	}
-	delete(e.pending, from)
 	p.mu.Lock()
 	p.path = to
 	p.mu.Unlock()
-	e.pending[to] = p
-	return true
+	e.pendingMu.Lock()
+	if e.pending[from] == p {
+		delete(e.pending, from)
+		e.pending[to] = p
+		e.pendingMu.Unlock()
+		return true
+	}
+	e.pendingMu.Unlock()
+	return false
 }
 
 func (e *Engine) unregisterPending(p *pendingFile) {
+	p.mu.Lock()
+	path := p.path
+	p.mu.Unlock()
 	e.pendingMu.Lock()
-	if e.pending[p.path] == p {
-		delete(e.pending, p.path)
+	if e.pending[path] == p {
+		delete(e.pending, path)
 	}
 	e.pendingMu.Unlock()
 }
