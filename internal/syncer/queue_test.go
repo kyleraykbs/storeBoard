@@ -613,3 +613,43 @@ func TestStreamedDirectoryRenameMovesHolderSubtree(t *testing.T) {
 		}
 	}
 }
+
+// GIO's atomic-save sequence is put(temp), then rename(temp, final). The
+// holder must pull the pending bytes under final, not receive a rename for a
+// temp path it never materialised.
+func TestQueuedFileRenameMovesThePutDestination(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	m := &storeMutator{e: n.eng, fs: n.store("docs")}
+	pf, err := m.Create(".goutputstream-test", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pf.WriteAt([]byte("saved"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rename(".goutputstream-test", "final.txt"); err != nil {
+		t.Fatal(err)
+	}
+	fs := n.store("docs")
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
+	foundPut, foundTempPut := false, false
+	for _, op := range fs.queue {
+		if op.Op == opPut && op.Path == "final.txt" {
+			foundPut = true
+		}
+		if op.Op == opPut && op.Path == ".goutputstream-test" {
+			foundTempPut = true
+		}
+	}
+	if !foundPut || foundTempPut {
+		t.Fatalf("queue after GIO rename: %+v", fs.queue)
+	}
+}

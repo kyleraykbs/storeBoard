@@ -508,6 +508,24 @@ func (m *storeMutator) RemoveDir(path string) error {
 	return nil
 }
 
+// moveQueuedPut changes the destination of a pending upload without making a
+// second blob op. GIO writes to .goutputstream-* then renames it; the holder
+// must pull those bytes under the final name, not receive a rename frame for a
+// path it never materialised.
+func (e *Engine) moveQueuedPut(fs *StoreState, from, to string, vv map[string]uint64) bool {
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
+	for i := range fs.queue {
+		if fs.queue[i].Op == opPut && fs.queue[i].Path == from {
+			fs.queue[i].Path = to
+			fs.queue[i].VV = vv
+			_ = e.writeQueue(fs)
+			return true
+		}
+	}
+	return false
+}
+
 func (m *storeMutator) Rename(from, to string) error {
 	if err := m.refuse(); err != nil {
 		return err
@@ -550,10 +568,17 @@ func (m *storeMutator) Rename(from, to string) error {
 		moved.VV = vv
 		_ = m.fs.db.Put(old)
 		_ = m.fs.db.Put(moved)
-		moves = append(moves, renameMove{From: ent.Path, Old: old, New: moved})
+		if !m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) {
+			moves = append(moves, renameMove{From: ent.Path, Old: old, New: moved})
+		}
+		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
+			return err
+		}
 	}
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves}); err != nil {
-		return err
+	if len(moves) > 0 {
+		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves, VV: moves[0].New.VV}); err != nil {
+			return err
+		}
 	}
 	m.e.refreshTree(m.fs)
 	go m.e.flushQueue(m.fs)
