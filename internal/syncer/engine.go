@@ -194,14 +194,53 @@ type Engine struct {
 	readSeq        int64
 	holderRates    map[string]holderRate
 	verified       map[string]verifiedFile
+	pendingMu      sync.Mutex
+	pending        map[string]*pendingFile
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
 	indexFrames    map[string]chan peerFrame
 	wantFrames     map[string]chan peerFrame
-	readFrames     map[string]chan peerFrame
-	blobFrames     chan peerFrame
+
+	readFrames map[string]chan peerFrame
+	blobFrames chan peerFrame
+}
+
+func (e *Engine) registerPending(p *pendingFile) {
+	e.pendingMu.Lock()
+	e.pending[p.path] = p
+	e.pendingMu.Unlock()
+}
+
+func (e *Engine) repathPending(from, to string) bool {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	p := e.pending[from]
+	if p == nil {
+		return false
+	}
+	delete(e.pending, from)
+	p.mu.Lock()
+	p.path = to
+	p.mu.Unlock()
+	e.pending[to] = p
+	return true
+}
+
+func (e *Engine) unregisterPending(p *pendingFile) {
+	e.pendingMu.Lock()
+	if e.pending[p.path] == p {
+		delete(e.pending, p.path)
+	}
+	e.pendingMu.Unlock()
+}
+
+func (e *Engine) hasPending(path string) bool {
+	e.pendingMu.Lock()
+	_, ok := e.pending[path]
+	e.pendingMu.Unlock()
+	return ok
 }
 
 type peerFrame struct {
@@ -337,6 +376,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		reads:       map[int64]chan readReply{},
 		holderRates: map[string]holderRate{},
 		verified:    map[string]verifiedFile{},
+		pending:     map[string]*pendingFile{},
 		closed:      make(chan struct{}),
 	}
 

@@ -293,24 +293,16 @@ func (m *storeMutator) Create(path string, mode uint32) (streamfs.PendingFile, e
 	if err != nil {
 		return nil, err
 	}
-	markTouched(pf)
 	if p, ok := pf.(*pendingFile); ok {
 		p.created = true
+		m.e.registerPending(p)
 	}
+	markTouched(pf)
 	// Record the empty file now: `touch foo && rm foo` in one shell sends
-	// Unlink before the kernel delivers RELEASE, and a path the journal has
-	// not seen cannot be deleted (ENOENT). The queue op still waits for
-	// close, where the real bytes are known.
+	// Unlink before the kernel delivers RELEASE.
 	m.fs.queueMu.Lock()
 	prev := m.fs.db.Get(path)
-	ent := &Entry{
-		Path:  path,
-		Blob:  emptyBlob(m.e),
-		Size:  0,
-		MTime: time.Now().UnixNano(),
-		Mode:  mode,
-		VV:    m.e.nextVV(m.fs, prev),
-	}
+	ent := &Entry{Path: path, Blob: emptyBlob(m.e), Size: 0, MTime: time.Now().UnixNano(), Mode: mode, VV: m.e.nextVV(m.fs, prev)}
 	err = m.fs.db.Put(ent)
 	m.fs.queueMu.Unlock()
 	if err != nil {
@@ -351,6 +343,9 @@ func (m *storeMutator) Open(path string, truncate bool) (streamfs.PendingFile, e
 	pf, err := m.pending(path, ent.Mode, base, fetch)
 	if err != nil {
 		return nil, err
+	}
+	if p, ok := pf.(*pendingFile); ok {
+		m.e.registerPending(p)
 	}
 	if truncate {
 		markTouched(pf)
@@ -547,6 +542,26 @@ func (m *storeMutator) Rename(from, to string) error {
 		return os.ErrNotExist
 	}
 	dst := m.fs.db.Get(to)
+	if m.e.hasPending(from) {
+		if dst != nil && !dst.Deleted && (len(entries) != 1 || entries[0].Dir || dst.Dir) {
+			return os.ErrExist
+		}
+		if dst != nil && !dst.Deleted {
+			vv := m.e.nextVV(m.fs, dst)
+			_ = m.fs.db.Put(&Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv})
+			if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
+				return err
+			}
+		}
+		vv := m.e.nextVV(m.fs, entries[0])
+		_ = m.fs.db.Put(&Entry{Path: from, Deleted: true, Dir: entries[0].Dir, VV: vv})
+		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: from, VV: vv}); err != nil {
+			return err
+		}
+		m.e.repathPending(from, to)
+		m.e.refreshTree(m.fs)
+		return nil
+	}
 	if dst != nil && !dst.Deleted {
 		// File replacement is what GIO atomic saves use. Directory replacement
 		// remains protected: silently replacing a non-empty tree is unsafe.
@@ -858,6 +873,7 @@ func (p *pendingFile) Truncate(size int64) error {
 // one is reachable. A policy refusal happens here, before anything is
 // journalled, so the tree never claims a file the queue rejected.
 func (p *pendingFile) Close() error {
+	defer p.e.unregisterPending(p)
 	err := p.close()
 	if err != nil {
 		// Release has no error path back to the writer, so a refusal is
