@@ -435,3 +435,25 @@ func TestReplaceRefreshesCachedFileAttributes(t *testing.T) {
 		t.Fatalf("content = %q, want photo", got)
 	}
 }
+
+func TestMountReportsFilesystemNameLimit(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mounted, err := Mount(mnt, NewTree(nil), Options{Fetcher: &memoryFetcher{}})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mnt, &st); err != nil {
+		t.Fatalf("statfs: %v", err)
+	}
+	if st.Namelen != 255 {
+		t.Fatalf("filesystem name limit = %d, want 255", st.Namelen)
+	}
+}

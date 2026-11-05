@@ -30,6 +30,12 @@ const (
 	opRename = "rename"
 )
 
+type renameMove struct {
+	From string `json:"from"`
+	Old  *Entry `json:"old"`
+	New  *Entry `json:"new"`
+}
+
 // queueOp is one queued change. The bytes of a put live beside the index at
 // <dataDir>/queue/<store>/<id>, so a crash between the journal and the wire
 // never loses what the user wrote.
@@ -44,6 +50,7 @@ type queueOp struct {
 	Blob  string            `json:"blob,omitempty"`
 	VV    map[string]uint64 `json:"vv,omitempty"`
 	Dir   bool              `json:"dir,omitempty"`
+	Moves []renameMove      `json:"moves,omitempty"`
 }
 
 func queueIndexPath(dataDir, storeName string) string {
@@ -182,16 +189,12 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 				e.dropQueued(fs, op.ID)
 			}
 		case opDelete, opRmdir:
-			if rem.Path == op.Path && rem.Deleted && vvCovers(rem.VV, op.VV) {
-				e.dropQueued(fs, op.ID)
-			}
-		case opMkdir:
-			if rem.Path == op.Path && !rem.Deleted && rem.Dir && vvCovers(rem.VV, op.VV) {
-				e.dropQueued(fs, op.ID)
-			}
 		case opRename:
-			if (rem.Path == op.To || strings.HasPrefix(rem.Path, op.To+"/")) && !rem.Deleted && vvCovers(rem.VV, op.VV) {
-				e.dropQueued(fs, op.ID)
+			for _, move := range op.Moves {
+				if rem.Path == move.New.Path && !rem.Deleted && vvCovers(rem.VV, move.New.VV) {
+					e.dropQueued(fs, op.ID)
+					break
+				}
 			}
 		}
 	}
@@ -224,7 +227,7 @@ func (e *Engine) flushQueue(fs *StoreState) {
 	fs.queueMu.Unlock()
 	for _, op := range ops {
 		if op.Op == opRename {
-			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Entry: &Entry{Path: op.To, VV: op.VV, Dir: op.Dir}}
+			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Moves: op.Moves}
 			if err := e.sendTo(peer, fr); err != nil {
 				e.logger.Debug("flush rename", "store", fs.name, "path", op.Path, "error", err)
 				return
@@ -534,24 +537,22 @@ func (m *storeMutator) Rename(from, to string) error {
 			return os.ErrExist
 		}
 	}
-	vv := m.e.nextVV(m.fs, entries[0])
+	moves := make([]renameMove, 0, len(entries))
 	for _, ent := range entries {
 		newPath := to
 		if ent.Path != from {
 			newPath = to + strings.TrimPrefix(ent.Path, from)
 		}
-		oldVV := vv
-		if ent != entries[0] {
-			oldVV = m.e.nextVV(m.fs, ent)
-		}
-		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: oldVV}
+		vv := m.e.nextVV(m.fs, ent)
+		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
 		moved := ent.clone()
 		moved.Path = newPath
-		moved.VV = oldVV
+		moved.VV = vv
 		_ = m.fs.db.Put(old)
 		_ = m.fs.db.Put(moved)
+		moves = append(moves, renameMove{From: ent.Path, Old: old, New: moved})
 	}
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, VV: vv, Dir: true}); err != nil {
+	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves}); err != nil {
 		return err
 	}
 	m.e.refreshTree(m.fs)

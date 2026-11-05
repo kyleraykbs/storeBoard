@@ -153,6 +153,18 @@ func (d *dirNode) OnAdd(ctx context.Context) {
 var _ = (fs.NodeLookuper)((*dirNode)(nil))
 var _ = (fs.NodeReaddirer)((*dirNode)(nil))
 var _ = (fs.NodeGetattrer)((*dirNode)(nil))
+var _ = (fs.NodeStatfser)((*dirNode)(nil))
+
+// Statfs supplies the filesystem name limit Nautilus uses to validate a
+// new folder name before it sends MKDIR. An unimplemented FUSE statfs
+// makes GIO report a zero/unknown NAME_MAX, so every non-empty name appears
+// "too long" in the New Folder dialog even though mkdir(2) succeeds.
+func (d *dirNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	out.Bsize = 4096
+	out.Frsize = 4096
+	out.NameLen = 255
+	return 0
+}
 
 // Lookup resolves one child name into an inode.
 func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

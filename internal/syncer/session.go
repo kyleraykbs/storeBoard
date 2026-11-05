@@ -36,6 +36,8 @@ type frame struct {
 	Error string `json:"error,omitempty"`
 	// Action names a forwarded verb (versions, restore).
 	Action string `json:"action,omitempty"`
+	// Moves carries per-entry journal records for an atomic subtree rename.
+	Moves []renameMove `json:"moves,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or
@@ -572,7 +574,7 @@ func (e *Engine) requestRange(peer string, fs *StoreState, rem *Entry, p *pendin
 // same tree.
 func (e *Engine) handleRename(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
-	if fs == nil || !validRel(fr.Path) || !validRel(fr.To) {
+	if fs == nil || !validRel(fr.Path) || !validRel(fr.To) || len(fr.Moves) == 0 {
 		return
 	}
 	if fs.stream {
@@ -580,47 +582,40 @@ func (e *Engine) handleRename(peer string, fr *frame) {
 	}
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
-	prefix := fr.Path + "/"
-	var entries []*Entry
-	for _, ent := range fs.db.All() {
-		if ent.Deleted || (ent.Path != fr.Path && !strings.HasPrefix(ent.Path, prefix)) {
+	from := filepath.Join(fs.root, fr.Path)
+	to := filepath.Join(fs.root, fr.To)
+	if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
+		e.logger.Warn("rename: create parent", "store", fs.name, "path", fr.To, "error", err)
+		return
+	}
+	if _, err := os.Lstat(to); err == nil {
+		e.logger.Warn("rename destination exists", "store", fs.name, "from", fr.Path, "to", fr.To)
+		return
+	} else if !os.IsNotExist(err) {
+		e.logger.Warn("inspect rename destination", "store", fs.name, "to", fr.To, "error", err)
+		return
+	}
+	if err := os.Rename(from, to); err != nil {
+		e.logger.Warn("rename on holder", "store", fs.name, "path", fr.Path, "to", fr.To, "error", err)
+		return
+	}
+	e.chownPath(fs, to)
+	changed := make([]*Entry, 0, len(fr.Moves)*2)
+	for _, move := range fr.Moves {
+		if move.Old == nil || move.New == nil || !validRel(move.From) || !validRel(move.New.Path) {
 			continue
 		}
-		entries = append(entries, ent)
-	}
-	if len(entries) == 0 {
-		return
-	}
-	if err := e.ensureDir(fs, filepath.Dir(filepath.Join(fs.root, fr.To))); err != nil {
-		return
-	}
-	for _, ent := range entries {
-		newPath := fr.To
-		if ent.Path != fr.Path {
-			newPath = fr.To + strings.TrimPrefix(ent.Path, fr.Path)
-		}
-		from := filepath.Join(fs.root, ent.Path)
-		to := filepath.Join(fs.root, newPath)
-		if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
+		if err := fs.db.Put(move.Old); err != nil {
+			e.logger.Warn("journal rename tombstone", "store", fs.name, "path", move.From, "error", err)
 			return
 		}
-		if err := os.Rename(from, to); err != nil {
-			e.logger.Warn("rename on holder", "store", fs.name, "path", ent.Path, "to", newPath, "error", err)
+		if err := fs.db.Put(move.New); err != nil {
+			e.logger.Warn("journal renamed entry", "store", fs.name, "path", move.New.Path, "error", err)
 			return
 		}
-		e.chownPath(fs, to)
-		vv := fr.Entry.VV
-		if len(vv) == 0 {
-			vv = map[string]uint64{e.me: fs.db.Next()}
-		}
-		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
-		moved := ent.clone()
-		moved.Path = newPath
-		moved.VV = vv
-		_ = fs.db.Put(old)
-		_ = fs.db.Put(moved)
+		changed = append(changed, move.Old, move.New)
 	}
-	e.broadcastIndex(fs, fs.db.All())
+	e.broadcastIndex(fs, changed)
 }
 
 // --- serving ---------------------------------------------------------------

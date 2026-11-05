@@ -580,3 +580,36 @@ func TestStreamedRenameMovesImpliedDirectorySubtree(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamedDirectoryRenameMovesHolderSubtree(t *testing.T) {
+	old := scanInterval
+	scanInterval = 50 * time.Millisecond
+	defer func() { scanInterval = old }()
+	epA, epB := twoEndpoints(t)
+	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{"docs": {Group: "g"}})
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
+	startNode(t, a)
+	startNode(t, b)
+	if !b.store("docs").mounted() {
+		waitPrepared(t, b.store("docs"))
+	}
+	if !b.store("docs").mounted() {
+		t.Skip("no FUSE mount available here")
+	}
+	writeFile(t, filepath.Join(a.root("docs"), "Adventures", "October", "one.jpg"), "one", time.Now())
+	writeFile(t, filepath.Join(a.root("docs"), "Adventures", "October", "two.jpg"), "two", time.Now())
+	waitFor(t, testWait, "subtree entries on streamed peer", func() bool {
+		return b.store("docs").db.Get("Adventures/October/one.jpg") != nil && b.store("docs").db.Get("Adventures/October/two.jpg") != nil
+	})
+	if err := os.Rename(filepath.Join(b.root("docs"), "Adventures"), filepath.Join(b.root("docs"), "Renamed")); err != nil {
+		t.Fatalf("rename directory through stream: %v", err)
+	}
+	waitFor(t, testWait, "renamed subtree on holder", func() bool {
+		return exists(filepath.Join(a.root("docs"), "Renamed", "October", "one.jpg")) && exists(filepath.Join(a.root("docs"), "Renamed", "October", "two.jpg"))
+	})
+	for name, want := range map[string]string{"one.jpg": "one", "two.jpg": "two"} {
+		if got := readFile(t, filepath.Join(a.root("docs"), "Renamed", "October", name)); got != want {
+			t.Fatalf("holder %s = %q, want %q", name, got, want)
+		}
+	}
+}
