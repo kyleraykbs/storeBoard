@@ -312,9 +312,19 @@ func (d *dirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 	if !ok {
 		return syscall.EXDEV
 	}
-	if err := d.fsys.mutator.Rename(d.childPath(name), parent.childPath(newName)); err != nil {
+	oldPath := d.childPath(name)
+	newPath := parent.childPath(newName)
+	child := d.GetChild(name)
+	if err := d.fsys.mutator.Rename(oldPath, newPath); err != nil {
 		return errnoFor(err)
 	}
+	// The kernel has already moved its dentry. The inode objects below it
+	// still hold the old absolute paths, so a read straight after the rename
+	// resolves against names that no longer exist. Rewrite the whole moved
+	// subtree before returning.
+	d.fsys.repath(child, oldPath, newPath)
+	d.fsys.invalidate(oldPath)
+	d.fsys.invalidate(newPath)
 	return 0
 }
 
@@ -659,6 +669,45 @@ func (f *FS) Replace(entries map[string]Entry) {
 		if dir != nil {
 			_ = dir.NotifyEntry(name)
 		}
+	}
+}
+
+// repath rewrites the absolute paths held by the inodes under a renamed
+// entry. The kernel moves its dentry; these node fields do not move with it.
+func (f *FS) repath(inode *fs.Inode, from, to string) {
+	if inode == nil {
+		return
+	}
+	switch n := inode.Operations().(type) {
+	case *dirNode:
+		old := n.path
+		n.path = to + strings.TrimPrefix(old, from)
+		f.mu.Lock()
+		delete(f.dirs, old)
+		f.dirs[n.path] = inode
+		f.mu.Unlock()
+	case *fileNode:
+		old := n.entry.Path
+		n.entry.Path = to + strings.TrimPrefix(old, from)
+	}
+	for _, child := range inode.Children() {
+		f.repath(child, from, to)
+	}
+}
+
+// invalidate asks the kernel to drop one cached parent/name dentry.
+func (f *FS) invalidate(p string) {
+	parent, name := path.Split(p)
+	parent = strings.TrimSuffix(parent, "/")
+	f.mu.Lock()
+	root := f.root
+	dir := f.dirs[parent]
+	f.mu.Unlock()
+	if parent == "" {
+		dir = root
+	}
+	if dir != nil {
+		_ = dir.NotifyEntry(name)
 	}
 }
 

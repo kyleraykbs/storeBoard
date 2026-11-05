@@ -457,3 +457,74 @@ func TestMountReportsFilesystemNameLimit(t *testing.T) {
 		t.Fatalf("filesystem name limit = %d, want 255", st.Namelen)
 	}
 }
+
+// A rename moves the kernel's dentry but not the absolute paths held by our
+// inodes. Reading immediately through the new name must still work.
+func TestReadImmediatelyAfterDirectoryRename(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tree := NewTree(map[string]Entry{
+		"Before/nested/a.txt": {Path: "Before/nested/a.txt", Blob: "b", Size: 5},
+	})
+	renamer := &renameMutator{tree: tree}
+	mounted, err := Mount(mnt, tree, Options{
+		Fetcher: &memoryFetcher{bodies: map[string]string{"b": "alpha"}},
+		Mutator: renamer,
+		UID:     uint32(os.Getuid()),
+		GID:     uint32(os.Getgid()),
+	})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	// Read once so the subtree inodes exist and carry their paths.
+	if got := readMounted(t, filepath.Join(mnt, "Before", "nested", "a.txt")); got != "alpha" {
+		t.Fatalf("before rename = %q", got)
+	}
+	if err := os.Rename(filepath.Join(mnt, "Before"), filepath.Join(mnt, "After")); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if got := readMounted(t, filepath.Join(mnt, "After", "nested", "a.txt")); got != "alpha" {
+		t.Fatalf("after rename = %q", got)
+	}
+}
+
+func readMounted(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// renameMutator records the rename in the tree like the engine does.
+type renameMutator struct {
+	tree *Tree
+}
+
+func (m *renameMutator) Create(string, uint32) (PendingFile, error) { return nil, os.ErrPermission }
+func (m *renameMutator) Open(string, bool) (PendingFile, error)     { return nil, os.ErrPermission }
+func (m *renameMutator) Truncate(string, int64) error               { return os.ErrPermission }
+func (m *renameMutator) Remove(string) error                        { return nil }
+func (m *renameMutator) MakeDir(string, uint32) error               { return nil }
+func (m *renameMutator) RemoveDir(string) error                     { return nil }
+func (m *renameMutator) Rename(from, to string) error {
+	next := map[string]Entry{}
+	m.tree.mu.RLock()
+	for p, e := range m.tree.entries {
+		if p == from || strings.HasPrefix(p, from+"/") {
+			e.Path = to + strings.TrimPrefix(p, from)
+			p = e.Path
+		}
+		next[p] = e
+	}
+	m.tree.mu.RUnlock()
+	m.tree.Replace(next)
+	return nil
+}
