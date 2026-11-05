@@ -451,6 +451,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			}
 		}
 	}
+	e.cleanupStaleAtomicFiles()
 	e.startFrameWorkers()
 	return e, nil
 }
