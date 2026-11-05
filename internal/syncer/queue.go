@@ -542,35 +542,12 @@ func (m *storeMutator) Rename(from, to string) error {
 		return os.ErrNotExist
 	}
 	dst := m.fs.db.Get(to)
-	if m.e.hasPending(from) {
-		if dst != nil && !dst.Deleted && (len(entries) != 1 || entries[0].Dir || dst.Dir) {
-			return os.ErrExist
-		}
-		if dst != nil && !dst.Deleted {
-			vv := m.e.nextVV(m.fs, dst)
-			_ = m.fs.db.Put(&Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv})
-			if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
-				return err
-			}
-		}
-		vv := m.e.nextVV(m.fs, entries[0])
-		_ = m.fs.db.Put(&Entry{Path: from, Deleted: true, Dir: entries[0].Dir, VV: vv})
-		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: from, VV: vv}); err != nil {
-			return err
-		}
-		m.e.repathPending(from, to)
-		m.e.refreshTree(m.fs)
-		return nil
-	}
 	if dst != nil && !dst.Deleted {
-		// File replacement is what GIO atomic saves use. Directory replacement
-		// remains protected: silently replacing a non-empty tree is unsafe.
 		if len(entries) != 1 || entries[0].Dir || dst.Dir {
 			return os.ErrExist
 		}
 		vv := m.e.nextVV(m.fs, dst)
-		tomb := &Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv}
-		_ = m.fs.db.Put(tomb)
+		_ = m.fs.db.Put(&Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv})
 		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
 			return err
 		}
@@ -588,11 +565,12 @@ func (m *storeMutator) Rename(from, to string) error {
 		moved.VV = vv
 		_ = m.fs.db.Put(old)
 		_ = m.fs.db.Put(moved)
-		if !m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) {
+		if m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) {
+			if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
+				return err
+			}
+		} else {
 			moves = append(moves, renameMove{From: ent.Path, Old: old, New: moved})
-		}
-		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
-			return err
 		}
 	}
 	if len(moves) > 0 {
