@@ -546,13 +546,18 @@ func (m *storeMutator) Rename(from, to string) error {
 	if len(entries) == 0 {
 		return os.ErrNotExist
 	}
-	for _, ent := range entries {
-		newPath := to
-		if ent.Path != from {
-			newPath = to + strings.TrimPrefix(ent.Path, from)
-		}
-		if dst := m.fs.db.Get(newPath); dst != nil && !dst.Deleted {
+	dst := m.fs.db.Get(to)
+	if dst != nil && !dst.Deleted {
+		// File replacement is what GIO atomic saves use. Directory replacement
+		// remains protected: silently replacing a non-empty tree is unsafe.
+		if len(entries) != 1 || entries[0].Dir || dst.Dir {
 			return os.ErrExist
+		}
+		vv := m.e.nextVV(m.fs, dst)
+		tomb := &Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv}
+		_ = m.fs.db.Put(tomb)
+		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
+			return err
 		}
 	}
 	moves := make([]renameMove, 0, len(entries))
