@@ -1,12 +1,16 @@
 package syncer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,12 +36,21 @@ type frame struct {
 	// ID correlates a ranged read with its answer. Reads are concurrent and
 	// multiplexed over the one connection, so the reply cannot rely on order.
 	ID int64 `json:"id,omitempty"`
-	// Error carries a holder's refusal for a read it could not serve.
+	// Error carries a holder's refusal for a read it could not serve, and
+	// Code classifies it (see refuseStale) so the reader knows not to retry.
 	Error string `json:"error,omitempty"`
+	Code  string `json:"code,omitempty"`
+	// Blob pins a ranged read to the version the reader opened.
+	Blob string `json:"blob,omitempty"`
 	// Action names a forwarded verb (versions, restore).
 	Action string `json:"action,omitempty"`
 	// Moves carries per-entry journal records for an atomic subtree rename.
 	Moves []renameMove `json:"moves,omitempty"`
+	// Bits, Sums and Buckets carry an index digest and the buckets a peer
+	// wants entries for (see digest.go).
+	Bits    int    `json:"bits,omitempty"`
+	Sums    []byte `json:"sums,omitempty"`
+	Buckets []int  `json:"buckets,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or
@@ -46,22 +59,42 @@ type pending struct {
 	entry        *Entry
 	conflict     bool
 	conflictName string
+	// asked is when the want went out; a want for the same version is not
+	// repeated while it is fresh (see request).
+	asked time.Time
+	// peer is who was asked; tried is everyone asked so far, so a refusal
+	// moves on to a peer that has not refused yet (see handleWantErr).
+	peer  string
+	tried []string
 }
+
+// wantRefresh is how long a want stands before the same version may be asked
+// for again. Every index frame used to re-send it: with full indexes every
+// 30 s, a transfer longer than that was restarted from byte zero, once per
+// peer holding the file, and never finished.
+const wantRefresh = 2 * time.Minute
 
 // incomingBlob is a transfer in progress. next is the chunk sequence this
 // side expects: a sender that restarts a transfer begins again at 0, and
 // appending its bytes onto the partial file would produce a blob that can
 // never hash correctly, so the file is reset instead of extended.
+//
+// The bytes are hashed as they arrive, so a finished transfer is verified
+// without reading it back: re-hashing a 20 GiB file took minutes on the one
+// worker every incoming chunk shared.
 type incomingBlob struct {
 	store string
+	path  string
+	blob  string    // as the sender named it; "" from an older sender
+	last  time.Time // guarded by Engine.mu
 	f     *os.File
-	entry *Entry
+	hash  hash.Hash
 	next  int
 }
 
 func wantKey(store, path string) string { return store + "\x00" + path }
-func incomeKey(peer, store, path string) string {
-	return peer + "\x00" + store + "\x00" + path
+func incomeKey(peer, store, path, blob string) string {
+	return peer + "\x00" + store + "\x00" + path + "\x00" + blob
 }
 
 // validRel rejects paths that could escape a store root.
@@ -105,11 +138,21 @@ func (e *Engine) sendBulkTo(peer string, fr frame) error {
 	return send.SendBulk(b)
 }
 
+// indexChunk bounds the entries one index frame carries. A whole store's
+// index used to be one line - tens of megabytes for a photo library - which a
+// slow link could not write inside the 30 s write deadline; the half-written
+// line then corrupted the frame after it.
+const indexChunk = 2000
+
 func (e *Engine) sendIndexTo(peer string, fs *StoreState, entries []*Entry) error {
-	if len(entries) == 0 {
-		return nil
+	for len(entries) > 0 {
+		n := min(len(entries), indexChunk)
+		if err := e.sendTo(peer, frame{Type: "index", Store: fs.name, Entries: entries[:n]}); err != nil {
+			return err
+		}
+		entries = entries[n:]
 	}
-	return e.sendTo(peer, frame{Type: "index", Store: fs.name, Entries: entries})
+	return nil
 }
 
 // --- receiving -------------------------------------------------------------
@@ -147,6 +190,11 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 	if fs == nil {
 		return // a store this machine does not carry
 	}
+	if !e.storeSharedWith(fs, peer) {
+		// Group membership is the authorization: a peer outside the store's
+		// group has no say over its tree.
+		return
+	}
 	for _, rem := range fr.Entries {
 		select {
 		case <-e.closed:
@@ -154,6 +202,11 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		default:
 		}
 		if rem == nil || !validRel(rem.Path) {
+			continue
+		}
+		if !rem.Dir && !rem.Deleted && !store.ValidSum(rem.Blob) {
+			// A live file names its bytes by their hash. Anything else is
+			// not a version this machine can fetch, verify or serve.
 			continue
 		}
 		// Local is this machine's own knowledge; a peer's claim about it means
@@ -209,6 +262,17 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 				}
 				continue
 			}
+			if loc != nil && loc.Deleted && !Dominates(rem.VV, loc.VV) {
+				// An edit concurrent with a deletion: the edit wins, so
+				// nothing is lost, and it carries the deletion's history.
+				// Fetching it with the peer's own vector was refused on
+				// arrival as not superseding the tombstone - on every
+				// exchange, forever.
+				win := rem.clone()
+				win.VV = MergeVV(loc.VV, rem.VV)
+				e.request(peer, fs, rem, &pending{entry: win})
+				continue
+			}
 			e.request(peer, fs, rem, &pending{entry: rem})
 
 		case Dominates(rem.VV, loc.VV) && !Dominates(loc.VV, rem.VV):
@@ -237,6 +301,12 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 							// a local edit the next scan will record. Fetching
 							// would park it as a conflict and put the old
 							// content back.
+							continue
+						}
+						if loc.Local && fs.rootEmpty.Load() {
+							// The root looks unmounted (see scan): this is
+							// not a deletion, and the file is not wanted
+							// back into a directory that is not the store.
 							continue
 						}
 						if loc.Local {
@@ -321,8 +391,12 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 
 	default:
 		// Same version: the directory exists on both sides, so only a missing
-		// one needs recreating (a mount that came back empty, say).
-		if info, err := os.Stat(filepath.Join(fs.root, rem.Path)); err != nil || !info.IsDir() {
+		// one needs recreating (a mount that came back empty, say). A
+		// streamed store's root is our own mount: statting it from the index
+		// worker re-enters the filesystem, and the journal already answers.
+		if fs.stream {
+			// Nothing to recreate: the view is the journal.
+		} else if info, err := os.Stat(filepath.Join(fs.root, rem.Path)); err != nil || !info.IsDir() {
 			if err := e.applyEntry(fs, rem); err != nil {
 				e.logger.Warn("create directory", "store", fs.name, "path", rem.Path, "error", err)
 			}
@@ -356,13 +430,25 @@ func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 	}
 
 	// Theirs wins: park a copy of ours, then fetch theirs with a merged
-	// vector so the pair cannot re-conflict.
+	// vector so the pair cannot re-conflict. The want is recorded before
+	// the file moves aside: a scan in between would otherwise read the
+	// parked file as a deletion (see awaitingUpdate), and it is sent after,
+	// so the winner cannot land before ours is safe.
+	winnerEntry := rem.clone()
+	winnerEntry.VV = merged
+	if fs.stream {
+		e.request(peer, fs, rem, &pending{entry: winnerEntry})
+		e.logger.Warn("conflict: kept remote version, local saved as copy",
+			"store", fs.name, "path", loc.Path, "peer", peer)
+		return
+	}
+	send := e.registerWant(peer, fs, rem, &pending{entry: winnerEntry})
 	if copyEnt := e.saveLocalConflict(fs, loc); copyEnt != nil {
 		e.broadcastIndex(fs, []*Entry{copyEnt})
 	}
-	winnerEntry := rem.clone()
-	winnerEntry.VV = merged
-	e.request(peer, fs, rem, &pending{entry: winnerEntry})
+	if send {
+		e.sendWant(peer, fs, rem)
+	}
 	e.logger.Warn("conflict: kept remote version, local saved as copy",
 		"store", fs.name, "path", loc.Path, "peer", peer)
 }
@@ -422,9 +508,10 @@ func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) *Entry {
 }
 
 // openEntryBlob opens the bytes of an entry, preferring the content store and
-// falling back to the canonical file, which is hashed first so a peer never
-// receives bytes that do not match the entry it asked for.
-func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error) {
+// falling back to the canonical file, which must still be the version the
+// journal describes so a peer never receives bytes that do not match the
+// entry it asked for.
+func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (*os.File, error) {
 	if ent.Blob != "" && e.store.Has(ent.Blob) {
 		return e.store.Open(ent.Blob)
 	}
@@ -440,27 +527,43 @@ func (e *Engine) openEntryBlob(fs *StoreState, ent *Entry) (io.ReadCloser, error
 		return nil, os.ErrNotExist
 	}
 	path := filepath.Join(fs.root, ent.Path)
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
 	if !info.Mode().IsRegular() {
+		f.Close()
 		return nil, fmt.Errorf("%s is not a regular file", ent.Path)
 	}
-	// Verifying costs a hash of the whole file, and a reader asks for it in
-	// ~128 KiB pieces: without this cache one image load re-hashed the file
-	// a hundred times, on the one worker that also serves indexes.
-	if ent.Blob != "" && !e.verifiedRecently(path, info, ent.Blob) {
-		sum, err := store.SumFile(path)
+	// A file whose size and mtime are the ones the journal recorded is the
+	// version the journal describes: that is the same evidence the scanner
+	// accepts, and the scanner is what wrote the entry (or applyEntry, which
+	// stamps the mtime). Anything else is hashed. Hashing unconditionally
+	// cost a full read of a 20 GiB video before its first range could be
+	// served, which outlasted the reader's deadline.
+	if ent.Blob != "" && (info.Size() != ent.Size || info.ModTime().UnixNano() != ent.MTime) &&
+		!e.verifiedRecently(path, info, ent.Blob) {
+		sum, err := store.Sum(f)
 		if err != nil {
+			f.Close()
 			return nil, err
 		}
 		if sum != ent.Blob {
+			f.Close()
 			return nil, fmt.Errorf("%s does not match the entry (%s)", ent.Path, sum)
 		}
 		e.rememberVerified(path, info, ent.Blob)
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
-	return os.Open(path)
+	return f, nil
 }
 
 // verifiedFile is one confirmed canonical file: a match between the bytes on
@@ -489,6 +592,10 @@ func (e *Engine) verifiedRecently(path string, info os.FileInfo, blob string) bo
 
 func (e *Engine) rememberVerified(path string, info os.FileInfo, blob string) {
 	e.mu.Lock()
+	if len(e.verified) >= 4096 {
+		// A cache, not a record: start over rather than grow forever.
+		e.verified = map[string]verifiedFile{}
+	}
 	e.verified[path] = verifiedFile{
 		size:  info.Size(),
 		mtime: info.ModTime().UnixNano(),
@@ -544,29 +651,64 @@ func (e *Engine) pathMissing(fs *StoreState, path string) bool {
 // request asks the peer for a blob and remembers what to do with it. A
 // streamed store never fetches: it records the entry and reads ranges from a
 // holder on demand, which is the whole point of the mount.
+//
+// The want names the exact version, so whichever peer serves it sends those
+// bytes and no others, and a refusal can move on to another peer.
 func (e *Engine) request(peer string, fs *StoreState, rem *Entry, p *pending) {
 	if fs.stream {
 		_ = e.applyEntry(fs, rem)
 		return
 	}
-	e.mu.Lock()
-	e.wants[wantKey(fs.name, rem.Path)] = p
-	e.mu.Unlock()
-	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path}); err != nil {
+	if e.registerWant(peer, fs, rem, p) {
+		e.sendWant(peer, fs, rem)
+	}
+}
+
+func (e *Engine) sendWant(peer string, fs *StoreState, rem *Entry) {
+	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path, Blob: rem.Blob}); err != nil {
 		e.logger.Debug("want", "peer", peer, "error", err)
 	}
 }
 
-// requestRange asks the peer for a byte window of a blob. Offset and Length
-// mirror what a FUSE read asks for, so seeking a streamed file refetches only
-// the bytes the caller actually read.
-func (e *Engine) requestRange(peer string, fs *StoreState, rem *Entry, p *pending, offset, length int64) {
-	e.mu.Lock()
-	e.wants[wantKey(fs.name, rem.Path)] = p
-	e.mu.Unlock()
-	if err := e.sendTo(peer, frame{Type: "want", Store: fs.name, Path: rem.Path, Offset: offset, Length: length}); err != nil {
-		e.logger.Debug("want", "peer", peer, "error", err)
+// registerWant records a want, reporting whether it still has to be sent
+// (false: the same version is already on its way).
+func (e *Engine) registerWant(peer string, fs *StoreState, rem *Entry, p *pending) bool {
+	if p.entry == nil || p.entry.Blob != rem.Blob {
+		return false
 	}
+	slot := p.slot()
+	e.mu.Lock()
+	if prev := e.wantLocked(fs.name, rem.Path, slot); prev != nil &&
+		(time.Since(prev.asked) < wantRefresh || e.receivingLocked(fs.name, rem.Path)) {
+		// Already asked, and the answer is on its way. The entry to apply
+		// may have moved on (a merged vector), so keep the newer one.
+		prev.entry = p.entry
+		if p.conflictName != "" {
+			prev.conflictName = p.conflictName
+		}
+		e.mu.Unlock()
+		return false
+	}
+	if !p.conflict {
+		e.dropSupersededLocked(fs.name, rem.Path, rem.Blob)
+	}
+	p.asked = time.Now()
+	p.peer = peer
+	p.tried = []string{peer}
+	e.setWantLocked(fs.name, rem.Path, p)
+	e.mu.Unlock()
+	return true
+}
+
+// receivingLocked reports whether a transfer of this path is arriving and
+// moved recently. Callers hold e.mu.
+func (e *Engine) receivingLocked(store, path string) bool {
+	for _, inc := range e.incoming {
+		if inc.store == store && inc.path == path && time.Since(inc.last) < wantRefresh {
+			return true
+		}
+	}
+	return false
 }
 
 // handleRename applies a rename queued on a streamed peer: the holder moves
@@ -574,7 +716,7 @@ func (e *Engine) requestRange(peer string, fs *StoreState, rem *Entry, p *pendin
 // same tree.
 func (e *Engine) handleRename(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
-	if fs == nil || !validRel(fr.Path) || !validRel(fr.To) || len(fr.Moves) == 0 {
+	if fs == nil || !validRel(fr.Path) || !validRel(fr.To) || len(fr.Moves) == 0 || !e.storeSharedWith(fs, peer) {
 		return
 	}
 	if fs.stream {
@@ -582,6 +724,45 @@ func (e *Engine) handleRename(peer string, fr *frame) {
 	}
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
+
+	// Only the shape of a move comes off the wire: which paths, and the
+	// sender's version. What the entry holds is this machine's own record.
+	// Trusting the sender's entry let it name any blob - including a path
+	// outside the content store - and then ask for its bytes.
+	type move struct{ old, moved *Entry }
+	moves := make([]move, 0, len(fr.Moves))
+	for _, mv := range fr.Moves {
+		if mv.New == nil || !validRel(mv.From) || !validRel(mv.New.Path) {
+			continue
+		}
+		var suffix string
+		switch {
+		case mv.From == fr.Path:
+		case strings.HasPrefix(mv.From, fr.Path+"/"):
+			suffix = mv.From[len(fr.Path):]
+		default:
+			continue
+		}
+		if mv.New.Path != fr.To+suffix {
+			continue
+		}
+		loc := fs.db.Get(mv.From)
+		if loc == nil || loc.Deleted {
+			continue
+		}
+		vv := MergeVV(loc.VV, mv.New.VV)
+		moved := loc.clone()
+		moved.Path = mv.New.Path
+		moved.VV = vv
+		moves = append(moves, move{
+			old:   &Entry{Path: mv.From, Deleted: true, Dir: loc.Dir, VV: vv},
+			moved: moved,
+		})
+	}
+	if len(moves) == 0 {
+		return
+	}
+
 	from := filepath.Join(fs.root, fr.Path)
 	to := filepath.Join(fs.root, fr.To)
 	if err := e.ensureDir(fs, filepath.Dir(to)); err != nil {
@@ -600,89 +781,19 @@ func (e *Engine) handleRename(peer string, fr *frame) {
 		return
 	}
 	e.chownPath(fs, to)
-	changed := make([]*Entry, 0, len(fr.Moves)*2)
-	for _, move := range fr.Moves {
-		if move.Old == nil || move.New == nil || !validRel(move.From) || !validRel(move.New.Path) {
-			continue
-		}
-		if err := fs.db.Put(move.Old); err != nil {
-			e.logger.Warn("journal rename tombstone", "store", fs.name, "path", move.From, "error", err)
+	changed := make([]*Entry, 0, len(moves)*2)
+	for _, mv := range moves {
+		if err := fs.db.Put(mv.old); err != nil {
+			e.logger.Warn("journal rename tombstone", "store", fs.name, "path", mv.old.Path, "error", err)
 			return
 		}
-		if err := fs.db.Put(move.New); err != nil {
-			e.logger.Warn("journal renamed entry", "store", fs.name, "path", move.New.Path, "error", err)
+		if err := fs.db.Put(mv.moved); err != nil {
+			e.logger.Warn("journal renamed entry", "store", fs.name, "path", mv.moved.Path, "error", err)
 			return
 		}
-		changed = append(changed, move.Old, move.New)
+		changed = append(changed, mv.old, mv.moved)
 	}
-	e.broadcastIndex(fs, changed)
-}
-
-// --- serving ---------------------------------------------------------------
-
-// handleWant streams a stored blob in chunks.
-func (e *Engine) handleWant(peer string, fr *frame) {
-	fs := e.byName[fr.Store]
-	if fs == nil || !validRel(fr.Path) {
-		return
-	}
-	ent := fs.db.Get(fr.Path)
-	if ent == nil || ent.Deleted || ent.Blob == "" {
-		return
-	}
-	blob, err := e.openEntryBlob(fs, ent)
-	if err != nil {
-		e.logger.Warn("no readable copy for want", "store", fs.name, "path", fr.Path, "blob", ent.Blob, "error", err)
-		return
-	}
-	defer blob.Close()
-
-	offset, length := fr.Offset, fr.Length
-	if offset < 0 || length < 0 || offset > ent.Size || (length > 0 && offset+length > ent.Size) {
-		e.logger.Warn("ranged want out of bounds", "store", fs.name, "path", fr.Path, "offset", offset, "length", length, "size", ent.Size)
-		return
-	}
-	if _, err := io.CopyN(io.Discard, blob, offset); err != nil && err != io.EOF {
-		return
-	}
-	if length > 0 {
-		blob = struct {
-			io.Reader
-			io.Closer
-		}{io.LimitReader(blob, length), blob}
-	}
-
-	buf := make([]byte, store.ChunkSize)
-	seq := 0
-	for {
-		n, rerr := blob.Read(buf)
-		if n > 0 {
-			// Bulk: index frames for every store overtake a transfer in
-			// progress instead of waiting behind gigabytes of video.
-			if err := e.sendBulkTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: seq, Data: buf[:n]}); err != nil {
-				return
-			}
-			seq++
-		}
-		if rerr == io.EOF {
-			// A zero-byte blob yields no data chunk at all, so the receiver
-			// never opened a transfer and dropped the blobEnd on the floor:
-			// empty files, and the directories holding them, never
-			// materialised. Send the empty first chunk to open the transfer.
-			if seq == 0 {
-				if err := e.sendBulkTo(peer, frame{Type: "blob", Store: fs.name, Path: fr.Path, Seq: 0}); err != nil {
-					return
-				}
-			}
-			break
-		}
-		if rerr != nil {
-			return
-		}
-	}
-	if err := e.sendTo(peer, frame{Type: "blobEnd", Store: fs.name, Path: fr.Path, Entry: ent, Offset: fr.Offset, Length: fr.Length}); err != nil {
-		e.logger.Debug("blobEnd", "peer", peer, "error", err)
-	}
+	go e.broadcastIndex(fs, changed)
 }
 
 // handleBlob collects incoming chunks into a temp file. Chunk sequence is
@@ -694,14 +805,23 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 // for a 105-entry store.
 func (e *Engine) handleBlob(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
-	if fs == nil || !validRel(fr.Path) {
+	if fs == nil || !validRel(fr.Path) || !e.storeSharedWith(fs, peer) {
 		return
 	}
-	key := incomeKey(peer, fr.Store, fr.Path)
+	if fr.Blob != "" && !store.ValidSum(fr.Blob) {
+		return
+	}
+	key := incomeKey(peer, fr.Store, fr.Path, fr.Blob)
 
 	e.mu.Lock()
 	inc := e.incoming[key]
 	if inc == nil {
+		if !e.wantedLocked(fr.Store, fr.Path, fr.Blob) {
+			// Nobody asked: an unrequested transfer is at best a duplicate
+			// answer and at worst a peer filling this disk.
+			e.mu.Unlock()
+			return
+		}
 		if fr.Seq != 0 {
 			// Mid-stream chunk with no transfer open: the start was dropped,
 			// so there is nothing this can validly extend.
@@ -713,7 +833,7 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.mu.Unlock()
 			return
 		}
-		inc = &incomingBlob{store: fr.Store, f: f}
+		inc = &incomingBlob{store: fr.Store, path: fr.Path, blob: fr.Blob, f: f, hash: sha256.New()}
 		e.incoming[key] = inc
 	}
 	e.mu.Unlock()
@@ -734,6 +854,7 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.dropIncoming(key, inc)
 			return
 		}
+		inc.hash.Reset()
 		inc.next = 0
 	}
 
@@ -742,62 +863,96 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.dropIncoming(key, inc)
 			return
 		}
+		inc.hash.Write(fr.Data)
 	}
 	inc.next = fr.Seq + 1
+	e.mu.Lock()
+	inc.last = time.Now()
+	e.mu.Unlock()
 }
 
-// handleBlobEnd verifies, stores and applies a completed blob.
+// handleBlobEnd closes a transfer and hands it to a finisher, which verifies,
+// stores and applies it off the chunk worker.
 func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
-	if fs == nil {
+	if fs == nil || !validRel(fr.Path) {
 		return
 	}
-	key := incomeKey(peer, fr.Store, fr.Path)
+	// The version is the sender's name for the bytes; an older sender only
+	// says it in the entry.
+	blob := fr.Blob
+	if blob == "" && fr.Entry != nil {
+		blob = fr.Entry.Blob
+	}
+	key := incomeKey(peer, fr.Store, fr.Path, fr.Blob)
 
 	e.mu.Lock()
 	inc := e.incoming[key]
 	delete(e.incoming, key)
-	want := e.wants[wantKey(fr.Store, fr.Path)]
-	delete(e.wants, wantKey(fr.Store, fr.Path))
+	var wants []*pending
+	if store.ValidSum(blob) {
+		for _, conflict := range []bool{false, true} {
+			if p := e.takeWantLocked(fr.Store, fr.Path, wantSlot(blob, conflict)); p != nil {
+				wants = append(wants, p)
+			}
+		}
+	}
 	e.mu.Unlock()
+	if len(wants) == 0 {
+		// A blobEnd nobody is waiting for - a second peer's answer to a want
+		// the first already satisfied, a version superseded since, or one
+		// never asked for - must not be applied: it carries no version check,
+		// and used to overwrite whatever the path held by then (a bare
+		// zero-byte one truncated any file).
+		if inc != nil {
+			inc.f.Close()
+			os.Remove(inc.f.Name())
+		}
+		return
+	}
+	select {
+	case e.finishSem <- struct{}{}:
+	case <-e.closed:
+		if inc != nil {
+			inc.f.Close()
+			os.Remove(inc.f.Name())
+		}
+		return
+	}
+	e.finishWG.Add(1)
+	go func() {
+		defer e.finishWG.Done()
+		defer func() { <-e.finishSem }()
+		e.finishBlob(peer, fs, fr, blob, inc, wants)
+	}()
+}
+
+// finishBlob verifies a completed transfer against the version that was
+// asked for, adopts it into the content store, and applies every want it
+// satisfies: the update itself, a conflict copy, or both.
+func (e *Engine) finishBlob(peer string, fs *StoreState, fr *frame, blob string, inc *incomingBlob, wants []*pending) {
+	defer e.lockBlob(blob)()
 	if inc == nil {
 		// No transfer was opened. That is legitimate only for a zero-byte
 		// file whose sender never sent a chunk: apply it directly rather than
 		// dropping the want and leaving an empty file missing forever.
-		if ent := fr.Entry; ent != nil && !ent.Deleted && ent.Size == 0 && ent.Blob != "" {
-			if err := e.ensureEmptyBlob(ent.Blob); err != nil {
-				e.logger.Warn("empty blob", "store", fs.name, "path", ent.Path, "error", err)
+		if ent := fr.Entry; ent != nil && !ent.Deleted && ent.Size == 0 && ent.Blob == blob {
+			if err := e.ensureEmptyBlob(blob); err != nil {
+				e.logger.Warn("empty blob", "store", fs.name, "path", fr.Path, "error", err)
 				return
 			}
-			if err := e.applyEntry(fs, ent); err != nil {
-				e.logger.Warn("apply empty entry", "store", fs.name, "path", ent.Path, "error", err)
-			}
+			e.applyWants(fs, wants)
 		}
 		return
 	}
 	defer os.Remove(inc.f.Name())
 
-	// The sender's entry describes the bytes that actually arrived; the
-	// remembered want only says what to do with them. Trusting a stale want's
-	// blob made every arrival fail verification against a hash the sender was
-	// never transmitting, re-request, and loop. Verify against the sender,
-	// then require the want (when there is one) to agree before applying.
-	wantEntry := fr.Entry
-	if wantEntry == nil || wantEntry.Blob == "" {
+	sum := hex.EncodeToString(inc.hash.Sum(nil))
+	if sum != blob {
 		inc.f.Close()
+		e.logger.Warn("blob failed verification", "store", fs.name, "path", fr.Path, "peer", peer, "want", blob, "got", sum)
 		return
 	}
-	if want != nil && want.entry != nil && want.entry.Blob != wantEntry.Blob {
-		// A newer version superseded what this side asked for: keep the bytes
-		// out of the journal and let the next index exchange request the
-		// current one.
-		e.logger.Info("blob superseded before it arrived; dropping it",
-			"store", fs.name, "path", fr.Path, "peer", peer,
-			"asked", want.entry.Blob, "got", wantEntry.Blob)
-		inc.f.Close()
-		return
-	}
-
 	if err := inc.f.Sync(); err != nil {
 		inc.f.Close()
 		return
@@ -805,36 +960,41 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	if err := inc.f.Close(); err != nil {
 		return
 	}
-	sum, err := store.SumFile(inc.f.Name())
-	if err != nil || sum != wantEntry.Blob {
-		e.logger.Warn("blob failed verification", "store", fs.name, "path", fr.Path, "want", wantEntry.Blob, "got", sum)
-		return
-	}
 	if err := e.store.Adopt(inc.f.Name(), sum); err != nil {
 		e.logger.Error("adopt blob", "error", err)
 		return
 	}
+	e.applyWants(fs, wants)
+}
 
-	// The blobs agree, so the want's entry carries the same content with the
-	// merged version vector conflict resolution computed; prefer it so a
-	// resolved pair cannot re-conflict on the next exchange.
-	applyEnt := wantEntry
-	if want != nil && want.entry != nil {
-		applyEnt = want.entry
+// applyWants applies a verified, stored blob to what asked for it. A
+// conflict copy goes first: it copies the blob, and applying the update may
+// move the blob into the tree.
+func (e *Engine) applyWants(fs *StoreState, wants []*pending) {
+	slices.SortFunc(wants, func(a, b *pending) int {
+		switch {
+		case a.conflict == b.conflict:
+			return 0
+		case a.conflict:
+			return -1
+		}
+		return 1
+	})
+	for _, want := range wants {
+		if want.conflict {
+			e.writeConflictCopy(fs, want, want.entry)
+			continue
+		}
+		if err := e.applyEntry(fs, want.entry); err != nil {
+			e.logger.Warn("apply entry", "store", fs.name, "path", want.entry.Path, "error", err)
+			continue
+		}
+		// Fan the applied version out at once. The peer that sent the bytes
+		// is usually a streamed store waiting for proof the holder took them;
+		// it retires its queue entry on that echo rather than on the next
+		// resend.
+		e.broadcastIndex(fs, []*Entry{want.entry})
 	}
-	if want != nil && want.conflict {
-		e.writeConflictCopy(fs, want, applyEnt)
-		return
-	}
-	if err := e.applyEntry(fs, applyEnt); err != nil {
-		e.logger.Warn("apply entry", "store", fs.name, "path", applyEnt.Path, "error", err)
-		return
-	}
-	// Fan the applied version out at once. The peer that sent the bytes is
-	// usually a streamed store waiting for proof the holder took them; it
-	// retires its queue entry on that echo rather than on the next
-	// half-minute resend.
-	e.broadcastIndex(fs, []*Entry{applyEnt})
 }
 
 // ensureEmptyBlob stores the zero-byte blob under sum, verifying the name is
@@ -886,7 +1046,6 @@ func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
 		}
 		_ = fs.db.Put(copyEnt)
 		fs.queueMu.Unlock()
-		e.refreshTree(fs)
 		e.broadcastIndex(fs, []*Entry{copyEnt})
 		return
 	}
@@ -926,7 +1085,6 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 		fs.scanMu.Lock()
 		err := fs.db.Put(ent)
 		fs.scanMu.Unlock()
-		e.refreshTree(fs)
 		return err
 	}
 	// Held across the write so a mount transition cannot swap the root out
@@ -951,6 +1109,15 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	// directory wins (the same rule handleDirEntry applies), and the file is
 	// parked so its bytes survive. Without this the child could never be
 	// written and the clash would never converge.
+	// The want went out some time ago. If a newer (or concurrent) version
+	// was recorded here since - a local edit the scanner picked up while the
+	// bytes were in flight - the arriving one must not land over it. The
+	// next index exchange orders the two properly, with a conflict copy if
+	// they really are concurrent.
+	if cur := fs.db.Get(ent.Path); cur != nil && !Dominates(ent.VV, cur.VV) {
+		return fmt.Errorf("%s: the arriving version does not supersede the one recorded here; leaving it to the next exchange", ent.Path)
+	}
+
 	if err := e.unblockParents(fs, ent.Path); err != nil {
 		return err
 	}
@@ -967,7 +1134,13 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 				}
 				name := conflictPath(ent.Path, sum)
 				parked := filepath.Join(fs.root, name)
-				if rerr := os.Rename(dst, parked); rerr == nil {
+				rerr := os.Rename(dst, parked)
+				if rerr != nil {
+					// Parking failed: overwriting now would destroy the only
+					// copy of an edit the mesh has not seen.
+					return fmt.Errorf("%s: cannot park an unsynced local change: %w", ent.Path, rerr)
+				}
+				{
 					e.chownPath(fs, parked)
 					parkEnt := &Entry{
 						Path:  name,
@@ -986,7 +1159,12 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 		}
 	}
 
-	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
+	// When the content-store copy would be released right after the write
+	// (no history wants it), move it into the tree instead of copying: the
+	// same end state, without reading and writing a 20 GiB file under the
+	// scan lock.
+	consume := !e.wantsBlob(fs, ent.Path, ent.Blob)
+	if err := e.placeBlob(fs, dst, ent.Blob, ent.Mode, ent.MTime, consume); err != nil {
 		return err
 	}
 	// The file is now here: from now on its absence means a deletion rather
@@ -1017,6 +1195,10 @@ func (e *Engine) unblockParents(fs *StoreState, path string) error {
 		if copyEnt := e.saveLocalConflictLocked(fs, loc); copyEnt != nil {
 			parked = copyEnt.Path
 			e.broadcastIndex(fs, []*Entry{copyEnt})
+		} else if info, err := os.Lstat(filepath.Join(fs.root, dir)); err == nil && info.Mode().IsRegular() {
+			// The file is still there and could not be parked (a full
+			// disk, say). Removing it would delete the user's bytes.
+			return fmt.Errorf("%s: cannot park the file a directory must replace", dir)
 		}
 		if tomb := e.tombstoneEntry(fs, loc); tomb != nil {
 			e.broadcastIndex(fs, []*Entry{tomb})
@@ -1035,12 +1217,13 @@ func (e *Engine) unblockParents(fs *StoreState, path string) error {
 // one it mirrors, both for the tools that sort by it (photos, videos) and
 // for the scanner, whose fast path is "size and mtime unchanged".
 func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime int64) error {
-	blob, err := e.store.Open(sum)
-	if err != nil {
-		return err
-	}
-	defer blob.Close()
+	return e.placeBlob(fs, dst, sum, mode, mtime, false)
+}
 
+// placeBlob is writeBlobTo, optionally taking the content-store copy instead
+// of copying it (consume). Taking it is a rename when the store and the tree
+// share a filesystem; otherwise it falls back to the copy.
+func (e *Engine) placeBlob(fs *StoreState, dst, sum string, mode uint32, mtime int64, consume bool) error {
 	if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 		return err
 	}
@@ -1051,35 +1234,67 @@ func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime
 		return err
 	}
 	tmp := f.Name()
-	if _, err := io.Copy(f, blob); err != nil {
+	moved := false
+	if consume {
 		f.Close()
-		os.Remove(tmp)
-		return err
+		if err := os.Rename(e.store.BlobPath(sum), tmp); err == nil {
+			moved = true
+		} else if f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_TRUNC, 0o600); err != nil {
+			os.Remove(tmp)
+			return err
+		}
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
+	if !moved {
+		blob, err := e.store.Open(sum)
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		// Between two files io.Copy is copy_file_range: in-kernel, and a
+		// reflink on filesystems that share extents.
+		_, err = io.Copy(f, blob)
+		blob.Close()
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(tmp)
+			return err
+		}
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
-		return err
-	}
+	// Mode, owner and mtime go on before the rename, so the file never
+	// appears at its path looking like anything but what it mirrors.
 	perm := os.FileMode(mode)
 	if perm == 0 {
 		perm = 0o644
 	}
-	_ = os.Chmod(dst, perm.Perm())
-	e.chownPath(fs, dst)
+	_ = os.Chmod(tmp, perm.Perm())
+	e.chownPath(fs, tmp)
 	if mtime != 0 {
 		when := time.Unix(0, mtime)
-		if err := os.Chtimes(dst, when, when); err != nil {
+		if err := os.Chtimes(tmp, when, when); err != nil {
 			e.logger.Warn("set mtime", "store", fs.name, "path", dst, "error", err)
 		}
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		if moved {
+			// The content store's copy is in tmp: put it back rather than
+			// lose the only one.
+			if rerr := os.Rename(tmp, e.store.BlobPath(sum)); rerr != nil {
+				os.Remove(tmp)
+			}
+		} else {
+			os.Remove(tmp)
+		}
+		return err
 	}
 	return nil
 }

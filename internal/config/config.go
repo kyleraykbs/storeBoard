@@ -423,6 +423,14 @@ func Parse(raw []byte) (*Config, error) {
 	if cfg.Socket == "" {
 		cfg.Socket = DefaultSocketPath()
 	}
+	// Paths are compared with each other below (dataDir against the store
+	// dirs) and against the daemon's own view: "/srv/sb/" and "/srv/sb" must
+	// be one root, or the dataDir checks are trivially sidestepped by a slash.
+	for _, p := range []*string{&cfg.Root, &cfg.DataDir, &cfg.Socket} {
+		if *p != "" {
+			*p = filepath.Clean(*p)
+		}
+	}
 
 	// Maps decode into whatever the file leaves behind (or nil when absent);
 	// normalize so callers never branch on nil.
@@ -485,6 +493,9 @@ func (c *Config) Validate() error {
 	}
 	if !filepath.IsAbs(c.Socket) {
 		return fmt.Errorf("socket %q: path must be absolute", c.Socket)
+	}
+	if err := c.checkDataDir(); err != nil {
+		return err
 	}
 
 	if c.Peer != "" {
@@ -559,6 +570,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("store %q: preferred peer %q is not in group %q", v.ID, v.Preferred, v.Group)
 			}
 		}
+		if err := v.Permissions.Validate(fmt.Sprintf("store %s permissions", v.ID)); err != nil {
+			return err
+		}
 		if v.Offline != nil {
 			switch v.Offline.Policy {
 			case "", StreamQueueUnbounded, StreamQueueCapped, StreamQueueReadOnly:
@@ -620,6 +634,16 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("store %q links to itself", v.ID)
 			}
 		}
+		// A link is a symlink the daemon creates at its path. With `a: "x"`
+		// and `b: "x/y"`, creating b's link means writing through a's — into
+		// store a's canonical dir — and which one wins depends on map order.
+		for pa, ta := range seenPaths {
+			for pb, tb := range seenPaths {
+				if containsPath(pa, pb) {
+					return fmt.Errorf("store %q links %q (%s) and %q (%s) nest: one link cannot sit inside another", v.ID, ta, pa, tb, pb)
+				}
+			}
+		}
 	}
 	if err := c.checkLinkCycles(); err != nil {
 		return err
@@ -642,6 +666,30 @@ func (c *Config) Validate() error {
 		if err := p.Validate(fmt.Sprintf("permissions %s", store)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkDataDir keeps the daemon's state out of the content it indexes. A
+// dataDir inside a store's canonical dir is scanned as that store — the
+// journals journal themselves and every blob syncs to every peer — and a
+// dataDir equal to the root sits where stores do. The one place under the
+// root it may live is <root>/.storeboard, the default: store ids may not start
+// with a dot, so that name can never be a store, and the orphan report skips
+// it. Any other directory under the root would read as an unconfigured store
+// today, and as a real one the day a store of that name is declared.
+func (c *Config) checkDataDir() error {
+	if c.DataDir == c.Root {
+		return fmt.Errorf("dataDir %q is the root itself; the default is %s", c.DataDir, filepath.Join(c.Root, StateDirName))
+	}
+	for id := range c.StoreTree {
+		dir := filepath.Join(c.Root, id)
+		if c.DataDir == dir || containsPath(dir, c.DataDir) {
+			return fmt.Errorf("dataDir %q is inside store %q (%s): the daemon would index its own state", c.DataDir, id, dir)
+		}
+	}
+	if containsPath(c.Root, c.DataDir) && c.DataDir != filepath.Join(c.Root, StateDirName) {
+		return fmt.Errorf("dataDir %q is under the root %s: the only state directory allowed there is %s", c.DataDir, c.Root, filepath.Join(c.Root, StateDirName))
 	}
 	return nil
 }

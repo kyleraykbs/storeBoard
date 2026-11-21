@@ -150,18 +150,24 @@ same window.
     storeboard backup list photos "Screenshots/old.png"
     storeboard backup restore photos "Screenshots/old.png" --at 2026-09-01T10:00:00Z
     storeboard backup restore photos "gone.png"     # a deleted file comes back
-    storeboard backup restore photos notes.md --to /tmp/notes.old
+    storeboard backup restore photos notes.md --to ~/notes.old
+
+`--to` writes a copy instead of a new version, and only where you could have
+written it yourself: an existing directory you own (root may write anywhere),
+never onto a symlink or someone else's file. It is not available for a store
+streamed on this machine — restore into the store and copy the file out.
 
 ## Send a file
 
     storeboard send photos holiday.jpg --as "2026/holiday.jpg"
 
 Copies a local file into a store: from then on it is an ordinary local change
-— indexed at once, recorded in the history, synced onwards. Nothing is
-overwritten; a name already taken parks the existing file under the same
-deterministic conflict name the merge uses and reports where. The daemon does
-the copying, so the file must be one it can see (the same machine, in
-practice), and root or the store's owner is the only caller allowed.
+— indexed at once, recorded in the history, synced onwards. The original stays
+where it was. Nothing is overwritten; a name already taken parks the existing
+file under the same deterministic conflict name the merge uses and reports
+where. The daemon does the copying, so the file must be one it can see (the
+same machine, in practice) and a regular file you own — not a symlink — and
+root or the store's owner is the only caller allowed.
 
 The phone's share sheet is the same verb, one layer down: the app's UI calls
 the engine directly (there is no socket inside an app), and a shared file is
@@ -175,6 +181,12 @@ are two doors onto one operation.
 
 `status --json` is the daemon's `/v1/status` document verbatim (HTTP over
 the unix socket); human output is free to change, JSON shapes are not.
+
+`storeboard doctor` checks the daemon over and says what is wrong in words:
+free disk, each peer (reachable, clock skew), each store (mount alive, root
+not unmounted, queued writes, holder reachable, conflicts, scans), and stalled
+transfers. It exits non-zero only when a check failed, so it can gate a timer
+or a deploy; `--json` is the `/v1/doctor` document.
 
 ## NixOS / home-manager
 

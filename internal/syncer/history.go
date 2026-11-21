@@ -68,6 +68,11 @@ func OpenHistory(path string, keep time.Duration) (*History, error) {
 			h.byPath[rec.Path] = append(h.byPath[rec.Path], rec.Version)
 		}
 		f.Close()
+		if err := sc.Err(); err != nil {
+			// The compaction below rewrites the file from what was read: a
+			// read error here would silently truncate the history for good.
+			return nil, fmt.Errorf("history %s: %w", path, err)
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("history: %w", err)
 	}
@@ -256,6 +261,14 @@ func (h *History) rewriteLocked() error {
 	if err := os.Rename(tmp, h.path); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	// The append handle still points at the inode that was just replaced.
+	// Every version recorded after the first prune went to that unlinked
+	// file and vanished at the next restart - and the collector then freed
+	// their blobs. Reopen on the next append.
+	if h.f != nil {
+		h.f.Close()
+		h.f = nil
 	}
 	return nil
 }

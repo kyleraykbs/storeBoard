@@ -16,10 +16,40 @@ and its own history.
 - `SyncService.kt` — a `dataSync` foreground service. On Android a socket in
   a background process is killed with the process, and a peer that vanishes
   is not a peer. The service is the engine's only owner.
+- `StoreboardDocumentsProvider.kt` — the stores in the Files app and the
+  system file picker (below).
 - `MainActivity.kt` — one screen: engine state, the status document
   rendered, the config it reads, the log tail, a file picker, and the share
   sheet. A file shared into storeboard is copied in and sent into the camera
   store.
+
+## Files integration
+
+`StoreboardDocumentsProvider.kt` puts every store in the system file picker
+and the Files app — the phone's counterpart of the desktop's mount. Each
+store is a root; document ids are `store` or `store/relative/path`. Folders
+come from the journal (`Daemon.Browse`/`Stat`), so a streamed store lists in
+full with none of its bytes on the phone.
+
+Opening a file:
+
+- bytes here and current (a replica store's file that has arrived): the file
+  itself is opened (`Daemon.LocalPath`), read or written. A write is an
+  ordinary local change; the scanner records and syncs it.
+- anything else (a streamed store, or a replica file still on its way): a
+  proxy descriptor whose reads call `Daemon.ReadAt`, which fetches the range
+  from a holder. Each read pulls a 1 MiB window ahead, on a thread per open
+  file, so a video plays without being downloaded first. These are
+  read-only; asking for write fails.
+
+The provider does not own the engine; the service does. While it is stopped
+there are no roots (a folder already open says "storeboard is not running"),
+and the stores appear on their own when it starts. The provider does not
+start the service itself: that would undo the stop button, and Android 12+
+refuses a foreground service started from the background. Creating,
+renaming and deleting through the Files app are not offered yet, nor are
+search, recents and thumbnails; a folder refreshes when the engine starts or
+stops, not yet when a peer changes it.
 
 ## Building
 

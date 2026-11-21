@@ -71,7 +71,11 @@ one, it changes here first, deliberately, with a decision log entry.
     CLI can read status; an acting verb (today: `store takeover`, `send`,
     `backup restore`) checks the requesting uid through the socket's peer
     credentials and allows only root or the store's owner — a refusal, not a
-    guess, when the uid cannot be read.
+    guess, when the uid cannot be read. `backup list` names every file a store
+    ever held and is authorized the same way. A path the caller names is the
+    caller's to name: `send` reads only a regular file the caller owns, and
+    copies it; `restore --to` writes only into an existing directory the
+    caller owns, and is never forwarded to a holder.
 12. Peers are declared, never invented: the config (Nix-generated) is the
     authoritative peer list, and the daemon learns a peer only from it.
     Address discovery (DNS, NAT traversal) may layer on top later;
@@ -179,7 +183,22 @@ owned by storeboard, and file bytes are not retained on this machine.
   mounting FUSE or silently keeping a second mirror.
 - Peers exchange index deltas; a side that lacks or is behind a version asks
   for the blob (`want` → `blob` chunks → `blobEnd`); a side that is ahead
-  pushes its index entry. Concurrent edits resolve deterministically (newer
+  pushes its index entry. A want names the exact version (`blob`, its
+  sha256): the holder serves those bytes from its content store, the file at
+  the path, or any other file holding the same content, and answers
+  `wantErr` when it has none, so the asker moves on to another peer. The
+  receiver hashes chunks as they arrive and verifies against the version it
+  asked for. Outgoing transfers run off the frame workers, a few per peer, in
+  a lane for files over 16 MiB and one for the rest, so a large file slows
+  small ones but never blocks them.
+- On connect, and as a safety net every 30 s while the journal moves (10 min
+  otherwise), peers that advertise the `digest` feature in their hello trade
+  an index digest instead of the whole index: the journal hashed into up to
+  4096 buckets by path. The receiver sends its entries for the buckets that
+  differ and `pull`s the sender's for the same buckets; both then apply the
+  ordinary rules. An entry a side has not finished with (bytes not yet here,
+  a write still queued for a holder) hashes differently, so it is retried.
+  Peers without the feature get full indexes as before. Concurrent edits resolve deterministically (newer
   mtime wins, blob hash breaks ties): the winner keeps the path on both
   machines, the loser is parked as `<name>.conflict-<blob8>` and indexed like
   any other file, so conflict copies themselves replicate.
@@ -203,9 +222,10 @@ owned by storeboard, and file bytes are not retained on this machine.
 - 9, 10: forward-looking — policies/hooks and min/max protocol negotiation
   do not exist yet.
 - 11: acting verbs exist and are authorized per caller: `store takeover`,
-  `send`, `backup restore` (socket peer credentials, root or the store's
-  owner, refusal when the uid cannot be read); everything else on the socket
-  is status-grade.
+  `send`, `backup restore`, and the `backup list` read (socket peer
+  credentials, root or the store's owner, refusal when the uid cannot be
+  read); `send` sources and `restore --to` targets are checked against the
+  caller's uid too. Everything else on the socket is status-grade.
 - 12: config-only peers; the transport rejects undeclared names.
 - 13: canonical dirs under root, child links and external symlinks created
   and reported; the scanner skips every symlink. Covered by
@@ -219,8 +239,12 @@ owned by storeboard, and file bytes are not retained on this machine.
   `TestScanNeverTombstonesUnmaterialisedEntries`).
 - 17: per-store/group/inherited permissions, re-applied on every scan.
 - The peer wire is newline-delimited JSON over TCP. Both sides open with a
-  hello (protocol, name, version); a disagreement on the protocol version
-  ends the connection, and a name that is not declared in config is rejected.
+  hello (protocol, name, version, clock, features); a disagreement on the
+  protocol version ends the connection, and a name that is not declared in
+  config is rejected. The clock gives the peer's skew, logged and reported by
+  `storeboard doctor` past 2 s, because conflicts are decided by mtime. A
+  write to a peer that has stopped reading waits as long as the peer is still
+  heard from; only a silent peer loses the link.
   Unknown frames are tolerated and noted. TLS with device certificates,
   built on the threat model, precedes anything sensitive.
 - Version history is opt-in per machine and thinned by a fixed schedule: the

@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -686,6 +687,8 @@ func TestBlobFramesProgressWhileIndexApplyIsBlocked(t *testing.T) {
 	n.eng.OnPeerFrame("a", index)
 	time.Sleep(20 * time.Millisecond)
 
+	// A transfer is only accepted for something this side asked for.
+	n.eng.addWant("docs", &pending{entry: &Entry{Path: "new.txt"}})
 	blob, err := json.Marshal(frame{Type: "blob", Store: "docs", Path: "new.txt", Data: []byte("new")})
 	if err != nil {
 		t.Fatal(err)
@@ -718,9 +721,7 @@ func TestEqualEntryWithMissingBytesRequestsBlob(t *testing.T) {
 	}
 	n.eng.OnPeerFrame("a", line)
 	waitFor(t, 2*time.Second, "want for equal entry with missing bytes", func() bool {
-		n.eng.mu.Lock()
-		defer n.eng.mu.Unlock()
-		return n.eng.wants[wantKey("docs", "missing.txt")] != nil
+		return n.eng.isWanted("docs", "missing.txt")
 	})
 }
 
@@ -1074,6 +1075,9 @@ func TestRestartedBlobTransferReplacesPartialBytes(t *testing.T) {
 		VV:    map[string]uint64{"b": 1},
 	}
 
+	// This side asked for it; an unrequested transfer is refused.
+	n.eng.addWant("docs", &pending{entry: ent})
+
 	// An abandoned first attempt: the opening chunk arrives and the rest
 	// never does.
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 0, Data: []byte("stale bytes")})
@@ -1083,6 +1087,7 @@ func TestRestartedBlobTransferReplacesPartialBytes(t *testing.T) {
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 0, Data: []byte(content[:half])})
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: ent.Path, Seq: 1, Data: []byte(content[half:])})
 	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: ent.Path, Entry: ent})
+	n.eng.finishWG.Wait()
 
 	// Verification is what let the apply happen: the bytes on disk are the
 	// restarted stream, not the abandoned one.
@@ -1106,7 +1111,7 @@ func TestOutOfOrderBlobChunkAbandonsTransfer(t *testing.T) {
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: "gap.bin", Seq: 7, Data: []byte("jumped")})
 
 	n.eng.mu.Lock()
-	_, open := n.eng.incoming[incomeKey("b", "docs", "gap.bin")]
+	_, open := n.eng.incoming[incomeKey("b", "docs", "gap.bin", "")]
 	n.eng.mu.Unlock()
 	if open {
 		t.Fatal("an out-of-order chunk left the transfer open")
@@ -1134,25 +1139,27 @@ func TestSupersededWantDropsArrivingBlob(t *testing.T) {
 		VV:    map[string]uint64{"b": 2},
 	}
 	// This side is still waiting on an older version's content.
-	n.eng.mu.Lock()
-	n.eng.wants[wantKey("docs", sent.Path)] = &pending{entry: &Entry{
+	n.eng.addWant("docs", &pending{entry: &Entry{
 		Path: sent.Path,
 		Blob: strings.Repeat("0", 64),
 		VV:   map[string]uint64{"b": 1},
-	}}
-	n.eng.mu.Unlock()
+	}})
 
 	n.eng.handleBlob("b", &frame{Type: "blob", Store: "docs", Path: sent.Path, Seq: 0, Data: []byte(arrived)})
 	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: sent.Path, Entry: sent})
+	n.eng.finishWG.Wait()
 
 	if exists(filepath.Join(n.root("docs"), sent.Path)) {
 		t.Fatal("a superseded want materialised content the journal never asked for")
 	}
+	// Asking for the newer version retires the older want, so nothing keeps
+	// waiting on bytes no peer will send.
+	n.eng.request("b", n.store("docs"), sent, &pending{entry: sent})
 	n.eng.mu.Lock()
-	_, stillWanted := n.eng.wants[wantKey("docs", sent.Path)]
+	stale := n.eng.wantLocked("docs", sent.Path, strings.Repeat("0", 64))
 	n.eng.mu.Unlock()
-	if stillWanted {
-		t.Fatal("the stale want survived, so the request will loop")
+	if stale != nil {
+		t.Fatal("the stale want survived a request for the newer version")
 	}
 }
 
@@ -1248,10 +1255,7 @@ func TestOneBusyStoreDoesNotStarveAnother(t *testing.T) {
 	n.eng.OnPeerFrame("b", mustFrame(t, frame{Type: "index", Store: "quick", Entries: []*Entry{ent}}))
 
 	waitFor(t, 20*time.Second, "the quick store to request its blob", func() bool {
-		n.eng.mu.Lock()
-		_, asked := n.eng.wants[wantKey("quick", ent.Path)]
-		n.eng.mu.Unlock()
-		return asked
+		return n.eng.isWanted("quick", ent.Path)
 	})
 }
 
@@ -1328,6 +1332,7 @@ func TestBlobChunksAreBulkAndIndexIsControl(t *testing.T) {
 
 	n.eng.broadcastIndex(fs, fs.db.All())
 	n.eng.handleWant("b", &frame{Type: "want", Store: "docs", Path: "big.bin"})
+	n.eng.sendWG.Wait()
 
 	rec.mu.Lock()
 	control, bulk := len(rec.control), len(rec.bulk)
@@ -1378,10 +1383,7 @@ func TestBusyWantDoesNotBlockAnotherStoresIndex(t *testing.T) {
 	n.eng.OnPeerFrame("b", mustFrame(t, frame{Type: "index", Store: "quick", Entries: []*Entry{ent}}))
 
 	waitFor(t, 20*time.Second, "the quick store to request its blob", func() bool {
-		n.eng.mu.Lock()
-		_, asked := n.eng.wants[wantKey("quick", ent.Path)]
-		n.eng.mu.Unlock()
-		return asked
+		return n.eng.isWanted("quick", ent.Path)
 	})
 	close(release)
 }
@@ -1667,5 +1669,109 @@ func TestDeleteParksAnUnsyncedEdit(t *testing.T) {
 	}
 	if got := readFile(t, copies[0]); got != edited {
 		t.Fatalf("parked content = %q, want the edit", got)
+	}
+}
+
+// A blob nobody asked for is never applied: not a duplicate answer, and not
+// a bare zero-byte blobEnd, which used to truncate whatever file it named.
+func TestUnrequestedBlobEndIsIgnored(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	writeFile(t, filepath.Join(fs.root, "keep.txt"), "precious", time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	empty, _ := store.Sum(strings.NewReader(""))
+	n.eng.handleBlobEnd("b", &frame{Type: "blobEnd", Store: "docs", Path: "keep.txt", Entry: &Entry{
+		Path: "keep.txt", Blob: empty, Size: 0, VV: map[string]uint64{"b": 99, "a": 99},
+	}})
+	if got := readFile(t, filepath.Join(fs.root, "keep.txt")); got != "precious" {
+		t.Fatalf("unrequested blobEnd rewrote the file to %q", got)
+	}
+}
+
+// A rename frame's entries are rebuilt from the holder's own journal: the
+// sender cannot name a blob of its choosing.
+func TestRenameFrameCannotInjectBlob(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	writeFile(t, filepath.Join(fs.root, "x.txt"), "x", time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	real := fs.db.Get("x.txt")
+	n.eng.handleRename("b", &frame{Type: "rename", Store: "docs", Path: "x.txt", To: "y.txt", Moves: []renameMove{{
+		From: "x.txt",
+		Old:  &Entry{Path: "x.txt", Deleted: true},
+		New:  &Entry{Path: "y.txt", Blob: "../../../../etc/passwd", VV: map[string]uint64{"b": 5}},
+	}}})
+	got := fs.db.Get("y.txt")
+	if got == nil || got.Blob != real.Blob {
+		t.Fatalf("renamed entry = %+v, want blob %s", got, real.Blob)
+	}
+}
+
+// A root that comes back empty while this machine held a library is a disk
+// that did not mount, not a mass deletion.
+func TestEmptyRootIsNotAMassDeletion(t *testing.T) {
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	for i := range massDeleteFloor + 5 {
+		writeFile(t, filepath.Join(fs.root, fmt.Sprintf("photo%03d.jpg", i)), fmt.Sprintf("bytes %d", i), time.Now())
+	}
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(fs.root); err != nil {
+		t.Fatal(err)
+	}
+	// Missing entirely: no scan at all.
+	if changed, err := n.eng.scan(fs, true); err == nil || len(changed) != 0 {
+		t.Fatalf("scan of a missing root: changed=%d err=%v", len(changed), err)
+	}
+	// Recreated empty: scanned, but nothing is tombstoned.
+	if err := os.MkdirAll(fs.root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range fs.db.All() {
+		if ent.Deleted {
+			t.Fatalf("%s was tombstoned by an empty root", ent.Path)
+		}
+	}
+}
+
+// One unreadable directory must not stop the rest of the store from syncing,
+// and what is inside it is unseen, not deleted.
+func TestUnreadableDirectoryIsSkippedNotDeleted(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every directory")
+	}
+	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
+	n.prepareAll()
+	fs := n.store("docs")
+	writeFile(t, filepath.Join(fs.root, "a-locked", "inside.txt"), "inside", time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(fs.root, "a-locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	writeFile(t, filepath.Join(fs.root, "z-after.txt"), "after", time.Now())
+	if _, err := n.eng.scan(fs, true); err != nil {
+		t.Fatalf("scan stopped at an unreadable directory: %v", err)
+	}
+	if ent := fs.db.Get("z-after.txt"); ent == nil || ent.Deleted {
+		t.Fatalf("file after the unreadable directory was not indexed: %+v", ent)
+	}
+	if ent := fs.db.Get("a-locked/inside.txt"); ent == nil || ent.Deleted {
+		t.Fatalf("file inside the unreadable directory was tombstoned: %+v", ent)
 	}
 }

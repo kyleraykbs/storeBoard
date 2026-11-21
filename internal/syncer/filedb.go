@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -63,6 +64,31 @@ type FileDB struct {
 	entries map[string]*Entry
 	counter uint64
 	closed  bool
+	// observe, when set, sees every change to the in-memory state, in order.
+	// It runs under the journal lock, so it must be cheap and must never
+	// call back into the journal.
+	observe func(*Entry)
+	// gen counts changes to the in-memory state.
+	gen uint64
+}
+
+// Gen is a counter that moves whenever the journal's state changes.
+func (d *FileDB) Gen() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.gen
+}
+
+// Observe hands fn every current entry, then every later change, with no gap
+// between the two: a view built this way can never miss an update that raced
+// its construction. fn runs under the journal lock.
+func (d *FileDB) Observe(fn func(*Entry)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, ent := range d.entries {
+		fn(ent.clone())
+	}
+	d.observe = fn
 }
 
 // OpenFileDB replays the log at path (absent: a fresh journal) and rewrites
@@ -89,6 +115,11 @@ func OpenFileDB(path, me string) (*FileDB, error) {
 			}
 		}
 		f.Close()
+		if err := sc.Err(); err != nil {
+			// The checkpoint below rewrites the journal from what was read:
+			// carrying on after a read error would truncate it for good.
+			return nil, fmt.Errorf("journal %s: %w", path, err)
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("journal: %w", err)
 	}
@@ -173,6 +204,18 @@ func (d *FileDB) putLocked(e *Entry) error {
 		return nil
 	}
 	d.entries[e.Path] = e.clone()
+	d.gen++
+	// This machine's counter must stay ahead of every version carrying its
+	// name - including ones it learns back from peers after its own journal
+	// was lost (a reinstalled phone). A counter that restarted at 1 made
+	// every new local edit look older than the last one, and peers pushed
+	// the old version back over it.
+	if c := e.VV[d.me]; c > d.counter {
+		d.counter = c
+	}
+	if d.observe != nil {
+		d.observe(e.clone())
+	}
 	if d.closed {
 		// Shutdown raced a scan: the in-memory state is updated, the log
 		// line is the only casualty, and the next start replays whatever
@@ -227,6 +270,37 @@ func (d *FileDB) All() []*Entry {
 	for _, p := range d.pathsLocked() {
 		out = append(out, d.entries[p].clone())
 	}
+	return out
+}
+
+// Under returns the entries at path or beneath it, sorted. It scans without
+// copying the entries it skips, which matters on a large store where a rename
+// in a FUSE handler used to clone and sort the whole journal.
+func (d *FileDB) Under(path string) []*Entry {
+	prefix := path + "/"
+	d.mu.Lock()
+	var out []*Entry
+	for p, ent := range d.entries {
+		if p == path || strings.HasPrefix(p, prefix) {
+			out = append(out, ent.clone())
+		}
+	}
+	d.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// WithBlob returns the live entries holding this content, sorted by path.
+func (d *FileDB) WithBlob(blob string) []*Entry {
+	d.mu.Lock()
+	var out []*Entry
+	for _, ent := range d.entries {
+		if ent.Blob == blob && !ent.Deleted && !ent.Dir {
+			out = append(out, ent.clone())
+		}
+	}
+	d.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
 }
 

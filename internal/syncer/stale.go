@@ -45,7 +45,6 @@ func (e *Engine) cleanupStaleAtomic(fs *StoreState, ent *Entry) {
 			return
 		}
 		fs.queueMu.Unlock()
-		e.refreshTree(fs)
 		e.broadcastIndex(fs, []*Entry{tomb})
 		go e.flushQueue(fs)
 		e.logger.Info("removed stale atomic-save artifact", "store", fs.name, "path", ent.Path)

@@ -67,45 +67,67 @@ class MainActivity : ComponentActivity() {
         }
 
         if (!Engine.running()) SyncService.start(this)
-        handleSend(intent)
+        // A recreated activity (rotation, process restore) carries the same
+        // launching intent; only a fresh launch is a new share, or every
+        // rotation would send the file again.
+        if (savedInstanceState == null) handleSend(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleSend(intent)
     }
 
     /** A file shared into storeboard is a send into the camera folder. */
     private fun handleSend(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
+        // Reopened from recents, the activity is handed the share that
+        // launched it the first time; that file was already sent.
+        if ((intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return
         val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+        // Consumed: nothing that reads this intent again may send it twice.
+        intent.action = null
         if (uri != null) sendUri(uri)
     }
 
     fun sendUri(uri: Uri) {
         lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { send(uri) }
+            val result = withContext(Dispatchers.IO) {
+                // On a cold start the share arrives before the service has
+                // brought the engine up; wait for it rather than failing.
+                if (Engine.awaitRunning()) {
+                    send(uri)
+                } else {
+                    "send failed: ${Engine.lastError ?: "the engine did not start"}"
+                }
+            }
             Toast.makeText(this@MainActivity, result, Toast.LENGTH_LONG).show()
         }
     }
 
     // The engine writes into its own directories, so a shared file is copied
     // in first: the share sheet hands over a URI, the mesh deals in paths.
+    // The engine copies, never moves, so the cache copy is this side's to
+    // delete — whether or not the send succeeded.
     private fun send(uri: Uri): String {
+        var copy: File? = null
         return try {
             val name = displayName(uri)
             val inbox = File(cacheDir, "shared").apply { mkdirs() }
-            val copy = File(inbox, name)
+            val file = File(inbox, name)
+            copy = file
             contentResolver.openInputStream(uri)?.use { input ->
-                copy.outputStream().use { output -> input.copyTo(output) }
+                file.outputStream().use { output -> input.copyTo(output) }
             } ?: return "could not read $name"
 
-            val raw = Engine.send("camera", copy, "shared/$name")
+            val raw = Engine.send("camera", file, "shared/$name")
             val sent = JSONObject(raw)
-            copy.delete()
             "sent ${sent.optString("path")} (${sent.optLong("size")} bytes)"
         } catch (e: Exception) {
             "send failed: ${e.message}"
+        } finally {
+            copy?.delete()
         }
     }
 
@@ -134,10 +156,16 @@ private fun App() {
         config = Engine.configFile(activity).takeIf { it.exists() }?.readText()
             ?: Engine.defaultConfig(activity)
         while (true) {
+            // status() marshals the whole document through the engine and
+            // tail() reads the log file: both are off the main thread, and
+            // only the assignments come back to it.
+            val polled = withContext(Dispatchers.IO) {
+                listOf(Engine.status(), Engine.lastError ?: "", tail(Engine.logFile(activity)))
+            }
             running = Engine.running()
-            status = Engine.status()
-            error = Engine.lastError ?: ""
-            log = tail(Engine.logFile(activity))
+            status = polled[0]
+            error = polled[1]
+            log = polled[2]
             delay(2000)
         }
     }

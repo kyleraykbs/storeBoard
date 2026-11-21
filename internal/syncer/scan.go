@@ -3,6 +3,7 @@ package syncer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,21 @@ import (
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 )
+
+// underAny reports whether p is one of dirs or lies beneath one.
+func underAny(p string, dirs []string) bool {
+	for _, d := range dirs {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// massDeleteFloor is the number of held files above which an entirely empty
+// root is treated as unavailable rather than emptied. A small store can
+// still be cleared by hand; a library cannot vanish because a disk did.
+const massDeleteFloor = 20
 
 // tmpPrefix marks scratch files the daemon writes inside store roots; the
 // scanner never indexes them.
@@ -31,6 +47,15 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	defer fs.scanMu.Unlock()
 
 	root := fs.root
+	// A root that is missing or not a directory is a pool that is not
+	// mounted, not a store whose files were all deleted. Walking it reported
+	// nothing, and every file became a tombstone the mesh then applied.
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		if err == nil {
+			err = fmt.Errorf("%s is not a directory", root)
+		}
+		return nil, fmt.Errorf("store root unavailable; not scanning: %w", err)
+	}
 	fs.setScanning(true)
 	defer fs.setScanning(false)
 	seen := make(map[string]bool)
@@ -38,12 +63,29 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	var changed []*Entry
 	var unmaterialised int
 
+	// Subtrees the walk could not read. Their entries are not absent, only
+	// unseen, so they are never tombstoned; the rest of the store still
+	// scans. Aborting on the first unreadable directory stopped every file
+	// after it, in lexical order, from ever syncing.
+	var unreadable []string
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil // vanished mid-walk: tombstoning below covers it
 			}
-			return err
+			if path == root {
+				return err
+			}
+			rel, rerr := filepath.Rel(root, path)
+			if rerr != nil {
+				return err
+			}
+			e.logger.Warn("unreadable path skipped; its entries are kept", "store", fs.name, "path", rel, "error", err)
+			unreadable = append(unreadable, rel)
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			// WalkDir does not follow directory symlinks. Every directory is
@@ -146,8 +188,29 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	}
 	fs.setLocal(len(seen))
 
-	for _, ent := range fs.db.All() {
-		if ent.Deleted || ent.Dir || seen[ent.Path] {
+	// An empty root against a journal full of files this machine held is
+	// what a pool that failed to mount looks like once the daemon has
+	// recreated the directory: refuse to read it as a mass deletion.
+	all := fs.db.All()
+	if tombstones && len(seen) == 0 {
+		held := 0
+		for _, ent := range all {
+			if ent.Local && !ent.Deleted && !ent.Dir {
+				held++
+			}
+		}
+		if held >= massDeleteFloor {
+			fs.rootEmpty.Store(true)
+			e.logger.Error("store root is empty but this machine held its files; not treating that as a deletion (is the filesystem mounted?)",
+				"store", fs.name, "root", root, "files", held)
+			tombstones = false
+		}
+	} else {
+		fs.rootEmpty.Store(false)
+	}
+
+	for _, ent := range all {
+		if ent.Deleted || ent.Dir || seen[ent.Path] || underAny(ent.Path, unreadable) {
 			continue
 		}
 		if !tombstones {
@@ -163,6 +226,13 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 		// materialised, the entry records it directly.
 		if !ent.Local && ent.Blob != "" && !e.store.Has(ent.Blob) {
 			unmaterialised++
+			continue
+		}
+		// A file this engine moved aside itself - parked as a conflict copy
+		// while the winning version downloads - is not a deletion. Reading it
+		// as one tombstoned the path under the arriving winner, which was
+		// then refused as older than the tombstone.
+		if e.awaitingUpdate(fs.name, ent.Path) {
 			continue
 		}
 		tomb := ent.clone()
@@ -193,7 +263,7 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	// Directories are reconciled after deletions: a directory this pass just
 	// emptied has been pruned, and recording it now would resurrect it as a
 	// user-created empty directory.
-	changed = append(changed, e.reconcileDirs(fs, dirs, seen, tombstones)...)
+	changed = append(changed, e.reconcileDirs(fs, dirs, seen, tombstones, unreadable)...)
 
 	if unmaterialised > 0 {
 		e.logger.Info("skipped entries this machine never materialised; their absence is not a deletion",
@@ -261,7 +331,17 @@ func (e *Engine) adoptFile(path, sum string) (string, error) {
 // is tombstoned, so that when the file is later deleted nothing claims the
 // directory should stay. That is what makes "the files left, so the directory
 // goes" true without touching empty directories the user created.
-func (e *Engine) reconcileDirs(fs *StoreState, dirs []string, files map[string]bool, tombstones bool) []*Entry {
+func (e *Engine) reconcileDirs(fs *StoreState, dirs []string, files map[string]bool, tombstones bool, unreadable []string) []*Entry {
+	if len(unreadable) > 0 {
+		// An unreadable directory says nothing about what is inside it.
+		kept := dirs[:0]
+		for _, d := range dirs {
+			if !underAny(d, unreadable) {
+				kept = append(kept, d)
+			}
+		}
+		dirs = kept
+	}
 	hasFiles := make(map[string]bool, len(dirs))
 	for path := range files {
 		for dir := filepath.Dir(path); dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
@@ -321,7 +401,7 @@ func (e *Engine) reconcileDirs(fs *StoreState, dirs []string, files map[string]b
 		return changed
 	}
 	for _, ent := range fs.db.All() {
-		if !ent.Dir || ent.Deleted || present[ent.Path] {
+		if !ent.Dir || ent.Deleted || present[ent.Path] || underAny(ent.Path, unreadable) {
 			continue
 		}
 		if tomb := e.tombstoneEntry(fs, ent); tomb != nil {
@@ -370,12 +450,9 @@ func (e *Engine) pruneEmptyParents(fs *StoreState, path string) {
 		if ent := fs.db.Get(dir); ent != nil && !ent.Deleted && ent.Dir {
 			return
 		}
-		abs := filepath.Join(fs.root, dir)
-		entries, err := os.ReadDir(abs)
-		if err != nil || len(entries) > 0 {
-			return
-		}
-		if err := os.Remove(abs); err != nil {
+		// rmdir refuses a non-empty directory by itself. Listing it first
+		// made deleting n files from one directory read n²/2 entries.
+		if err := os.Remove(filepath.Join(fs.root, dir)); err != nil {
 			return
 		}
 		e.logger.Info("removed empty directory", "store", fs.name, "path", dir)

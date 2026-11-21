@@ -79,3 +79,23 @@ Facts learned the hard way, worth keeping.
   writer to a closed socket, `dropLink` correctly ignores the stale link, and
   the mesh goes silent with no error. The handler call is guarded in
   `serveLink`.
+
+## Streamed mounts (2026-11-20)
+
+- Never send a kernel invalidation (`NotifyEntry`, `NotifyDelete`,
+  `NotifyContent`) from inside a FUSE handler, or from anything a handler
+  calls synchronously (a journal write in `Create`, a rename). The kernel
+  holds the parent directory's lock for the whole request and the
+  invalidation waits on that lock: a rename in any subdirectory hung forever
+  (`TestNestedRenameDoesNotDeadlock`). It went unnoticed for top-level paths
+  only because `FS.root` was never set, so those invalidations were silently
+  skipped. Invalidations now go through `queueInvalidation` → a goroutine.
+- go-fuse asks the node's `Getattr`, not the handle's, whenever the node
+  implements it; a handle's size must be reported from the node.
+- go-fuse returns an already-registered inode for a known inode number, so a
+  path that changes kind needs a different number (`stableIno(p, dir)`).
+- The streamed tree is a directory index fed by `FileDB.Observe`. Rebuilding
+  it per journal write made the first sync of a large store quadratic
+  (5k entries: 5.9 s before; 50k entries: 0.17 s after).
+- Do not run a pkill/fusermount sweep over `/proc/self/mountinfo` on the dev
+  machine: the live daemon's `BulkPictures` mount is in it.

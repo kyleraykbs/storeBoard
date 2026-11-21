@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -428,8 +429,16 @@ func TestWriteHandleCommitsOnlyWhenDirty(t *testing.T) {
 	if err := h.Close(); err != nil {
 		t.Fatalf("close after writing: %v", err)
 	}
-	if got := queued(); got != 2 {
-		t.Fatalf("queued after the write = %d, want 2", got)
+	// The new version supersedes the unsent empty one: nobody will ever
+	// ask for those bytes.
+	if got := queued(); got != 1 {
+		t.Fatalf("queued after the write = %d, want 1", got)
+	}
+	fs.queueMu.Lock()
+	size := fs.queue[0].Size
+	fs.queueMu.Unlock()
+	if size != 3 {
+		t.Fatalf("queued version has %d bytes, want 3", size)
 	}
 	if ent := fs.db.Get("notes.txt"); ent == nil || ent.Size != 3 {
 		t.Fatalf("journal entry = %+v", ent)
@@ -564,7 +573,6 @@ func TestStreamedRenameMovesImpliedDirectorySubtree(t *testing.T) {
 	if err := fs.db.Put(&Entry{Path: "Adventures/two.txt", Blob: "two", Size: 3, VV: map[string]uint64{"a": 2}}); err != nil {
 		t.Fatal(err)
 	}
-	n.eng.refreshTree(fs)
 	m := &storeMutator{e: n.eng, fs: fs}
 	if err := m.Rename("Adventures", "Renamed"); err != nil {
 		t.Fatalf("rename implied directory: %v", err)
@@ -651,5 +659,86 @@ func TestQueuedFileRenameMovesThePutDestination(t *testing.T) {
 	}
 	if !foundPut || foundTempPut {
 		t.Fatalf("queue after GIO rename: %+v", fs.queue)
+	}
+}
+
+// Every kind of queued op is retired once a holder's entry covers it. Deletes
+// and new directories used to stay queued forever, re-sent on every flush.
+func TestQueueRetiresDeletesAndDirectories(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+	if err := m.MakeDir("album", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.db.Put(&Entry{Path: "old.txt", Blob: strings.Repeat("ab", 32), Size: 3, VV: map[string]uint64{"b": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove("old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	fs.queueMu.Lock()
+	ops := append([]queueOp(nil), fs.queue...)
+	fs.queueMu.Unlock()
+	if len(ops) != 2 {
+		t.Fatalf("queued %d ops, want 2", len(ops))
+	}
+	for _, op := range ops {
+		rem := &Entry{Path: op.Path, Dir: op.Op == opMkdir, Deleted: op.Op == opDelete, VV: MergeVV(op.VV, map[string]uint64{"b": 7})}
+		n.eng.ackQueue(fs, rem)
+	}
+	fs.queueMu.Lock()
+	left := len(fs.queue)
+	fs.queueMu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d ops still queued after the holder covered them", left)
+	}
+}
+
+// Replacing a file by rename (how GIO saves) queues the upload after the
+// delete of what it replaces, with a version that dominates it.
+func TestRenameOverExistingQueuesUploadAfterDelete(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+	if err := fs.db.Put(&Entry{Path: "photo.jpg", Blob: strings.Repeat("cd", 32), Size: 3, VV: map[string]uint64{"b": 4}}); err != nil {
+		t.Fatal(err)
+	}
+	pf, err := m.Create(".goutputstream-XYZ", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pf.WriteAt([]byte("new"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rename(".goutputstream-XYZ", "photo.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	fs.queueMu.Lock()
+	ops := append([]queueOp(nil), fs.queue...)
+	fs.queueMu.Unlock()
+	var delAt, putAt = -1, -1
+	for i, op := range ops {
+		if op.Path == "photo.jpg" && op.Op == opDelete {
+			delAt = i
+		}
+		if op.Path == "photo.jpg" && op.Op == opPut {
+			putAt = i
+		}
+	}
+	if delAt < 0 || putAt < 0 || putAt < delAt {
+		t.Fatalf("queue order %+v: want the delete of photo.jpg before its upload", ops)
+	}
+	if !Dominates(ops[putAt].VV, map[string]uint64{"b": 4}) {
+		t.Fatalf("upload vv %v does not dominate the replaced version", ops[putAt].VV)
 	}
 }

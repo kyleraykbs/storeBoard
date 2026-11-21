@@ -65,6 +65,34 @@ func TestNewTakesOverAStaleSocket(t *testing.T) {
 	defer srv.Close()
 }
 
+// Two daemons on one data directory would share journals with two views of
+// them; the lock refuses the second before it touches the socket.
+func TestNewRefusesASecondDaemonOnTheSameDataDir(t *testing.T) {
+	cfg := testConfig(t)
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	other := *cfg
+	other.Socket = filepath.Join(t.TempDir(), "other.sock")
+	if _, err := New(&other, nil); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("second New on the same dataDir: %v", err)
+	}
+	if _, err := os.Lstat(other.Socket); !os.IsNotExist(err) {
+		t.Fatalf("the refused daemon created its socket anyway: %v", err)
+	}
+
+	// Released on Close: the next daemon starts.
+	srv.Close()
+	again, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New after Close: %v", err)
+	}
+	again.Close()
+}
+
 func TestNewRefusesALiveSocket(t *testing.T) {
 	cfg := testConfig(t)
 	srv, err := New(cfg, nil)
@@ -73,8 +101,30 @@ func TestNewRefusesALiveSocket(t *testing.T) {
 	}
 	defer srv.Close()
 
-	if _, err := New(cfg, nil); err == nil || !strings.Contains(err.Error(), "already listening") {
+	other := *cfg
+	other.DataDir = filepath.Join(t.TempDir(), "data")
+	if _, err := New(&other, nil); err == nil || !strings.Contains(err.Error(), "already listening") {
 		t.Fatalf("second New on a live socket: %v", err)
+	}
+}
+
+// Only a refused connection proves a socket is stale. A dial that fails for
+// another reason (here EACCES) may be a live daemon, and unlinking its socket
+// would leave it running and unreachable.
+func TestNewLeavesASocketItCannotProbe(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the socket's mode")
+	}
+	cfg := testConfig(t)
+	bindStaleSocket(t, cfg.Socket)
+	if err := os.Chmod(cfg.Socket, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg, nil); err == nil || !strings.Contains(err.Error(), "cannot be probed") {
+		t.Fatalf("New over an unprobeable socket: %v", err)
+	}
+	if _, err := os.Lstat(cfg.Socket); err != nil {
+		t.Fatalf("the socket was removed: %v", err)
 	}
 }
 
@@ -599,5 +649,128 @@ func TestSendOverUnixSocket(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(root, res.Parked)); err != nil || string(b) != "first" {
 		t.Fatalf("parked = %q, %v; want the old content kept", b, err)
+	}
+
+	// Send copies: both originals are still where the caller left them.
+	for path, want := range map[string]string{first: "first", second: "second"} {
+		if b, err := os.ReadFile(path); err != nil || string(b) != want {
+			t.Fatalf("source %s after send = %q, %v; want it untouched", path, b, err)
+		}
+	}
+}
+
+// runServer starts a daemon on cfg and returns a client on its socket.
+func runServer(t *testing.T, cfg *config.Config) *http.Client {
+	t.Helper()
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go srv.Run(ctx)
+	t.Cleanup(func() {
+		cancel()
+		srv.Close()
+	})
+	client := unixClient(cfg)
+	waitServer(t, client)
+	return client
+}
+
+func post(t *testing.T, client *http.Client, url, body string) (int, string) {
+	t.Helper()
+	resp, err := client.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out strings.Builder
+	buf := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(buf)
+		out.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	return resp.StatusCode, out.String()
+}
+
+// The send endpoint refuses a relative source: the daemon's working directory
+// is its data dir, and it must never guess what the caller meant.
+func TestSendRefusesARelativeSource(t *testing.T) {
+	cfg := testConfig(t)
+	client := runServer(t, cfg)
+	code, body := post(t, client, "http://storeboard/v1/stores/photos/send", `{"source": "holiday.txt"}`)
+	if code == http.StatusOK || !strings.Contains(body, "absolute") {
+		t.Fatalf("relative send = %d %s, want a refusal", code, body)
+	}
+}
+
+// A malformed body is the caller's mistake and is answered 400 — never decoded
+// into zero values (a takeover with path "" means "the first busy path"). An
+// oversized one is cut off at the limit.
+func TestMalformedAndOversizedBodiesAreRefused(t *testing.T) {
+	cfg := testConfig(t)
+	client := runServer(t, cfg)
+	for _, url := range []string{
+		"http://storeboard/v1/cleanup",
+		"http://storeboard/v1/stores/photos/takeover",
+		"http://storeboard/v1/stores/photos/send",
+		"http://storeboard/v1/stores/photos/restore",
+	} {
+		if code, body := post(t, client, url, `{"path": `); code != http.StatusBadRequest {
+			t.Errorf("POST %s with a broken body = %d %s, want 400", url, code, body)
+		}
+		huge := `{"path": "` + strings.Repeat("x", maxBody) + `"}`
+		if code, body := post(t, client, url, huge); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("POST %s with a %d-byte body = %d %.80s, want 413", url, len(huge), code, body)
+		}
+	}
+	// An empty body is still "no fields": a bare POST cleanup works.
+	if code, body := post(t, client, "http://storeboard/v1/cleanup", ""); code != http.StatusOK {
+		t.Fatalf("POST cleanup with no body = %d %s", code, body)
+	}
+}
+
+// versions names every file a store ever held: it is authorized like the
+// verbs that act on them, not served to anyone who can reach the socket.
+func TestVersionsIsAuthorizedPerCaller(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Backup = &config.Backup{Enable: true}
+
+	srv, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.handler())
+	resp, err := http.Get(ts.URL + "/v1/stores/photos/versions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	ts.Close()
+	srv.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("versions without credentials = %s, want 403", resp.Status)
+	}
+
+	// The store's owner (the test process) is let through over the socket.
+	client := runServer(t, cfg)
+	resp, err = client.Get("http://storeboard/v1/stores/photos/versions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("versions as the owner = %s, want 200", resp.Status)
+	}
+	unknown, err := client.Get("http://storeboard/v1/stores/nope/versions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("versions of an unknown store = %s, want 404", unknown.Status)
 	}
 }

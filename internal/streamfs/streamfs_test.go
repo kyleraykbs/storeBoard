@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -42,11 +43,14 @@ func lookPath(name string) (string, error) {
 // memoryFetcher serves entries from a map, standing in for the engine's
 // network fetch.
 type memoryFetcher struct {
+	mu     sync.Mutex
 	bodies map[string]string
 	opened []string
 }
 
 func (m *memoryFetcher) ReadRange(_ context.Context, entry Entry, offset, length int64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.opened = append(m.opened, entry.Blob)
 	body, ok := m.bodies[entry.Blob]
 	if !ok {
@@ -117,7 +121,10 @@ func TestMountServesJournalTree(t *testing.T) {
 	if err := deep.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(fetcher.opened) == 0 {
+	fetcher.mu.Lock()
+	opened := len(fetcher.opened)
+	fetcher.mu.Unlock()
+	if opened == 0 {
 		t.Fatal("no ranged fetch happened")
 	}
 	if err := mounted.Unmount(); err != nil {
@@ -505,6 +512,7 @@ func readMounted(t *testing.T, path string) string {
 
 // renameMutator records the rename in the tree like the engine does.
 type renameMutator struct {
+	mu   sync.Mutex
 	tree *Tree
 }
 
@@ -515,6 +523,8 @@ func (m *renameMutator) Remove(string) error                        { return nil
 func (m *renameMutator) MakeDir(string, uint32) error               { return nil }
 func (m *renameMutator) RemoveDir(string) error                     { return nil }
 func (m *renameMutator) Rename(from, to string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	next := map[string]Entry{}
 	m.tree.mu.RLock()
 	for p, e := range m.tree.entries {
@@ -527,4 +537,181 @@ func (m *renameMutator) Rename(from, to string) error {
 	m.tree.mu.RUnlock()
 	m.tree.Replace(next)
 	return nil
+}
+
+// A rename inside a subdirectory must return. The kernel holds both parents
+// locked for the whole request, and an invalidation sent from inside the
+// handler waited on that lock forever - every GIO save in a subfolder hung.
+func TestNestedRenameDoesNotDeadlock(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tree := NewTree(map[string]Entry{
+		"Before/nested/a.txt":       {Blob: "b", Size: 5},
+		"Before/x/.goutputstream-1": {Blob: "b", Size: 5},
+	})
+	mounted, err := Mount(mnt, tree, Options{
+		Fetcher: &memoryFetcher{bodies: map[string]string{"b": "alpha"}},
+		Mutator: &renameMutator{tree: tree},
+		UID:     uint32(os.Getuid()),
+		GID:     uint32(os.Getgid()),
+	})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	readMounted(t, filepath.Join(mnt, "Before", "nested", "a.txt"))
+	readMounted(t, filepath.Join(mnt, "Before", "x", ".goutputstream-1"))
+
+	done := make(chan error, 2)
+	go func() {
+		done <- os.Rename(filepath.Join(mnt, "Before", "nested"), filepath.Join(mnt, "Before", "moved"))
+	}()
+	go func() {
+		done <- os.Rename(filepath.Join(mnt, "Before", "x", ".goutputstream-1"), filepath.Join(mnt, "Before", "x", "photo.jpg"))
+	}()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("rename: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			// Leave the mount to the lazy detach in Unmount; failing here is
+			// the point.
+			t.Fatal("nested rename hung")
+		}
+	}
+	if got := readMounted(t, filepath.Join(mnt, "Before", "moved", "a.txt")); got != "alpha" {
+		t.Fatalf("after rename = %q", got)
+	}
+	if got := readMounted(t, filepath.Join(mnt, "Before", "x", "photo.jpg")); got != "alpha" {
+		t.Fatalf("after save rename = %q", got)
+	}
+}
+
+// Single-path updates keep the directory index exact: implied directories
+// appear with their first file and vanish with their last.
+func TestTreeIncrementalUpdates(t *testing.T) {
+	tree := NewTree(nil)
+	tree.Set(Entry{Path: "a/b/c.txt", Blob: "1", Size: 1})
+	tree.Set(Entry{Path: "a/d.txt", Blob: "2", Size: 1})
+	if e, ok := tree.Get("a/b"); !ok || !e.Dir {
+		t.Fatalf("implied dir a/b = %+v %v", e, ok)
+	}
+	names := func(dir string) []string {
+		var out []string
+		for _, c := range tree.children(dir) {
+			out = append(out, c.name)
+		}
+		return out
+	}
+	if got := fmt.Sprint(names("a")); got != "[b d.txt]" {
+		t.Fatalf("children(a) = %s", got)
+	}
+	tree.Delete("a/b/c.txt")
+	if _, ok := tree.Get("a/b"); ok {
+		t.Fatal("a/b survived its last file")
+	}
+	if got := fmt.Sprint(names("a")); got != "[d.txt]" {
+		t.Fatalf("children(a) after delete = %s", got)
+	}
+	tree.Delete("a/d.txt")
+	if _, ok := tree.Get("a"); ok || tree.hasChildren("") {
+		t.Fatal("empty tree still lists a")
+	}
+	// An explicit empty directory exists on its own.
+	tree.Set(Entry{Path: "empty", Dir: true})
+	if e, ok := tree.Get("empty"); !ok || !e.Dir {
+		t.Fatalf("explicit dir = %+v %v", e, ok)
+	}
+}
+
+// A path that changes kind gets a new inode of the right kind instead of the
+// cached one.
+func TestPathChangingKindGetsANewInode(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tree := NewTree(map[string]Entry{"thing": {Blob: "b", Size: 5}})
+	mounted, err := Mount(mnt, tree, Options{Fetcher: &memoryFetcher{bodies: map[string]string{"b": "alpha"}}})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	if info, err := os.Stat(filepath.Join(mnt, "thing")); err != nil || info.IsDir() {
+		t.Fatalf("thing as file: %v %v", info, err)
+	}
+	mounted.Replace(map[string]Entry{"thing/inside.txt": {Blob: "b", Size: 5}})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		info, err := os.Stat(filepath.Join(mnt, "thing"))
+		if err == nil && info.IsDir() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("thing never became a directory: %v %v", info, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := readMounted(t, filepath.Join(mnt, "thing", "inside.txt")); got != "alpha" {
+		t.Fatalf("inside = %q", got)
+	}
+}
+
+// A sequential read of a file bigger than one readahead window returns every
+// byte in order, whatever the kernel's request sizes.
+func TestSequentialReadAcrossWindows(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	var b strings.Builder
+	for i := 0; b.Len() < 3*raBlockSize+12345; i++ {
+		fmt.Fprintf(&b, "%08d\n", i)
+	}
+	body := b.String()
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &memoryFetcher{bodies: map[string]string{"big": body}}
+	mounted, err := Mount(mnt, NewTree(map[string]Entry{"big.bin": {Blob: "big", Size: int64(len(body))}}), Options{Fetcher: fetcher})
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	t.Cleanup(func() { _ = mounted.Unmount() })
+	if got := readMounted(t, filepath.Join(mnt, "big.bin")); got != body {
+		t.Fatalf("sequential read mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+	fetcher.mu.Lock()
+	fetches := len(fetcher.opened)
+	fetcher.mu.Unlock()
+	if want := (len(body) + raBlockSize - 1) / raBlockSize; fetches > want+1 {
+		t.Fatalf("%d fetches for %d windows", fetches, want)
+	}
+}
+
+// Directory operations cost the directory, not the store.
+func BenchmarkLookupInLargeTree(b *testing.B) {
+	entries := map[string]Entry{}
+	for d := range 200 {
+		for f := range 500 {
+			p := fmt.Sprintf("dir%03d/sub/file%04d.jpg", d, f)
+			entries[p] = Entry{Blob: "x", Size: 1}
+		}
+	}
+	tree := NewTree(entries)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = tree.Get(fmt.Sprintf("dir%03d/sub", i%200))
+		_ = tree.children(fmt.Sprintf("dir%03d", i%200))
+	}
 }

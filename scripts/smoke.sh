@@ -62,6 +62,9 @@ if "$CLI" --config "$work/absent.json" config check >/dev/null 2>&1; then
 fi
 
 echo "== daemon up"
+# The stores are flat (configVersion 2): one appears inside another through
+# `links`, never by nesting declarations — the nested `stores` key is gone and
+# a config that still uses it fails the check below.
 cat >"$config" <<EOF
 {
   "configVersion": 2,
@@ -80,14 +83,17 @@ cat >"$config" <<EOF
     "photos": {
       "group": "family",
       "symlinks": ["$work/Pictures"],
-      "stores": { "bulk": { "group": "family", "path": "Bulk" } }
+      "links": { "bulk": "Bulk" }
     },
+    "bulk": { "group": "family" },
     "documents": { "group": "family", "symlinks": ["$work/docs"] },
     "archive": { "group": "family", "symlinks": ["$work/archive"] }
   },
   "backup": { "enable": true, "keep": "7d" }
 }
 EOF
+
+"$CLI" --config "$config" config check >/dev/null
 
 "$DAEMON" --config "$config" &
 pid=$!
@@ -111,7 +117,7 @@ echo "$status_json" |
 		.root == ($w + "/laptop") and
 		(.groups | length == 1) and (.stores | length == 4) and
 		([.stores[] | select(.name == "documents")][0].root == ($w + "/laptop/documents")) and
-		([.stores[] | select(.name == "bulk")][0].parent == "photos") and
+		([.stores[] | select(.name == "photos")][0].links.bulk == "Bulk") and
 		([.sync[].state] | all(. == "replica"))' >/dev/null || {
 	echo "FAIL: the status document is not what this test expects:" >&2
 	echo "$status_json" | jq -c '{
@@ -123,7 +129,8 @@ echo "$status_json" |
 }
 
 # The tree is symlinks: a declared path points at the canonical dir, and a
-# child store appears inside its parent without the parent owning its bytes.
+# linked store appears inside the store that links it without that store
+# owning its bytes.
 [ -L "$work/Pictures" ] || { echo "FAIL: declared symlink missing" >&2; exit 1; }
 [ "$(readlink "$work/Pictures")" = "$work/laptop/photos" ] || {
 	echo "FAIL: symlink target is $(readlink "$work/Pictures")" >&2
@@ -170,13 +177,16 @@ cat >"$config2" <<EOF
     "photos": {
       "group": "family",
       "symlinks": ["$work/PicturesB"],
-      "stores": { "bulk": { "group": "family", "sync": "remote", "path": "Bulk" } }
+      "links": { "bulk": "Bulk" }
     },
+    "bulk": { "group": "family", "sync": "remote" },
     "documents": { "group": "family", "sync": "remote", "symlinks": ["$work/remoteDocs"] },
     "archive": { "group": "family", "sync": "remote", "symlinks": ["$work/remoteArchive"] }
   }
 }
 EOF
+
+"$CLI" --config "$config2" config check >/dev/null
 
 "$DAEMON" --config "$config2" &
 pid2=$!
@@ -246,6 +256,9 @@ parked=$("$CLI" --config "$config" send photos "$work/send-me2.txt" --as "sent/h
 }
 grep -q "from the share sheet" "$work/Pictures/$parked"
 grep -q "second take" "$work/Pictures/sent/holiday.txt"
+# send copies: the originals stay where they were.
+grep -q "from the share sheet" "$work/send-me.txt"
+grep -q "second take" "$work/send-me2.txt"
 
 echo "== a path with content says why, and takeover links it without losing anything"
 "$CLI" --config "$config2" status | grep -q "(path has content)"

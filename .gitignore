@@ -11,3 +11,6 @@ android/build/
 android/app/build/
 android/app/libs/*.aar
 android/local.properties
+
+# Pid files from local daemon runs.
+*.pid

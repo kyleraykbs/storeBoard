@@ -56,6 +56,12 @@ type Connection struct {
 	State    string    `json:"state"`
 	Since    time.Time `json:"since"`
 	Error    string    `json:"error,omitempty"`
+	// Version is the peer's build, as its hello said, while connected.
+	Version string `json:"version,omitempty"`
+	// ClockSkewMs is how far the peer's clock runs ahead of this machine's
+	// (negative: behind), measured at the handshake. Conflicts are decided
+	// by modification time, so a large skew picks the wrong winner.
+	ClockSkewMs int64 `json:"clockSkewMs,omitempty"`
 }
 
 // Permissions is a store's resolved ownership and mode: what the daemon gives
@@ -223,4 +229,41 @@ type CleanupResult struct {
 	OrphanBytes  int64    `json:"orphanBytes"`
 	Blobs        int      `json:"blobs"`
 	BlobBytes    int64    `json:"blobBytes"`
+}
+
+// BrowseEntry is one child of a directory in a store, as the journal knows
+// it. Local reports whether the bytes are on this machine; a streamed store's
+// files are fetched from a holder when read.
+type BrowseEntry struct {
+	Name  string    `json:"name"`
+	Path  string    `json:"path"`
+	Dir   bool      `json:"dir,omitempty"`
+	Size  int64     `json:"size"`
+	MTime time.Time `json:"mtime,omitempty"`
+	Blob  string    `json:"blob,omitempty"`
+	Local bool      `json:"local,omitempty"`
+}
+
+// Check outcomes, worst last.
+const (
+	CheckOK   = "ok"
+	CheckWarn = "warn"
+	CheckFail = "fail"
+)
+
+// Check is one finding of `storeboard doctor`: what was looked at, how it
+// stands, and what to do about it.
+type Check struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+	Hint   string `json:"hint,omitempty"`
+}
+
+// Doctor is the daemon's health report: every check, and the worst status
+// among them.
+type Doctor struct {
+	APIVersion int     `json:"apiVersion"`
+	Status     string  `json:"status"`
+	Checks     []Check `json:"checks"`
 }

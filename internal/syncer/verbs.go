@@ -117,6 +117,14 @@ func (e *Engine) handleVerbs(peer string, fr *frame) {
 			e.replyVerbs(peer, fr, nil, "unsafe path")
 			return
 		}
+		if req.To != "" {
+			// `to` is a path on the asker's machine, but this holder would be
+			// the one writing it — on its own disk, as the store's owner. A
+			// group peer is trusted with the store, not with this machine's
+			// filesystem, so a forwarded restore only ever lands in the store.
+			e.replyVerbs(peer, fr, nil, "restore --to is not forwarded to a holder")
+			return
+		}
 		// The holder acts as the store's owner: it is the machine that keeps
 		// the bytes, and the peer is already authorized by the group.
 		uid := fs.perm.uid
@@ -124,7 +132,7 @@ func (e *Engine) handleVerbs(peer string, fr *frame) {
 		if req.At != 0 {
 			at = time.Unix(0, req.At)
 		}
-		res, err := e.Restore(fr.Store, uid, req.Path, req.Blob, at, req.To)
+		res, err := e.Restore(fr.Store, uid, req.Path, req.Blob, at, "")
 		if err != nil {
 			e.replyVerbs(peer, fr, nil, err.Error())
 			return

@@ -5,17 +5,21 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/statelock"
 	"codeberg.org/kyleraykbs/storeboard/internal/syncer"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 	"codeberg.org/kyleraykbs/storeboard/internal/version"
@@ -28,6 +32,21 @@ import (
 // no privileged verb ships while this holds.
 const socketMode = 0o666
 
+// maxBody bounds every JSON request body. The largest legitimate one is a
+// send or restore naming two paths; the socket is open to every local user,
+// and an unbounded decode would let any of them make the daemon buffer
+// whatever they cared to stream at it.
+const maxBody = 1 << 20
+
+// Connection deadlines. There is deliberately no read or write timeout on the
+// request as a whole: a send, a restore or a takeover legitimately runs for
+// as long as the bytes take. What is bounded is a client that connects and
+// never finishes its headers, or parks an idle keep-alive connection forever.
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 2 * time.Minute
+)
+
 // Server is the daemon: one unix socket, one document, the peer wire, and
 // the sync engine behind it.
 type Server struct {
@@ -38,6 +57,15 @@ type Server struct {
 	listener  net.Listener
 	transport *transport.Manager
 	engine    *syncer.Engine
+	lock      *statelock.Lock
+
+	// run is the engine's lifetime: Close cancels it and waits for engine.Run
+	// to return before closing the engine, because the scanners and the link
+	// reconciler it runs are still writing journals and paths until then.
+	mu        sync.Mutex
+	closed    bool
+	cancelRun context.CancelFunc
+	engineRun chan struct{}
 }
 
 // New prepares the state and socket directories, then binds the socket. A
@@ -58,16 +86,38 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 
+	// The state is single-owner, and that is decided before the socket is
+	// touched: a second daemon on the same data directory must not even
+	// take over a socket the first one is about to answer on.
+	lock, err := statelock.Acquire(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			lock.Release()
+		}
+	}()
+
 	if fi, err := os.Lstat(cfg.Socket); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("%s exists and is not a socket", cfg.Socket)
 		}
-		if conn, err := net.Dial("unix", cfg.Socket); err == nil {
+		conn, err := net.Dial("unix", cfg.Socket)
+		if err == nil {
 			conn.Close()
 			return nil, fmt.Errorf("storeboardd already listening on %s", cfg.Socket)
 		}
-		// Nobody answers: a leftover socket file from a crashed daemon.
-		if err := os.Remove(cfg.Socket); err != nil {
+		// Only a refused connection proves nobody is there: the socket file
+		// outlived a crashed daemon. Anything else — EACCES, a full backlog
+		// (EAGAIN), a timeout — can be a live daemon that simply did not
+		// answer this dial, and unlinking its socket would strand it,
+		// running and unreachable, until a restart.
+		if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ENOENT) {
+			return nil, fmt.Errorf("%s exists and cannot be probed (%v); not taking it over", cfg.Socket, err)
+		}
+		if err := os.Remove(cfg.Socket); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("remove stale socket: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
@@ -88,6 +138,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		ln.Close()
 		return nil, fmt.Errorf("sync engine: %w", err)
 	}
+	ok = true
 
 	s := &Server{
 		cfg:       cfg,
@@ -96,10 +147,13 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		listener:  ln,
 		transport: transport.New(cfg, logger),
 		engine:    engine,
+		lock:      lock,
 	}
 	s.transport.SetHandler(engine)
 	s.http = &http.Server{
-		Handler: s.handler(),
+		Handler:           s.handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
 		// Every request carries the uid of the process on the other end of
 		// the socket: the acting verb (takeover) authorizes per caller, so a
 		// world-writable socket cannot be used to move somebody else's files
@@ -129,12 +183,43 @@ func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/space", s.handleSpace)
+	mux.HandleFunc("/v1/doctor", s.handleDoctor)
 	mux.HandleFunc("/v1/cleanup", s.handleCleanup)
 	mux.HandleFunc("/v1/stores/", s.handleStore)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
 	})
 	return mux
+}
+
+// decodeBody reads a JSON request body into v, bounded by maxBody. An empty
+// body is no fields at all (every verb's fields are optional or checked by
+// the verb); anything else that does not decode is the caller's mistake and
+// is answered 400 here — it must never reach a verb as zero values, where a
+// malformed takeover would have meant "the first busy path".
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if r.Body == nil {
+		return true
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": fmt.Sprintf("body larger than %d bytes", maxBody)})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("body: %v", err)})
+		return false
+	}
+	if dec.More() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body: trailing data after the JSON value"})
+		return false
+	}
+	return true
 }
 
 // handleSpace reports the size of each data category. Space reports are safe
@@ -147,6 +232,16 @@ func (s *Server) handleSpace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.engine.Space())
+}
+
+// handleDoctor is the health report: the status document's numbers, judged.
+func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.engine.Doctor(s.transport.Snapshot()))
 }
 
 // handleCleanup runs expiry and content collection, then unconfigured store
@@ -167,8 +262,8 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RemoveOrphans bool `json:"removeOrphans"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeBody(w, r, &req) {
+		return
 	}
 	writeJSON(w, http.StatusOK, s.engine.Cleanup(req.RemoveOrphans))
 }
@@ -203,7 +298,9 @@ func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 // handleSend copies a local file into a store: the share sheet's path onto
 // the mesh, and the same verb the app's engine offers directly. The file the
 // caller names is read by the daemon, so it must be a path this machine can
-// see — the CLI's own host, which is also the one the daemon runs on.
+// see — the CLI's own host, which is also the one the daemon runs on — given
+// absolute (the daemon's working directory is its data dir), and the
+// caller's own file: the engine checks the owner and copies, never moves.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -219,8 +316,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, name string)
 		Source string `json:"source"`
 		Path   string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("body: %v", err)})
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Source == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body: source is required"})
 		return
 	}
 	res, err := s.engine.Send(name, uid, req.Source, req.Path)
@@ -247,8 +347,8 @@ func (s *Server) handleTakeover(w http.ResponseWriter, r *http.Request, name str
 	var req struct {
 		Path string `json:"path"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeBody(w, r, &req) {
+		return
 	}
 	res, err := s.engine.Takeover(name, req.Path, uid)
 	if err != nil {
@@ -258,12 +358,28 @@ func (s *Server) handleTakeover(w http.ResponseWriter, r *http.Request, name str
 	writeJSON(w, http.StatusOK, res)
 }
 
-// handleVersions lists a file's recorded versions. Reading is no more
-// privileged than status: the socket is world-readable already.
+// handleVersions lists a file's recorded versions. It reads like status but
+// is authorized like the acting verbs: a bare listing names every file a
+// store ever held, deleted ones included, and the socket is open to every
+// local user — so root or the store's owner, the same rule restore applies to
+// the bytes behind the list.
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	uid, ok := requestUID(r)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
+		return
+	}
+	if err := s.engine.CheckOwner(name, uid, "list the versions of"); err != nil {
+		code := http.StatusForbidden
+		if strings.HasPrefix(err.Error(), "unknown store") {
+			code = http.StatusNotFound
+		}
+		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
 	res, err := s.engine.Versions(name, r.URL.Query().Get("path"))
@@ -291,8 +407,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, name stri
 		At   string `json:"at"`
 		To   string `json:"to"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("body: %v", err)})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	var at time.Time
@@ -341,10 +456,25 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully. The socket
-// file itself is removed by Close.
+// file itself is removed by Close, which the caller must reach whatever Run
+// returns: it is what unmounts streamed stores and stops the engine.
 func (s *Server) Run(ctx context.Context) error {
-	go s.engine.Run(ctx)
-	s.transport.Run(ctx)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("server is closed")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancelRun = cancel
+	done := make(chan struct{})
+	s.engineRun = done
+	s.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		s.engine.Run(runCtx)
+	}()
+	s.transport.Run(runCtx)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -365,21 +495,52 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return s.http.Shutdown(shutdownCtx)
+		// A request still running after the grace period (a long send) is
+		// not a reason to skip the rest of shutdown: Close force-closes the
+		// connections and tears the engine down either way.
+		if err := s.http.Shutdown(shutdownCtx); err != nil {
+			s.logger.Warn("http shutdown did not finish; closing connections", "error", err)
+		}
+		return nil
 	}
 }
 
 // Close stops frame callbacks before transport and durable state. This keeps
-// a bounded sync queue from delaying network teardown.
+// a bounded sync queue from delaying network teardown. It then waits for
+// engine.Run — scanners and link reconciliation write journals and paths until
+// it returns — before closing the engine's journals and mounts. Safe to call
+// whether or not Run ran, and more than once.
 func (s *Server) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	cancel, done := s.cancelRun, s.engineRun
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	s.http.Close()
+	// Serve may never have run (a New that is closed straight away), and
+	// then http.Close does not know the listener.
+	s.listener.Close()
 	s.engine.StopFrames()
 	s.transport.Close()
-	s.engine.Close()
-	s.http.Close()
-	if err := os.Remove(s.cfg.Socket); err != nil && !os.IsNotExist(err) {
-		return err
+	if done != nil {
+		<-done
 	}
-	return nil
+	s.engine.Close()
+	err := os.Remove(s.cfg.Socket)
+	if err != nil && os.IsNotExist(err) {
+		err = nil
+	}
+	// Last: the socket is gone and the state is closed, so the next daemon
+	// may have both.
+	s.lock.Release()
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

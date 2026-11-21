@@ -418,3 +418,57 @@
   write, offline write with the holder's daemon stopped, and the flush when it
   returns, all compared by sha256.
 - **Reversible:** yes - the queue and mount are additive to `stream` stores.
+
+## 2026-11-20 — A path on the socket is the caller's to name
+
+- **Decision:** the daemon runs as root behind a world-writable socket, so a
+  path in a request is checked against the requesting uid, not just the
+  store's owner. `send` takes an absolute source, refuses symlinks and
+  non-regular files, reads only a file the caller owns (checked on the open
+  descriptor), and copies it (temp, fsync, rename) instead of moving it.
+  `restore --to` takes an absolute, clean path into an existing directory the
+  caller owns, onto nothing but a regular file of theirs; it creates no
+  directories and chowns nothing but the file, and a holder refuses a
+  forwarded `to` outright. `backup list` is authorized like the acting verbs.
+  The CLI resolves relative paths itself (the daemon's cwd is its data dir).
+- **Why:** review found that any local user could have the daemon move any
+  file it could reach into a store they own (`send /etc/shadow`), write and
+  chown any path (`restore --to /etc/x`, whose parent `ensureDir` then handed
+  to the store's owner), and list every file name in every store.
+- **Also:** a data directory is single-owner (`flock` on `<dataDir>/lock`,
+  daemon and app alike), and only ECONNREFUSED/ENOENT marks a socket stale;
+  request bodies are capped at 1 MiB and a malformed one is a 400;
+  `cleanup --remove-orphans` says it is not implemented instead of being a
+  silent no-op; a restore's version vector extends the current one; the config
+  rejects a dataDir inside a store or elsewhere under the root than
+  `<root>/.storeboard`, nested links in one store, and bad store-level
+  permissions.
+- **Reversible:** the checks, yes; `send` no longer removes its source, which
+  the app already deleted itself and the CLI never documented.
+
+## 2026-11-20 — Transfers by content, digests instead of full indexes
+
+- **Decision:** a want carries the blob it is for, and wants are keyed by
+  (store, path, blob); the holder serves that version from wherever it has it
+  and refuses with `wantErr` otherwise, and the asker tries the next peer.
+  Transfers are scheduled per peer in two lanes (16 MiB cut-off; 4 small, 2
+  large slots), hashed as they arrive, finished off the chunk workers (4
+  shards, 4 finishers), and moved into the tree instead of copied when the
+  content store would release them anyway. A link write that times out while
+  the peer still pings is retried, not fatal. Peers advertising `digest`
+  reconcile with bucketed digests (`digest`/`pull` frames) instead of full
+  indexes. The hello carries the sender's clock; skew past 2 s is logged and
+  reported by `storeboard doctor` (new `/v1/doctor`).
+- **Why:** one 20 GiB file stalled everything: it was served inline on the
+  store's want worker, re-hashed and copied on the one blob worker while new
+  chunks backed up, and the sender's 30 s write deadline then dropped the
+  link and restarted the transfer. Path-keyed wants lost conflict losers and
+  let a superseded transfer apply the wrong version. Full indexes on every
+  reconnect cost megabytes for no change.
+- **Also:** an edit concurrent with a local deletion is fetched with the
+  merged vector - fetched with the peer's own, it was refused against the
+  tombstone on every exchange; the scanner no longer tombstones a path whose
+  new version is in flight (a file parked by conflict resolution).
+- **Reversible:** every frame field and frame type is additive; a peer
+  without the features is served the old way.
+

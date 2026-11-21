@@ -7,6 +7,7 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -77,14 +79,27 @@ type StoreState struct {
 	linkState []api.StoreSymlink
 	state     string
 
-	// mount is the journal-backed view, non-nil only while streamed.
-	mount *streamfs.FS
+	// tree is a streamed store's journal as a directory index, kept in step
+	// with every journal write; mount serves it, non-nil while mounted.
+	tree  *streamfs.Tree
+	mount *streamfs.FS // guarded by scanMu
+	// browseOnce builds tree on first use for a store that is not streamed:
+	// only an app browsing it (see Browse) needs the directory index.
+	browseOnce sync.Once
+	// mountUp mirrors mount != nil for readers that cannot take scanMu.
+	mountUp atomic.Bool
 
 	// offline is the write policy for a streamed store; queue holds the
 	// writes waiting for a holder, and queuedBytes bounds a capped queue.
 	offline     *config.OfflineQueue
 	queue       []queueOp
 	queuedBytes int64
+	// flushing and flushAgain coalesce flush requests (see flushQueue).
+	flushing   atomic.Bool
+	flushAgain atomic.Bool
+	// rootEmpty records that the last scan found the root empty while this
+	// machine held many of its files (see massDeleteFloor).
+	rootEmpty atomic.Bool
 	// queueMu guards the queue. It is deliberately not scanMu: the mount's
 	// handlers call into the queue, and a handler waiting on scanMu while the
 	// engine waits on the mount is a deadlock.
@@ -120,14 +135,14 @@ func (fs *StoreState) publish() api.StoreSync {
 	}
 	out := fs.published
 	out.Symlinks = links
-	fs.metaMu.Unlock()
-	out.Store = fs.name
-	out.Entries = fs.db.LiveCount()
 	out.Conflicts = fs.conflicts
 	out.LastScan = fs.lastScan
 	out.Local = fs.local
 	out.Scanning = fs.scanning
-	if pending := out.Entries - fs.local; pending > 0 {
+	fs.metaMu.Unlock()
+	out.Store = fs.name
+	out.Entries = fs.db.LiveCount()
+	if pending := out.Entries - out.Local; pending > 0 {
 		out.Pending = pending
 	}
 	return out
@@ -188,23 +203,44 @@ type Engine struct {
 	stores         []*StoreState
 	byName         map[string]*StoreState
 	sends          map[string]transport.Sender
-	wants          map[string]*pending
+	wants          map[string]map[string]*pending // wantKey -> slot -> want
 	incoming       map[string]*incomingBlob
 	reads          map[int64]chan readReply
 	readSeq        int64
 	holderRates    map[string]holderRate
 	verified       map[string]verifiedFile
+	fullSent       map[string]fullIndexMark
 	pendingMu      sync.Mutex
 	pending        map[string]*pendingFile
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
+	readWG         sync.WaitGroup
 	indexFrames    map[string]chan peerFrame
 	wantFrames     map[string]chan peerFrame
 
+	// The loop intervals as they were when the engine was made: the package
+	// variables are knobs for tests, and reading them from running loops
+	// raced every test that turned one.
+	scanEvery, linkEvery, indexEvery, pruneEvery time.Duration
+
 	readFrames map[string]chan peerFrame
-	blobFrames chan peerFrame
+	blobFrames [blobShards]chan peerFrame
+
+	// finishSem bounds completed transfers being verified and applied, and
+	// finishWG lets Close wait for them.
+	finishSem chan struct{}
+	finishWG  sync.WaitGroup
+	// blobLocks serialises finishing per blob (see lockBlob).
+	blobLockMu sync.Mutex
+	blobLocks  map[string]*blobLock
+
+	// sendMu guards sendq, each peer's outgoing transfers; sendWG lets Close
+	// wait for the running ones.
+	sendMu sync.Mutex
+	sendq  map[string]*peerSends
+	sendWG sync.WaitGroup
 }
 
 func (e *Engine) registerPending(p *pendingFile) {
@@ -267,8 +303,10 @@ func (e *Engine) startFrameWorkers() {
 		e.indexFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.wantFrames = make(map[string]chan peerFrame, len(e.stores))
 		e.readFrames = make(map[string]chan peerFrame, len(e.stores))
-		e.blobFrames = make(chan peerFrame, syncFrameQueue)
-		e.frameWG.Add(1 + 3*len(e.stores))
+		for i := range e.blobFrames {
+			e.blobFrames[i] = make(chan peerFrame, syncFrameQueue)
+		}
+		e.frameWG.Add(blobShards + 3*len(e.stores))
 		// One worker per store for each class: a slow store delays only
 		// itself, and serving a multi-gigabyte blob cannot hold another
 		// store's index frames hostage.
@@ -282,7 +320,16 @@ func (e *Engine) startFrameWorkers() {
 					case <-e.closed:
 						return
 					case pf := <-ch:
-						e.handleIndex(pf.peer, &pf.fr)
+						// Digests share the index worker: a pull reply
+						// must be judged after the index frames before it.
+						switch pf.fr.Type {
+						case "digest":
+							e.handleDigest(pf.peer, &pf.fr)
+						case "pull":
+							e.handlePull(pf.peer, &pf.fr)
+						default:
+							e.handleIndex(pf.peer, &pf.fr)
+						}
 					}
 				}
 			}(index)
@@ -311,32 +358,45 @@ func (e *Engine) startFrameWorkers() {
 			e.readFrames[fs.name] = reads
 			go func(ch chan peerFrame) {
 				defer e.frameWG.Done()
+				slots := make(chan struct{}, readWorkers)
 				for {
 					select {
 					case <-e.closed:
 						return
 					case pf := <-ch:
-						e.handleRead(pf.peer, &pf.fr)
+						select {
+						case slots <- struct{}{}:
+						case <-e.closed:
+							return
+						}
+						e.readWG.Add(1)
+						go func() {
+							defer e.readWG.Done()
+							defer func() { <-slots }()
+							e.handleRead(pf.peer, &pf.fr)
+						}()
 					}
 				}
 			}(reads)
 		}
-		go func() {
-			defer e.frameWG.Done()
-			for {
-				select {
-				case <-e.closed:
-					return
-				case pf := <-e.blobFrames:
-					switch pf.fr.Type {
-					case "blob":
-						e.handleBlob(pf.peer, &pf.fr)
-					case "blobEnd":
-						e.handleBlobEnd(pf.peer, &pf.fr)
+		for _, ch := range e.blobFrames {
+			go func(ch chan peerFrame) {
+				defer e.frameWG.Done()
+				for {
+					select {
+					case <-e.closed:
+						return
+					case pf := <-ch:
+						switch pf.fr.Type {
+						case "blob":
+							e.handleBlob(pf.peer, &pf.fr)
+						case "blobEnd":
+							e.handleBlobEnd(pf.peer, &pf.fr)
+						}
 					}
 				}
-			}
-		}()
+			}(ch)
+		}
 	})
 }
 
@@ -383,13 +443,21 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		store:       st,
 		byName:      map[string]*StoreState{},
 		sends:       map[string]transport.Sender{},
-		wants:       map[string]*pending{},
+		wants:       map[string]map[string]*pending{},
+		finishSem:   make(chan struct{}, finishSlots),
+		blobLocks:   map[string]*blobLock{},
+		sendq:       map[string]*peerSends{},
 		incoming:    map[string]*incomingBlob{},
 		reads:       map[int64]chan readReply{},
 		holderRates: map[string]holderRate{},
 		verified:    map[string]verifiedFile{},
+		fullSent:    map[string]fullIndexMark{},
 		pending:     map[string]*pendingFile{},
 		closed:      make(chan struct{}),
+		scanEvery:   scanInterval,
+		linkEvery:   linkInterval,
+		indexEvery:  indexInterval,
+		pruneEvery:  pruneInterval,
 	}
 
 	for _, v := range cfg.StoreViews() {
@@ -449,6 +517,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			if err := e.loadQueue(fs); err != nil {
 				return nil, err
 			}
+			fs.observeTree()
 		}
 	}
 	e.cleanupStaleAtomicFiles()
@@ -464,7 +533,7 @@ func (e *Engine) Run(ctx context.Context) {
 	// last few minutes is kept regardless - a peer may be mid-transfer.
 	e.pruneOnce(time.Now())
 	e.Collect()
-	go e.pruneLoop(ctx, pruneInterval)
+	go e.pruneLoop(ctx, e.pruneEvery)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -491,7 +560,7 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) indexLoop(ctx context.Context) {
-	t := time.NewTicker(indexInterval)
+	t := time.NewTicker(e.indexEvery)
 	defer t.Stop()
 	for {
 		select {
@@ -503,6 +572,17 @@ func (e *Engine) indexLoop(ctx context.Context) {
 	}
 }
 
+// fullIndexFloor is how often a store's whole index is resent to a peer even
+// when nothing changed. The resend is a safety net for a frame lost in link
+// churn; sending a hundred-thousand-entry index to every peer every 30 s, and
+// making each of them walk it, was most of an idle mesh's traffic and CPU.
+var fullIndexFloor = 10 * time.Minute
+
+type fullIndexMark struct {
+	gen uint64
+	at  time.Time
+}
+
 func (e *Engine) resendIndexes() {
 	e.mu.Lock()
 	peers := make([]string, 0, len(e.sends))
@@ -510,15 +590,38 @@ func (e *Engine) resendIndexes() {
 		peers = append(peers, peer)
 	}
 	e.mu.Unlock()
+	now := time.Now()
 	for _, peer := range peers {
 		for _, fs := range e.stores {
-			if e.storeSharedWith(fs, peer) {
-				if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
-					e.logger.Debug("resend index", "peer", peer, "store", fs.name, "error", err)
-				}
+			if !e.storeSharedWith(fs, peer) {
+				continue
 			}
+			key := peer + "\x00" + fs.name
+			gen := fs.db.Gen()
+			e.mu.Lock()
+			last, sent := e.fullSent[key]
+			e.mu.Unlock()
+			// A digest costs one frame when the peers agree, so it can go
+			// on the same schedule the full index did: whenever the journal
+			// moved, and on the floor otherwise. A change one side refused
+			// ("leaving it to the next exchange") is retried by the next
+			// one, so this cannot wait the whole floor while things move.
+			if sent && last.gen == gen && now.Sub(last.at) < fullIndexFloor {
+				continue
+			}
+			if err := e.offerIndex(peer, fs); err != nil {
+				e.logger.Debug("resend index", "peer", peer, "store", fs.name, "error", err)
+				continue
+			}
+			e.markFullSent(peer, fs, gen)
 		}
 	}
+}
+
+func (e *Engine) markFullSent(peer string, fs *StoreState, gen uint64) {
+	e.mu.Lock()
+	e.fullSent[peer+"\x00"+fs.name] = fullIndexMark{gen: gen, at: time.Now()}
+	e.mu.Unlock()
 }
 
 // reconcileLinks recreates missing canonical dirs and declared symlinks. It
@@ -535,7 +638,7 @@ func (e *Engine) reconcileLinks() {
 }
 
 func (e *Engine) linkLoop(ctx context.Context) {
-	t := time.NewTicker(linkInterval)
+	t := time.NewTicker(e.linkEvery)
 	defer t.Stop()
 	for {
 		select {
@@ -574,7 +677,6 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 		// The canonical path is this daemon's mount, not a directory the
 		// user owns: there is nothing to adopt, heal or chown here.
 		e.mountStream(fs)
-		e.refreshTree(fs)
 		fs.refreshLocked()
 		e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state, "mount", fs.mounted())
 		return
@@ -598,7 +700,7 @@ func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 			e.logger.Debug("initial index", "store", fs.name, "error", err)
 		}
 	}
-	t := time.NewTicker(scanInterval)
+	t := time.NewTicker(e.scanEvery)
 	defer t.Stop()
 	for {
 		select {
@@ -619,7 +721,7 @@ func (e *Engine) broadcastFullIndex(fs *StoreState) error {
 	e.mu.Unlock()
 	for _, peer := range peers {
 		if e.storeSharedWith(fs, peer) {
-			if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
+			if err := e.offerIndex(peer, fs); err != nil {
 				return err
 			}
 		}
@@ -640,7 +742,6 @@ func (e *Engine) scanOnce(fs *StoreState) {
 		// the store holds.
 		fs.refreshLocked()
 		fs.scanMu.Unlock()
-		e.refreshTree(fs)
 		return
 	}
 	e.applyDir(fs, fs.root)
@@ -670,13 +771,17 @@ func (e *Engine) broadcastIndex(fs *StoreState, entries []*Entry) {
 	if len(sends) == 0 {
 		return
 	}
-	b, err := json.Marshal(frame{Type: "index", Store: fs.name, Entries: entries})
-	if err != nil {
-		return
-	}
-	b = append(b, '\n')
-	for _, s := range sends {
-		_ = s.Send(b)
+	for len(entries) > 0 {
+		n := min(len(entries), indexChunk)
+		b, err := json.Marshal(frame{Type: "index", Store: fs.name, Entries: entries[:n]})
+		if err != nil {
+			return
+		}
+		b = append(b, '\n')
+		for _, s := range sends {
+			_ = s.Send(b)
+		}
+		entries = entries[n:]
 	}
 }
 
@@ -695,6 +800,8 @@ func (e *Engine) sendListFor(fs *StoreState) []transport.Sender {
 
 // --- transport hooks -------------------------------------------------------
 
+var _ transport.UrgentHandler = (*Engine)(nil)
+
 // OnPeerConnected opens a sync session: the peer gets this machine's full
 // index for every store the two share, and remote stores may now go live.
 func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
@@ -702,13 +809,22 @@ func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 	e.sends[peer] = send
 	e.mu.Unlock()
 
+	digest := peerHasDigest(send)
 	for _, fs := range e.stores {
 		if !e.storeSharedWith(fs, peer) {
 			continue
 		}
-		if err := e.sendIndexTo(peer, fs, fs.db.All()); err != nil {
-			e.logger.Debug("send index", "peer", peer, "store", fs.name, "error", err)
+		gen := fs.db.Gen()
+		if digest && !e.digestInitiator(peer) {
+			// The peer opens the exchange; answering it is enough.
+			e.markFullSent(peer, fs, gen)
+			continue
 		}
+		if err := e.offerIndex(peer, fs); err != nil {
+			e.logger.Debug("send index", "peer", peer, "store", fs.name, "error", err)
+			continue
+		}
+		e.markFullSent(peer, fs, gen)
 	}
 	e.evaluatePeers()
 }
@@ -735,7 +851,7 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	}
 	pf := peerFrame{peer: peer, fr: fr}
 	switch fr.Type {
-	case "index":
+	case "index", "digest", "pull":
 		ch, ok := e.indexFrames[fr.Store]
 		if !ok {
 			return // a store this machine does not carry
@@ -757,9 +873,36 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 		// Cheap and latency-sensitive: a reply goes straight to the read
 		// that is blocked on it, never behind a queue of store work.
 		e.deliverRead(&fr)
+	case "wantErr":
+		e.handleWantErr(peer, &fr)
 	case "blob", "blobEnd":
-		e.enqueueFrame(e.blobFrames, pf)
+		e.enqueueFrame(e.blobFrames[blobShard(peer, &fr)], pf)
 	}
+}
+
+// OnPeerUrgent takes read replies straight off the link's read loop. A reader
+// blocked in the mount is waiting on exactly this frame, and queueing it behind
+// a large index apply (or a full blob queue) turned a busy sync into EIO in the
+// file manager. Frames are marshalled type-first, so a prefix check is enough
+// to leave every other frame alone without decoding it twice.
+func (e *Engine) OnPeerUrgent(peer string, line []byte) bool {
+	for _, prefix := range urgentPrefixes {
+		if bytes.HasPrefix(line, prefix) {
+			var fr frame
+			if err := json.Unmarshal(line, &fr); err != nil {
+				return true
+			}
+			e.deliverRead(&fr)
+			return true
+		}
+	}
+	return false
+}
+
+var urgentPrefixes = [][]byte{
+	[]byte(`{"type":"readData"`),
+	[]byte(`{"type":"readErr"`),
+	[]byte(`{"type":"verbsResult"`),
 }
 
 // evaluatePeers records whether each remote store has a holder reachable. It
@@ -831,7 +974,12 @@ func (e *Engine) Snapshot() []api.StoreSync {
 // stop job waiting on journals or files.
 func (e *Engine) Close() {
 	e.StopFrames()
+	e.cancelSends()
 	e.frameWG.Wait()
+	// The dispatchers are down, so nothing adds to these any more.
+	e.readWG.Wait()
+	e.finishWG.Wait()
+	e.sendWG.Wait()
 	e.mu.Lock()
 	incoming := make([]*incomingBlob, 0, len(e.incoming))
 	for key, inc := range e.incoming {

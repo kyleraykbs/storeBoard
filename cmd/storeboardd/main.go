@@ -14,6 +14,13 @@ import (
 )
 
 func main() {
+	// os.Exit skips deferred calls, so every exit path goes through run and
+	// its Close: exiting from the middle left the FUSE mount of a streamed
+	// store and the socket file behind.
+	os.Exit(run())
+}
+
+func run() int {
 	configPath := flag.String("config", "", "path to config file (default: $STOREBOARD_CONFIG, else $XDG_CONFIG_HOME/storeboard/config.json)")
 	flag.Parse()
 
@@ -32,25 +39,33 @@ func main() {
 	cfg, err := config.Load(config.ResolvePath(*configPath))
 	if err != nil {
 		logger.Error("invalid config", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	srv, err := server.New(cfg, logger)
 	if err != nil {
 		logger.Error("startup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
-	defer func() {
-		if err := srv.Close(); err != nil {
-			logger.Error("close failed", "error", err)
-		}
-	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The first signal starts a graceful shutdown; after it the default
+	// disposition is back, so a second Ctrl-C (or SIGTERM from a stop job
+	// that ran out of patience) kills a shutdown that hangs.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
+	code := 0
 	if err := srv.Run(ctx); err != nil {
 		logger.Error("server failed", "error", err)
-		os.Exit(1)
+		code = 1
 	}
+	if err := srv.Close(); err != nil {
+		logger.Error("close failed", "error", err)
+		code = 1
+	}
+	return code
 }

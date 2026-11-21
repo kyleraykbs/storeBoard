@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -405,4 +406,174 @@ func TestBackupCommands(t *testing.T) {
 			t.Errorf("%v: err = %v, want ErrHandled", args, err)
 		}
 	}
+}
+
+// fakeDaemon answers every POST with 200 and records each body by path.
+// Requests are sequential (the CLI waits for each answer), but the race
+// detector cannot see the socket as a happens-before edge, hence the lock.
+func fakeDaemon(t *testing.T) (string, func(string) ([]byte, bool)) {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "s.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	bodies := map[string][]byte{}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies[r.URL.Path] = b
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"store":"docs","path":"x"}`))
+	})}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	get := func(path string) ([]byte, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		b, ok := bodies[path]
+		return b, ok
+	}
+	return writeConfig(t, `{"configVersion": 2, "socket": "`+socket+`", "dataDir": "`+t.TempDir()+`"}`), get
+}
+
+// Value flags are taken with their value wherever they appear, paths are
+// resolved here (the daemon's working directory is its data dir), and an
+// extra positional or an unknown flag is an error rather than silently
+// dropped — `send docs f --as x` used to send f under its own name.
+func TestActingVerbsParseFlagsAndResolvePaths(t *testing.T) {
+	path, bodies := fakeDaemon(t)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) error {
+		var o, e bytes.Buffer
+		return Run(context.Background(), args, path, &o, &e)
+	}
+
+	if err := run("send", "--as", "in/store.txt", "docs", "local.txt"); err != nil {
+		t.Fatal(err)
+	}
+	var send struct{ Source, Path string }
+	sendBody, _ := bodies("/v1/stores/docs/send")
+	if err := json.Unmarshal(sendBody, &send); err != nil {
+		t.Fatal(err)
+	}
+	if send.Source != filepath.Join(wd, "local.txt") || send.Path != "in/store.txt" {
+		t.Fatalf("send body = %+v, want an absolute source and the --as path", send)
+	}
+
+	if err := run("backup", "restore", "docs", "--to=out/copy.txt", "note.txt", "--blob", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	var restore struct{ Path, Blob, To string }
+	restoreBody, _ := bodies("/v1/stores/docs/restore")
+	if err := json.Unmarshal(restoreBody, &restore); err != nil {
+		t.Fatal(err)
+	}
+	if restore.Path != "note.txt" || restore.Blob != "abc" || restore.To != filepath.Join(wd, "out", "copy.txt") {
+		t.Fatalf("restore body = %+v", restore)
+	}
+
+	for _, args := range [][]string{
+		{"send", "docs", "a.txt", "b.txt"},
+		{"send", "docs", "a.txt", "--as"},
+		{"send", "docs", "a.txt", "--bogus"},
+		{"backup", "restore", "docs", "note.txt", "extra"},
+		{"backup", "list", "docs", "note.txt", "--at", "x"},
+		{"store", "takeover", "docs", "other"},
+		{"cleanup", "--remove-orphans"},
+	} {
+		if err := run(args...); !errors.Is(err, ErrHandled) {
+			t.Errorf("%v: err = %v, want a usage error", args, err)
+		}
+	}
+	if _, ok := bodies("/v1/cleanup"); ok {
+		t.Fatal("cleanup --remove-orphans reached the daemon")
+	}
+}
+
+// doctor reports in the same shape whatever it finds, including a daemon that
+// does not answer, and exits non-zero only when a check failed.
+func TestDoctor(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		ConfigVersion: config.ConfigVersion,
+		Root:          filepath.Join(dir, "Storeboard"),
+		DataDir:       filepath.Join(dir, "data"),
+		Socket:        filepath.Join(dir, "storeboard.sock"),
+		Peer:          "laptop",
+		Peers: map[string]config.Peer{
+			"laptop": {Endpoints: []string{"127.0.0.1:4242"}},
+			"pool":   {Endpoints: []string{"127.0.0.1:1"}},
+		},
+		Groups: map[string]config.Group{
+			"family": {Peers: []string{"laptop", "pool"}},
+		},
+		StoreTree:   map[string]config.Store{"photos": {Group: "family"}},
+		Permissions: map[string]config.Permissions{},
+	}
+	cfgPath := filepath.Join(dir, "config.json")
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// No daemon yet: a failed check, not a bare error.
+	var out, errOut bytes.Buffer
+	if err := Run(ctx, []string{"doctor"}, cfgPath, &out, &errOut); !errors.Is(err, ErrHandled) {
+		t.Fatalf("doctor without a daemon = %v, want ErrHandled", err)
+	}
+	if !strings.Contains(out.String(), "FAIL  daemon") {
+		t.Fatalf("doctor without a daemon printed %q", out.String())
+	}
+
+	srv, err := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	waitForSocket(t, cfg.Socket)
+
+	out.Reset()
+	err = Run(ctx, []string{"doctor", "--json"}, cfgPath, &out, &errOut)
+	var doc api.Doctor
+	if jerr := json.Unmarshal(out.Bytes(), &doc); jerr != nil {
+		t.Fatalf("doctor --json: %v\n%s", jerr, out.String())
+	}
+	names := map[string]api.Check{}
+	for _, c := range doc.Checks {
+		names[c.Name] = c
+	}
+	for _, want := range []string{"disk", "peer pool", "store photos", "transfers"} {
+		if _, ok := names[want]; !ok {
+			t.Errorf("no %q check in %+v", want, doc.Checks)
+		}
+	}
+	if names["peer pool"].Status != api.CheckWarn {
+		t.Errorf("an unreachable peer = %+v, want a warning", names["peer pool"])
+	}
+	// Only a failing disk on the test machine may fail the run.
+	if (err != nil) != (doc.Status == api.CheckFail) || (doc.Status == api.CheckFail && names["disk"].Status != api.CheckFail) {
+		t.Errorf("doctor exit = %v with status %s: %+v", err, doc.Status, doc.Checks)
+	}
+
+	out.Reset()
+	_ = Run(ctx, []string{"doctor"}, cfgPath, &out, &errOut)
+	t.Log("\n" + out.String())
+	if !strings.Contains(out.String(), "store photos") || !strings.Contains(out.String(), "-> ") {
+		t.Errorf("human doctor output: %q", out.String())
+	}
+	cancel()
+	<-done
 }

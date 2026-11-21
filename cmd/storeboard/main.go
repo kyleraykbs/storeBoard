@@ -30,7 +30,11 @@ func main() {
 	if err := cli.Run(ctx, flag.Args(), *configPath, os.Stdout, os.Stderr); err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
-			return
+			// Interrupted is not success: a script running `storeboard send`
+			// must not read a Ctrl-C or a SIGTERM as "the file is on the mesh".
+			// 130 is the shell's own convention for death by SIGINT.
+			fmt.Fprintln(os.Stderr, "storeboard: interrupted")
+			os.Exit(130)
 		case errors.Is(err, cli.ErrHandled):
 			// The command already wrote its report; the exit code is the news.
 			os.Exit(1)

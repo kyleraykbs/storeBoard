@@ -146,9 +146,26 @@ func (e *Engine) writeQueue(fs *StoreState) error {
 	return os.Rename(tmp, index)
 }
 
-// enqueue records one op, then tries to hand it to a holder straight away.
-// Callers hold scanMu.
+// enqueue records one op. Callers hold queueMu - the one lock that guards the
+// queue. (Some callers used to hold scanMu instead, so two writers could append
+// at once, lose an op, or interleave two rewrites of the queue file.)
+//
+// A put or a delete supersedes an earlier put of the same path that no holder
+// has acknowledged: those bytes are a version nobody will ever ask for again,
+// and keeping them grew the queue - and a capped queue's count - forever.
 func (e *Engine) enqueue(fs *StoreState, op queueOp) error {
+	if op.Op == opPut || op.Op == opDelete {
+		kept := fs.queue[:0]
+		for _, prev := range fs.queue {
+			if prev.Op == opPut && prev.Path == op.Path && prev.ID != op.ID {
+				fs.queuedBytes -= prev.Size
+				_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), prev.ID))
+				continue
+			}
+			kept = append(kept, prev)
+		}
+		fs.queue = kept
+	}
 	fs.queue = append(fs.queue, op)
 	fs.queuedBytes += op.Size
 	if err := e.writeQueue(fs); err != nil {
@@ -157,7 +174,14 @@ func (e *Engine) enqueue(fs *StoreState, op queueOp) error {
 	return nil
 }
 
-// dropQueued forgets an op and its bytes. Callers hold scanMu.
+// enqueueOp is enqueue for callers that do not hold queueMu.
+func (e *Engine) enqueueOp(fs *StoreState, op queueOp) error {
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
+	return e.enqueue(fs, op)
+}
+
+// dropQueued forgets an op and its bytes. Callers hold queueMu.
 func (e *Engine) dropQueued(fs *StoreState, id string) {
 	kept := fs.queue[:0]
 	for _, op := range fs.queue {
@@ -175,20 +199,36 @@ func (e *Engine) dropQueued(fs *StoreState, id string) {
 }
 
 // ackQueue drops the ops a peer has now seen. A remote entry that carries this
-// machine's counter for the path is proof the change landed.
+// machine's counter for the path is proof the change landed. Every kind of op
+// must be acknowledged somehow: an op that never is stays queued forever, is
+// re-sent on every flush, and (for a put) keeps its bytes on disk.
 func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
-	if !fs.stream || len(fs.queue) == 0 {
+	if !fs.stream {
 		return
 	}
 	fs.queueMu.Lock()
 	defer fs.queueMu.Unlock()
+	if len(fs.queue) == 0 {
+		return
+	}
 	for _, op := range append([]queueOp(nil), fs.queue...) {
 		switch op.Op {
 		case opPut:
-			if rem.Path == op.Path && rem.Blob == op.Blob && vvCovers(rem.VV, op.VV) {
+			// Landed as written; or seen and then deleted; or parked whole
+			// as a conflict copy because a concurrent version won the path.
+			// A covering entry with different bytes is not enough: the
+			// holder may still be about to fetch ours as its conflict copy.
+			landed := rem.Path == op.Path && vvCovers(rem.VV, op.VV) && (rem.Blob == op.Blob || rem.Deleted)
+			parked := rem.Path == conflictPath(op.Path, op.Blob) && rem.Blob == op.Blob && !rem.Deleted
+			if landed || parked {
 				e.dropQueued(fs, op.ID)
 			}
-		case opDelete, opRmdir:
+		case opDelete, opRmdir, opMkdir:
+			// No bytes ride on these: once the holder's entry covers ours,
+			// it has seen the change, whatever it did next.
+			if rem.Path == op.Path && vvCovers(rem.VV, op.VV) {
+				e.dropQueued(fs, op.ID)
+			}
 		case opRename:
 			for _, move := range op.Moves {
 				if rem.Path == move.New.Path && !rem.Deleted && vvCovers(rem.VV, move.New.VV) {
@@ -213,8 +253,35 @@ func vvCovers(remote, mine map[string]uint64) bool {
 // flushQueue hands queued changes to the best holder. Every op travels as an
 // ordinary index entry (or a rename frame), so the holder's version-vector
 // rules decide what wins and a queued write can never overwrite a newer one.
+//
+// Every write through the mount asks for a flush. Concurrent requests
+// coalesce into one more pass rather than each re-sending the whole queue.
 func (e *Engine) flushQueue(fs *StoreState) {
-	if !fs.stream || len(fs.queue) == 0 {
+	if !fs.stream {
+		return
+	}
+	if !fs.flushing.CompareAndSwap(false, true) {
+		fs.flushAgain.Store(true)
+		return
+	}
+	for {
+		fs.flushAgain.Store(false)
+		e.flushQueueOnce(fs)
+		fs.flushing.Store(false)
+		if !fs.flushAgain.Load() || !fs.flushing.CompareAndSwap(false, true) {
+			return
+		}
+	}
+}
+
+// flushBatch bounds the entries one flushed index frame carries.
+const flushBatch = 512
+
+func (e *Engine) flushQueueOnce(fs *StoreState) {
+	fs.queueMu.Lock()
+	ops := append([]queueOp(nil), fs.queue...)
+	fs.queueMu.Unlock()
+	if len(ops) == 0 {
 		return
 	}
 	peers := e.holdersFor(fs)
@@ -222,11 +289,25 @@ func (e *Engine) flushQueue(fs *StoreState) {
 		return
 	}
 	peer := peers[0]
-	fs.queueMu.Lock()
-	ops := append([]queueOp(nil), fs.queue...)
-	fs.queueMu.Unlock()
+	var batch []*Entry
+	send := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		err := e.sendIndexTo(peer, fs, batch)
+		batch = nil
+		if err != nil {
+			e.logger.Debug("flush queue", "store", fs.name, "error", err)
+			return false
+		}
+		return true
+	}
 	for _, op := range ops {
 		if op.Op == opRename {
+			// A rename is ordered against the entries around it.
+			if !send() {
+				return
+			}
 			fr := frame{Type: "rename", Store: fs.name, Path: op.Path, To: op.To, Moves: op.Moves}
 			if err := e.sendTo(peer, fr); err != nil {
 				e.logger.Debug("flush rename", "store", fs.name, "path", op.Path, "error", err)
@@ -241,11 +322,12 @@ func (e *Engine) flushQueue(fs *StoreState) {
 		case opMkdir:
 			ent = &Entry{Path: op.Path, Dir: true, Mode: op.Mode, VV: op.VV}
 		}
-		if err := e.sendIndexTo(peer, fs, []*Entry{ent}); err != nil {
-			e.logger.Debug("flush queue", "store", fs.name, "path", op.Path, "error", err)
+		batch = append(batch, ent)
+		if len(batch) >= flushBatch && !send() {
 			return
 		}
 	}
+	send()
 }
 
 // queuedBlob returns the queued bytes for a blob this machine wrote but has
@@ -309,7 +391,6 @@ func (m *storeMutator) Create(path string, mode uint32) (streamfs.PendingFile, e
 		pf.Close()
 		return nil, err
 	}
-	m.e.refreshTree(m.fs)
 	return pf, nil
 }
 
@@ -455,11 +536,10 @@ func (m *storeMutator) Remove(path string) error {
 	vv := m.e.nextVV(m.fs, ent)
 	tomb := &Entry{Path: path, Deleted: true, Dir: ent.Dir, VV: vv}
 	_ = m.fs.db.Put(tomb)
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: path, VV: vv}); err != nil {
+	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: path, VV: vv}); err != nil {
 		return err
 	}
-	m.e.refreshTree(m.fs)
-	m.e.broadcastIndex(m.fs, []*Entry{tomb})
+	go m.e.broadcastIndex(m.fs, []*Entry{tomb})
 	go m.e.flushQueue(m.fs)
 	return nil
 }
@@ -473,11 +553,10 @@ func (m *storeMutator) MakeDir(path string, mode uint32) error {
 	vv := m.e.nextVV(m.fs, m.fs.db.Get(path))
 	ent := &Entry{Path: path, Dir: true, Mode: mode, VV: vv}
 	_ = m.fs.db.Put(ent)
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opMkdir, Path: path, Mode: mode, VV: vv}); err != nil {
+	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opMkdir, Path: path, Mode: mode, VV: vv}); err != nil {
 		return err
 	}
-	m.e.refreshTree(m.fs)
-	m.e.broadcastIndex(m.fs, []*Entry{ent})
+	go m.e.broadcastIndex(m.fs, []*Entry{ent})
 	go m.e.flushQueue(m.fs)
 	return nil
 }
@@ -494,11 +573,10 @@ func (m *storeMutator) RemoveDir(path string) error {
 	vv := m.e.nextVV(m.fs, m.fs.db.Get(path))
 	tomb := &Entry{Path: path, Dir: true, Deleted: true, VV: vv}
 	_ = m.fs.db.Put(tomb)
-	if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRmdir, Path: path, VV: vv}); err != nil {
+	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opRmdir, Path: path, VV: vv}); err != nil {
 		return err
 	}
-	m.e.refreshTree(m.fs)
-	m.e.broadcastIndex(m.fs, []*Entry{tomb})
+	go m.e.broadcastIndex(m.fs, []*Entry{tomb})
 	go m.e.flushQueue(m.fs)
 	return nil
 }
@@ -510,15 +588,37 @@ func (m *storeMutator) RemoveDir(path string) error {
 func (e *Engine) moveQueuedPut(fs *StoreState, from, to string, vv map[string]uint64) bool {
 	fs.queueMu.Lock()
 	defer fs.queueMu.Unlock()
+	idx := -1
 	for i := range fs.queue {
 		if fs.queue[i].Op == opPut && fs.queue[i].Path == from {
-			fs.queue[i].Path = to
-			fs.queue[i].VV = vv
-			_ = e.writeQueue(fs)
-			return true
+			idx = i
+			break
 		}
 	}
-	return false
+	if idx < 0 {
+		return false
+	}
+	op := fs.queue[idx]
+	op.Path = to
+	op.VV = vv
+	// The upload now happens after everything already queued - including
+	// the delete of the file it replaces, which must not reach the holder
+	// after it - and an older upload of the destination is superseded.
+	kept := fs.queue[:0]
+	for i, prev := range fs.queue {
+		if i == idx {
+			continue
+		}
+		if prev.Op == opPut && prev.Path == to {
+			fs.queuedBytes -= prev.Size
+			_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), prev.ID))
+			continue
+		}
+		kept = append(kept, prev)
+	}
+	fs.queue = append(kept, op)
+	_ = e.writeQueue(fs)
+	return true
 }
 
 func (m *storeMutator) Rename(from, to string) error {
@@ -530,25 +630,25 @@ func (m *storeMutator) Rename(from, to string) error {
 	}
 	m.fs.scanMu.Lock()
 	defer m.fs.scanMu.Unlock()
-	prefix := from + "/"
 	var entries []*Entry
-	for _, ent := range m.fs.db.All() {
-		if ent.Deleted || (ent.Path != from && !strings.HasPrefix(ent.Path, prefix)) {
-			continue
+	for _, ent := range m.fs.db.Under(from) {
+		if !ent.Deleted {
+			entries = append(entries, ent)
 		}
-		entries = append(entries, ent)
 	}
 	if len(entries) == 0 {
 		return os.ErrNotExist
 	}
 	dst := m.fs.db.Get(to)
+	var replaced map[string]uint64
 	if dst != nil && !dst.Deleted {
 		if len(entries) != 1 || entries[0].Dir || dst.Dir {
 			return os.ErrExist
 		}
 		vv := m.e.nextVV(m.fs, dst)
+		replaced = vv
 		_ = m.fs.db.Put(&Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv})
-		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
+		if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
 			return err
 		}
 	}
@@ -559,6 +659,12 @@ func (m *storeMutator) Rename(from, to string) error {
 			newPath = to + strings.TrimPrefix(ent.Path, from)
 		}
 		vv := m.e.nextVV(m.fs, ent)
+		if replaced != nil {
+			// The file that lands on the destination replaces what was
+			// there: it must dominate that version, or a holder sees two
+			// concurrent writes and parks one of them as a conflict.
+			vv = MergeVV(vv, replaced)
+		}
 		old := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
 		moved := ent.clone()
 		moved.Path = newPath
@@ -566,7 +672,7 @@ func (m *storeMutator) Rename(from, to string) error {
 		_ = m.fs.db.Put(old)
 		_ = m.fs.db.Put(moved)
 		if m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) {
-			if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
+			if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
 				return err
 			}
 		} else {
@@ -574,31 +680,30 @@ func (m *storeMutator) Rename(from, to string) error {
 		}
 	}
 	if len(moves) > 0 {
-		if err := m.e.enqueue(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves, VV: moves[0].New.VV}); err != nil {
+		if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves, VV: moves[0].New.VV}); err != nil {
 			return err
 		}
 	}
-	m.e.refreshTree(m.fs)
 	go m.e.flushQueue(m.fs)
 	return nil
 }
 
 // childrenLocked lists a directory's immediate children. Callers hold scanMu.
 func (fs *StoreState) childrenLocked(dir string) []string {
-	var out []string
+	seen := map[string]bool{}
 	prefix := dir + "/"
-	for _, ent := range fs.db.All() {
-		if ent.Deleted || !strings.HasPrefix(ent.Path, prefix) {
+	for _, ent := range fs.db.Under(dir) {
+		if ent.Deleted || ent.Path == dir {
 			continue
 		}
-		rest := ent.Path[len(prefix):]
-		name := rest
-		if i := strings.IndexByte(rest, '/'); i >= 0 {
-			name = rest[:i]
-		}
+		name, _, _ := strings.Cut(ent.Path[len(prefix):], "/")
 		if name != "" {
-			out = append(out, name)
+			seen[name] = true
 		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
@@ -962,7 +1067,6 @@ func (p *pendingFile) dropCreatedEntry() {
 	}
 	_ = p.fs.db.Put(tomb)
 	p.fs.queueMu.Unlock()
-	p.e.refreshTree(p.fs)
 }
 
 // recordCurrent journals and queues the bytes currently in the scratch file.
@@ -1050,8 +1154,7 @@ func (p *pendingFile) recordCurrent() error {
 	}
 	p.fs.queueMu.Unlock()
 
-	p.e.refreshTree(p.fs)
-	p.e.broadcastIndex(p.fs, []*Entry{ent})
+	go p.e.broadcastIndex(p.fs, []*Entry{ent})
 	go p.e.flushQueue(p.fs)
 	return nil
 }

@@ -942,9 +942,12 @@ func TestSpaceAndCleanupAgainstLivePair(t *testing.T) {
 	if _, err := os.Stat(orpRoot); err != nil {
 		t.Fatalf("cleanup removed an orphan by default: %v", err)
 	}
-	explicit := cliRun(t, a, "cleanup", "--remove-orphans", "--json")
-	if !strings.Contains(explicit, "old-store") {
-		t.Fatalf("explicit cleanup did not report the preserved orphan:\n%s", explicit)
+	// --remove-orphans is not implemented, and says so instead of quietly
+	// running an ordinary cleanup: the flag fails and nothing is touched.
+	cli, _ := binaries(t)
+	out, err := exec.Command(cli, "-config", a.cfgPath, "cleanup", "--remove-orphans", "--json").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "not implemented") {
+		t.Fatalf("cleanup --remove-orphans = %v:\n%s\nwant an explicit not-implemented failure", err, out)
 	}
 	if _, err := os.Stat(orpRoot); err != nil {
 		t.Fatalf("cleanup deleted orphan data even though deletion is unimplemented: %v", err)

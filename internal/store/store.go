@@ -7,10 +7,12 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // ChunkSize is the blob-frame payload size on the wire.
@@ -36,18 +38,42 @@ func Open(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// BlobPath is where a blob with this sum lives.
+// ErrInvalidSum refuses a blob name that is not a sha256 in lowercase hex.
+var ErrInvalidSum = errors.New("store: not a sha256 blob name")
+
+// ValidSum reports whether sum can name a blob: exactly 64 lowercase hex
+// digits. Sums arrive from peers; anything else would be joined into a path,
+// and "../../etc/shadow" is not a hash.
+func ValidSum(sum string) bool {
+	if len(sum) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(sum); i++ {
+		c := sum[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// BlobPath is where a blob with this sum lives, or "" for a sum that cannot
+// name a blob.
 func (s *Store) BlobPath(sum string) string {
-	if len(sum) < 5 {
-		return filepath.Join(s.root, "invalid", sum)
+	if !ValidSum(sum) {
+		return ""
 	}
 	return filepath.Join(s.root, sum[:2], sum[2:4], sum)
 }
 
 // Has reports whether the blob is already stored.
 func (s *Store) Has(sum string) bool {
-	_, err := os.Stat(s.BlobPath(sum))
-	return err == nil
+	p := s.BlobPath(sum)
+	if p == "" {
+		return false
+	}
+	info, err := os.Stat(p)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // Temp creates a scratch file on the same filesystem as the store, so
@@ -57,18 +83,23 @@ func (s *Store) Temp() (*os.File, error) {
 }
 
 // Open reads a stored blob.
-func (s *Store) Open(sum string) (io.ReadCloser, error) {
-	return os.Open(s.BlobPath(sum))
+func (s *Store) Open(sum string) (*os.File, error) {
+	p := s.BlobPath(sum)
+	if p == "" {
+		return nil, ErrInvalidSum
+	}
+	return os.Open(p)
 }
 
 // Remove deletes a stored blob. Callers only do this when the bytes exist
 // somewhere else on this machine (a materialised file, or a kept version), so
 // removal never destroys the last copy.
 func (s *Store) Remove(sum string) error {
-	if sum == "" {
+	p := s.BlobPath(sum)
+	if p == "" {
 		return nil
 	}
-	err := os.Remove(s.BlobPath(sum))
+	err := os.Remove(p)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -80,13 +111,36 @@ func (s *Store) Remove(sum string) error {
 // leave a blob that the journal already references but the store lacks.
 func (s *Store) Adopt(tmpPath, sum string) error {
 	dst := s.BlobPath(sum)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if dst == "" {
+		return ErrInvalidSum
+	}
+	leaf := filepath.Dir(dst)
+	mid := filepath.Dir(leaf)
+	// The fan-out directories are created on first use. A directory entry
+	// is only durable once its parent is fsynced, so a new one is synced
+	// into its parent, or a crash could lose a blob the journal references.
+	_, midErr := os.Stat(mid)
+	_, leafErr := os.Stat(leaf)
+	if err := os.MkdirAll(leaf, 0o700); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, dst); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	if err := syncDir(leaf); err != nil {
+		return err
+	}
+	if leafErr != nil {
+		if err := syncDir(mid); err != nil {
+			return err
+		}
+	}
+	if midErr != nil {
+		if err := syncDir(s.root); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Sum hashes a reader (hex sha256).
@@ -119,7 +173,7 @@ func syncDir(dir string) error {
 	if err := d.Sync(); err != nil {
 		// Directory fsync is unsupported on some filesystems; the rename
 		// still succeeded, so this is not fatal.
-		if os.IsPermission(err) {
+		if os.IsPermission(err) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
 			return nil
 		}
 		return err

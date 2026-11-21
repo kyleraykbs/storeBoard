@@ -297,3 +297,29 @@ func TestRemoteStoreIgnoresBackup(t *testing.T) {
 	}
 	local.eng.Close()
 }
+
+// A version recorded after a prune must survive a restart. The prune renames
+// a compacted file into place; appending through the old handle wrote to the
+// unlinked inode.
+func TestHistoryAppendsSurvivePrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.ndjson")
+	h, err := OpenHistory(path, time.Hour*24*365)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	h.Record("a.txt", Version{Blob: strings.Repeat("a", 64), Size: 1, MTime: now.Add(-time.Hour).UnixNano(), Time: now.Add(-time.Hour).UnixNano()})
+	h.Prune(now)
+	h.Record("a.txt", Version{Blob: strings.Repeat("b", 64), Size: 1, MTime: now.UnixNano(), Time: now.UnixNano()})
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := OpenHistory(path, time.Hour*24*365)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if got := len(again.Versions("a.txt")); got != 2 {
+		t.Fatalf("versions after reopen = %d, want 2", got)
+	}
+}

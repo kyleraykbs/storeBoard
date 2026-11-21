@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,12 +36,16 @@ Commands:
   store takeover <name>
                   turn a declared symlink path that already holds files
                   into a link to the store, keeping and syncing that content
-  send <store> <file>
+  send <store> <file> [--as PATH]
+                  copy a file of yours into a store (the original stays
+                  where it is); a name already taken is parked, not lost
   space           show how much disk each data category and each
                   unconfigured store uses
-  cleanup         expire trash and history, collect redundant blobs,
-                  optionally removing data for unconfigured stores
+  cleanup         expire trash and history, collect redundant blobs; data
+                  of unconfigured stores is reported, never deleted
   status          show the daemon's status document
+  doctor          check the daemon over and explain anything wrong:
+                  mounts, queues, peers, clocks, disk, stalled transfers
   version         print version information
   help            show this help
 
@@ -75,6 +80,8 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return cleanupCmd(ctx, configPath, rest, stdout, stderr)
 	case "status":
 		return status(ctx, configPath, rest, stdout, stderr)
+	case "doctor":
+		return doctorCmd(ctx, configPath, rest, stdout, stderr)
 	case "send":
 		return sendCmd(ctx, configPath, rest, stdout, stderr)
 	case "store":
@@ -218,7 +225,7 @@ func status(ctx context.Context, configPath string, args []string, stdout, stder
 		return err
 	}
 
-	body, err := fetch(ctx, cfg.Socket, "/v1/status")
+	body, err := fetch(ctx, cfg.Socket, "/v1/status", statusTimeout)
 	if err != nil {
 		return fmt.Errorf("cannot reach storeboardd at %s: %w (is it running?)", cfg.Socket, err)
 	}
@@ -236,6 +243,79 @@ func status(ctx context.Context, configPath string, args []string, stdout, stder
 	return nil
 }
 
+// doctorCmd prints the daemon's health report. It exits non-zero when any
+// check failed, so it can gate a deploy or a timer; warnings alone do not.
+// A config that does not load or a daemon that does not answer are findings
+// too, reported in the same shape.
+func doctorCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
+	jsonOut, err := jsonFlag(args, "doctor", stderr)
+	if err != nil {
+		return err
+	}
+	var doc api.Doctor
+	path := config.ResolvePath(configPath)
+	cfg, err := config.Load(path)
+	switch {
+	case err != nil:
+		doc = api.Doctor{APIVersion: api.Version, Status: api.CheckFail, Checks: []api.Check{{
+			Name: "config", Status: api.CheckFail, Detail: err.Error(), Hint: "fix it, then `storeboard config check`",
+		}}}
+	default:
+		body, ferr := fetch(ctx, cfg.Socket, "/v1/doctor", statusTimeout)
+		if ferr == nil {
+			ferr = json.Unmarshal(body, &doc)
+		}
+		if ferr != nil {
+			doc = api.Doctor{APIVersion: api.Version, Status: api.CheckFail, Checks: []api.Check{{
+				Name: "daemon", Status: api.CheckFail, Detail: fmt.Sprintf("cannot reach storeboardd at %s: %v", cfg.Socket, ferr),
+				Hint: "is it running? `systemctl status storeboard`",
+			}}}
+		}
+	}
+	if jsonOut {
+		if err := writeJSON(stdout, doc); err != nil {
+			return err
+		}
+	} else {
+		renderDoctor(stdout, &doc)
+	}
+	if doc.Status == api.CheckFail {
+		return ErrHandled
+	}
+	return nil
+}
+
+func renderDoctor(w io.Writer, doc *api.Doctor) {
+	width := 0
+	for _, c := range doc.Checks {
+		width = max(width, len(c.Name))
+	}
+	warns, fails := 0, 0
+	for _, c := range doc.Checks {
+		mark := "ok  "
+		switch c.Status {
+		case api.CheckWarn:
+			mark = "warn"
+			warns++
+		case api.CheckFail:
+			mark = "FAIL"
+			fails++
+		}
+		fmt.Fprintf(w, "%s  %-*s  %s\n", mark, width, c.Name, c.Detail)
+		if c.Hint != "" && c.Status != api.CheckOK {
+			fmt.Fprintf(w, "      %-*s  -> %s\n", width, "", c.Hint)
+		}
+	}
+	switch {
+	case fails > 0:
+		fmt.Fprintf(w, "\n%d failed, %d warnings\n", fails, warns)
+	case warns > 0:
+		fmt.Fprintf(w, "\n%d warnings\n", warns)
+	default:
+		fmt.Fprintln(w, "\nall good")
+	}
+}
+
 // spaceCmd shows how much disk each category of daemon state uses.
 func spaceCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
 	jsonOut, err := jsonFlag(args, "space", stderr)
@@ -246,7 +326,7 @@ func spaceCmd(ctx context.Context, configPath string, args []string, stdout, std
 	if err != nil {
 		return err
 	}
-	body, err := fetch(ctx, cfg.Socket, "/v1/space")
+	body, err := fetch(ctx, cfg.Socket, "/v1/space", statusTimeout)
 	if err != nil {
 		return fmt.Errorf("cannot reach storeboardd at %s: %w (is it running?)", cfg.Socket, err)
 	}
@@ -263,17 +343,21 @@ func spaceCmd(ctx context.Context, configPath string, args []string, stdout, std
 }
 
 // cleanupCmd runs expiry, pruning and blob collection. Orphaned store data
-// is reported but never destroyed unless --remove-orphans is passed.
+// is reported and never destroyed: the engine does not implement removing it
+// (it cannot tell a retired store from an unplugged disk or a renamed one).
 func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	removeOrphans, jsonOut := false, false
+	jsonOut := false
 	for _, arg := range args {
 		switch arg {
 		case "--remove-orphans":
-			removeOrphans = true
+			// Once suggested by this command's own output and silently
+			// ignored by the daemon. Saying so is the honest answer.
+			fmt.Fprintln(stderr, "storeboard: cleanup: --remove-orphans is not implemented; orphaned store data is only reported. Delete it by hand once you are sure the store is gone (storeboard space lists where it is)")
+			return ErrHandled
 		case "--json":
 			jsonOut = true
 		case "-h", "--help":
-			fmt.Fprintln(stderr, "storeboard: usage: storeboard cleanup [--remove-orphans] [--json]")
+			fmt.Fprintln(stderr, "storeboard: usage: storeboard cleanup [--json]")
 			return ErrHandled
 		default:
 			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n", arg)
@@ -284,7 +368,7 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/cleanup", map[string]any{"removeOrphans": removeOrphans})
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/cleanup", map[string]any{}, noTimeout)
 	if err != nil {
 		return fmt.Errorf("cleanup: %w", err)
 	}
@@ -321,7 +405,7 @@ func renderCleanup(w io.Writer, res *api.CleanupResult) {
 		for _, id := range res.OrphanStores {
 			fmt.Fprintf(w, "  %s\n", id)
 		}
-		fmt.Fprintln(w, "orphan data was left in place; re-run with --remove-orphans to delete it")
+		fmt.Fprintln(w, "orphan data was left in place; storeboard never deletes it on its own")
 	} else {
 		fmt.Fprintln(w, "orphaned store data: none")
 	}
@@ -340,10 +424,21 @@ func humanBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f%ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+// Client timeouts. Status-grade reads answer from memory and a daemon that
+// cannot answer them in seconds is wedged, so they fail fast. The acting verbs
+// move real bytes — a send of a video, a takeover of a photo library, a restore
+// through a holder — and a fixed deadline only ever cut them off half done; they
+// run until they finish or the user interrupts (ctx).
+const (
+	statusTimeout = 10 * time.Second
+	listTimeout   = 2 * time.Minute
+	noTimeout     = time.Duration(0)
+)
+
 // call sends one request to the daemon over its unix socket and returns the
 // body, with the daemon's own error message when it refuses. A non-nil body
-// is encoded as JSON.
-func call(ctx context.Context, socket, method, path string, body any) ([]byte, error) {
+// is encoded as JSON. A zero timeout means none beyond ctx.
+func call(ctx context.Context, socket, method, path string, body any, timeout time.Duration) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -353,7 +448,7 @@ func call(ctx context.Context, socket, method, path string, body any) ([]byte, e
 		reader = bytes.NewReader(encoded)
 	}
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
@@ -388,8 +483,8 @@ func call(ctx context.Context, socket, method, path string, body any) ([]byte, e
 	return respBody, nil
 }
 
-func fetch(ctx context.Context, socket, path string) ([]byte, error) {
-	return call(ctx, socket, http.MethodGet, path, nil)
+func fetch(ctx context.Context, socket, path string, timeout time.Duration) ([]byte, error) {
+	return call(ctx, socket, http.MethodGet, path, nil, timeout)
 }
 
 // backupCmd is the backup verb group: list a file's recorded versions and
@@ -411,23 +506,56 @@ func backupCmd(ctx context.Context, configPath string, args []string, stdout, st
 	}
 }
 
-// splitFlags separates the shared flags from positional arguments, so a
-// command can take both without the flag parser tripping over the names.
-func splitFlags(args []string, command string, stderr io.Writer) (bool, []string, error) {
+// splitFlags separates flags from positional arguments, so a command can take
+// both in any order. valueFlags are the flags that take a value (`--as x` or
+// `--as=x`); the value is consumed with its flag. The old splitter knew only
+// --json, so `send s f --as x` read `--as` and `x` as two more positionals and
+// silently ignored them, and a typo'd flag became a path. Now any other
+// argument starting with "-" is an error, and `--` ends the flags for a path
+// that really does start with one.
+func splitFlags(args []string, command string, valueFlags []string, stderr io.Writer) (bool, []string, map[string]string, error) {
 	var flags, positional []string
-	for _, arg := range args {
-		if arg == "--json" || arg == "-h" || arg == "--help" {
-			flags = append(flags, arg)
-			continue
+	values := map[string]string{}
+	takesValue := func(name string) bool {
+		for _, f := range valueFlags {
+			if f == name {
+				return true
+			}
 		}
-		positional = append(positional, arg)
+		return false
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			positional = append(positional, args[i+1:]...)
+			i = len(args)
+		case arg == "--json" || arg == "-h" || arg == "--help":
+			flags = append(flags, arg)
+		case strings.HasPrefix(arg, "-") && arg != "-":
+			name, value, inline := strings.Cut(arg, "=")
+			if !takesValue(name) {
+				fmt.Fprintf(stderr, "storeboard: %s: unknown flag %q\n", command, arg)
+				return false, nil, nil, ErrHandled
+			}
+			if !inline {
+				if i+1 >= len(args) {
+					return false, nil, nil, usageErr(stderr, command, name+" needs a value")
+				}
+				i++
+				value = args[i]
+			}
+			values[name] = value
+		default:
+			positional = append(positional, arg)
+		}
 	}
 	jsonOut, err := jsonFlag(flags, command, stderr)
-	return jsonOut, positional, err
+	return jsonOut, positional, values, err
 }
 
 func backupList(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "backup list <store> [path]", stderr)
+	jsonOut, positional, _, err := splitFlags(args, "backup list <store> [path]", nil, stderr)
 	if err != nil {
 		return err
 	}
@@ -449,7 +577,7 @@ func backupList(ctx context.Context, configPath string, args []string, stdout, s
 	if path != "" {
 		query += "?path=" + url.QueryEscape(path)
 	}
-	body, err := fetch(ctx, cfg.Socket, query)
+	body, err := fetch(ctx, cfg.Socket, query, listTimeout)
 	if err != nil {
 		return fmt.Errorf("backup list %s: %w", store, err)
 	}
@@ -492,11 +620,11 @@ func backupList(ctx context.Context, configPath string, args []string, stdout, s
 }
 
 func backupRestore(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "backup restore <store> <path>", stderr)
+	jsonOut, positional, values, err := splitFlags(args, "backup restore <store> <path>", []string{"--blob", "--at", "--to"}, stderr)
 	if err != nil {
 		return err
 	}
-	if len(positional) < 2 {
+	if len(positional) != 2 {
 		fmt.Fprintln(stderr, "storeboard: usage: storeboard backup restore <store> <path> [--blob HASH] [--at RFC3339] [--to PATH] [--json]")
 		return ErrHandled
 	}
@@ -505,40 +633,23 @@ func backupRestore(ctx context.Context, configPath string, args []string, stdout
 		Blob string `json:"blob,omitempty"`
 		At   string `json:"at,omitempty"`
 		To   string `json:"to,omitempty"`
-	}{Path: positional[1]}
+	}{Path: positional[1], Blob: values["--blob"], At: values["--at"], To: values["--to"]}
 	store := positional[0]
-
-	// The value flags take an argument, which is why this walks by index.
-	for i := range args {
-		want := ""
-		switch args[i] {
-		case "--blob":
-			want = "1"
-		case "--at":
-			want = "2"
-		case "--to":
-			want = "3"
-		default:
-			continue
+	if req.To != "" {
+		// The daemon's working directory is its data dir, not this shell's:
+		// a relative --to has to be resolved here, where it was meant.
+		abs, err := filepath.Abs(req.To)
+		if err != nil {
+			return fmt.Errorf("--to %s: %w", req.To, err)
 		}
-		if i+1 >= len(args) {
-			return usageErr(stderr, "backup restore <store> <path>", args[i]+" needs a value")
-		}
-		switch want {
-		case "1":
-			req.Blob = args[i+1]
-		case "2":
-			req.At = args[i+1]
-		case "3":
-			req.To = args[i+1]
-		}
+		req.To = abs
 	}
 
 	cfg, err := config.Load(config.ResolvePath(configPath))
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/restore", req)
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/restore", req, noTimeout)
 	if err != nil {
 		return fmt.Errorf("backup restore %s: %w", store, err)
 	}
@@ -574,38 +685,34 @@ func shortBlob(blob string) string {
 // sendCmd is the send verb: copy a local file into a store, which is how a
 // share sheet and a desktop both put a file on the mesh. The daemon does the
 // copying, so the file must be one it can see — the same machine, in
-// practice. Nothing is overwritten: a taken name is parked and reported.
+// practice — and one the caller owns. The original is left where it is.
+// Nothing is overwritten: a taken name is parked and reported.
 func sendCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut, positional, err := splitFlags(args, "send <store> <file>", stderr)
+	jsonOut, positional, values, err := splitFlags(args, "send <store> <file>", []string{"--as"}, stderr)
 	if err != nil {
 		return err
 	}
-	if len(positional) < 2 {
+	if len(positional) != 2 {
 		fmt.Fprintln(stderr, "storeboard: usage: storeboard send <store> <file> [--as PATH] [--json]")
 		return ErrHandled
 	}
 	store := positional[0]
+	// The daemon resolves paths from its own working directory (its data
+	// dir), so the file is named the way this shell meant it.
+	source, err := filepath.Abs(positional[1])
+	if err != nil {
+		return fmt.Errorf("send %s: %w", positional[1], err)
+	}
 	req := struct {
 		Source string `json:"source"`
 		Path   string `json:"path,omitempty"`
-	}{Source: positional[1]}
-
-	// --as takes a value, which is why this walks by index.
-	for i := range args {
-		if args[i] != "--as" {
-			continue
-		}
-		if i+1 >= len(args) {
-			return usageErr(stderr, "send <store> <file>", "--as needs a value")
-		}
-		req.Path = args[i+1]
-	}
+	}{Source: source, Path: values["--as"]}
 
 	cfg, err := config.Load(config.ResolvePath(configPath))
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/send", req)
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(store)+"/send", req, noTimeout)
 	if err != nil {
 		return fmt.Errorf("send %s: %w", store, err)
 	}
@@ -647,34 +754,23 @@ func storeCmd(ctx context.Context, configPath string, args []string, stdout, std
 }
 
 func storeTakeover(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	// Split the positional name from the flags; --path takes a value.
-	var name, linkPath string
-	var flags []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--json", "-h", "--help":
-			flags = append(flags, args[i])
-		case "--path":
-			if i+1 >= len(args) {
-				return usageErr(stderr, "store takeover <name>", "--path needs a value")
-			}
-			linkPath = args[i+1]
-			i++
-		default:
-			if name != "" {
-				fmt.Fprintf(stderr, "storeboard: store takeover: unexpected argument %q\n", args[i])
-				return ErrHandled
-			}
-			name = args[i]
-		}
-	}
-	jsonOut, err := jsonFlag(flags, "store takeover <name>", stderr)
+	jsonOut, positional, values, err := splitFlags(args, "store takeover <name>", []string{"--path"}, stderr)
 	if err != nil {
 		return err
 	}
-	if name == "" {
+	if len(positional) != 1 {
 		fmt.Fprintln(stderr, "storeboard: usage: storeboard store takeover <name> [--path PATH] [--json]")
 		return ErrHandled
+	}
+	name, linkPath := positional[0], values["--path"]
+	if linkPath != "" {
+		// Declared symlinks are absolute; resolve a relative one here, where
+		// the user typed it, rather than against the daemon's directory.
+		abs, err := filepath.Abs(linkPath)
+		if err != nil {
+			return fmt.Errorf("--path %s: %w", linkPath, err)
+		}
+		linkPath = abs
 	}
 
 	cfg, err := config.Load(config.ResolvePath(configPath))
@@ -684,7 +780,7 @@ func storeTakeover(ctx context.Context, configPath string, args []string, stdout
 	req := struct {
 		Path string `json:"path,omitempty"`
 	}{Path: linkPath}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(name)+"/takeover", req)
+	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/stores/"+url.PathEscape(name)+"/takeover", req, noTimeout)
 	if err != nil {
 		return fmt.Errorf("takeover %s: %w", name, err)
 	}

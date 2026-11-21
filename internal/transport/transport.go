@@ -17,9 +17,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -53,6 +55,30 @@ type hello struct {
 	Protocol int    `json:"protocol"`
 	Name     string `json:"name"`
 	Version  string `json:"version"`
+	// Time is the sender's clock (unix nanoseconds) as it wrote the hello.
+	// Both sides write theirs before reading, so the difference is the skew
+	// give or take half a round trip.
+	Time int64 `json:"time,omitempty"`
+	// Features names optional protocol the sender understands; frames only
+	// a newer peer handles are sent to peers that list them.
+	Features []string `json:"features,omitempty"`
+}
+
+// ClockSkewWarn is the skew worth telling the user about: conflicts are
+// decided by modification time, and beyond this a machine with a fast clock
+// wins edits it should lose.
+const ClockSkewWarn = 2 * time.Second
+
+// FeatureHandler is an optional Handler extension naming the features this
+// side advertises in its hello.
+type FeatureHandler interface {
+	Features() []string
+}
+
+// FeatureSender is implemented by the Sender handed to OnPeerConnected: it
+// reports what the peer's hello advertised.
+type FeatureSender interface {
+	HasFeature(name string) bool
 }
 
 // peerState is one declared peer's link bookkeeping. Every field is guarded
@@ -69,6 +95,11 @@ type peerState struct {
 
 	conn      net.Conn
 	linkReset chan struct{}
+	// version, skew and features describe the peer as its hello did, for
+	// the life of the registered link.
+	version  string
+	skew     time.Duration
+	features []string
 
 	mu sync.Mutex
 }
@@ -90,6 +121,8 @@ func (p *peerState) snapshot() api.Connection {
 	}
 	if p.conn != nil {
 		out.Endpoint = p.conn.RemoteAddr().String()
+		out.Version = p.version
+		out.ClockSkewMs = p.skew.Milliseconds()
 	} else if len(p.endps) > 0 {
 		out.Endpoint = p.endps[0]
 	}
@@ -97,6 +130,8 @@ func (p *peerState) snapshot() api.Connection {
 }
 
 func (p *peerState) backoff() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.attempt == 0 {
 		return 0
 	}
@@ -119,6 +154,37 @@ type Handler interface {
 	OnPeerDisconnected(peer string)
 }
 
+// UrgentHandler is an optional Handler extension. The link's read loop offers
+// it every frame first; a frame it claims is handled right there, ahead of the
+// queue of ordinary frames. It is for replies a caller is blocked on - a
+// ranged read's bytes - which otherwise wait behind every frame queued before
+// them, so one store's slow index apply made another store's mount time out.
+// It must be fast and must never block.
+type UrgentHandler interface {
+	OnPeerUrgent(peer string, line []byte) bool
+}
+
+// maxFrame bounds one wire line. Index frames are chunked well below this; a
+// line past it is a broken or hostile peer, and buffering it would let either
+// exhaust memory.
+const maxFrame = 256 << 20
+
+// readLine reads one newline-terminated line of at most limit bytes.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(line)+len(chunk) > limit {
+			return nil, fmt.Errorf("frame longer than %d bytes", limit)
+		}
+		line = append(line, chunk...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
+}
+
 // Manager owns the listener, the dial loops and every peer's link state.
 type Manager struct {
 	cfg    *config.Config
@@ -136,6 +202,14 @@ type Manager struct {
 	// (tests do exactly that, and a restart does it for real).
 	wg sync.WaitGroup
 
+	// closing is set by Close before it waits on wg; spawn refuses new
+	// goroutines after that, so an accept racing shutdown cannot Add to a
+	// WaitGroup that is already being waited on.
+	closing bool
+
+	// ping is pingInterval as it was when the manager was made.
+	ping time.Duration
+
 	// cancel ends the context Run derived from the caller's. Close uses it
 	// so teardown never depends on the caller cancelling first: a caller
 	// that just calls Close (every transport test does) would otherwise
@@ -143,13 +217,21 @@ type Manager struct {
 	cancel context.CancelFunc
 }
 
-// spawn runs fn on a goroutine Close will wait for.
-func (m *Manager) spawn(fn func()) {
+// spawn runs fn on a goroutine Close will wait for. It reports false, and
+// does not run fn, once Close has begun.
+func (m *Manager) spawn(fn func()) bool {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return false
+	}
 	m.wg.Add(1)
+	m.mu.Unlock()
 	go func() {
 		defer m.wg.Done()
 		fn()
 	}()
+	return true
 }
 
 // SetHandler installs the frame consumer. Call before Run.
@@ -187,6 +269,11 @@ type linkWriter struct {
 	busy    bool
 	waiting int
 	c       net.Conn
+	// features is what the peer's hello advertised.
+	features []string
+	// alive reports that the peer has been heard from recently. A write
+	// that times out while it is true is a busy reader, not a dead link.
+	alive func() bool
 }
 
 func newLinkWriter(c net.Conn) *linkWriter {
@@ -219,16 +306,43 @@ func (w *linkWriter) release() {
 	w.mu.Unlock()
 }
 
+// writeTimeout bounds one attempt at a write. It is a var only for tests.
+var writeTimeout = 30 * time.Second
+
 func (w *linkWriter) writeWith(b []byte, priority bool) error {
 	w.acquire(priority)
 	defer w.release()
-	if err := w.c.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	for {
+		if err := w.c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		n, err := w.c.Write(b)
+		b = b[n:]
+		if err == nil {
+			break
+		}
+		// A peer whose engine is busy (verifying a big file, applying a huge
+		// index) stops reading for a while, and its socket fills. It is
+		// still alive - its pings keep arriving - so keep waiting: the
+		// deadline used to drop the link, which restarted the very transfer
+		// that kept it busy, and the next one too.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() && w.alive != nil && w.alive() {
+			continue
+		}
+		_ = w.c.SetWriteDeadline(time.Time{})
+		// A write that failed part-way left half a frame on the wire, and
+		// the next frame would be glued onto it. The link is unusable:
+		// close it so both sides redial and resync instead.
+		w.c.Close()
 		return err
 	}
-	_, err := w.c.Write(b)
 	_ = w.c.SetWriteDeadline(time.Time{})
-	return err
+	return nil
 }
+
+// HasFeature reports whether the peer advertised a feature.
+func (w *linkWriter) HasFeature(name string) bool { return slices.Contains(w.features, name) }
 
 func (w *linkWriter) Send(b []byte) error     { return w.writeWith(b, true) }
 func (w *linkWriter) SendBulk(b []byte) error { return w.writeWith(b, false) }
@@ -238,7 +352,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	m := &Manager{cfg: cfg, logger: logger, peers: map[string]*peerState{}}
+	m := &Manager{cfg: cfg, logger: logger, peers: map[string]*peerState{}, ping: pingInterval}
 	now := time.Now().UTC()
 	for name, p := range cfg.Peers {
 		if name == cfg.Peer {
@@ -338,7 +452,9 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
 				acceptErr <- err
 				return
 			}
-			m.spawn(func() { m.accept(ctx, c) })
+			if !m.spawn(func() { m.accept(ctx, c) }) {
+				c.Close()
+			}
 		}
 	}()
 	select {
@@ -402,7 +518,9 @@ func (m *Manager) tryDial(ctx context.Context, p *peerState) {
 		if p.connected() {
 			return
 		}
-		var d net.Dialer
+		// Bounded: the kernel's own connect timeout is minutes, and one
+		// blackholed endpoint would hold up every endpoint after it.
+		d := net.Dialer{Timeout: dialTimeout}
 		c, err := d.DialContext(ctx, "tcp", ep)
 		if err != nil {
 			m.noteDialFailure(p, ep, err)
@@ -442,7 +560,11 @@ func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
 	_ = c.SetDeadline(time.Now().Add(handshakeTimeout))
 	defer c.SetDeadline(time.Time{})
 
-	line, err := json.Marshal(hello{Protocol: WireVersion, Name: m.cfg.Peer, Version: version.Version})
+	var features []string
+	if fh, ok := m.getHandler().(FeatureHandler); ok {
+		features = fh.Features()
+	}
+	line, err := json.Marshal(hello{Protocol: WireVersion, Name: m.cfg.Peer, Version: version.Version, Time: time.Now().UnixNano(), Features: features})
 	if err != nil {
 		return got, nil, err
 	}
@@ -450,9 +572,21 @@ func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
 		return got, nil, fmt.Errorf("write hello: %w", err)
 	}
 
-	reader := bufio.NewReader(c)
-	if err := json.NewDecoder(reader).Decode(&got); err != nil {
+	// The hello is read as exactly one line. A json.Decoder reads ahead
+	// into its own buffer, and a frame the peer sent right behind its hello
+	// was silently lost with it.
+	reader := bufio.NewReaderSize(c, 64*1024)
+	raw, err := readLine(reader, 64*1024)
+	if err != nil {
 		return got, reader, fmt.Errorf("read hello: %w", err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		return got, reader, fmt.Errorf("read hello: %w", err)
+	}
+	if got.Time != 0 {
+		// Reuse the field for the measured skew; the peer's raw clock is of
+		// no use past this point.
+		got.Time = got.Time - time.Now().UnixNano()
 	}
 	switch {
 	case got.Protocol != WireVersion:
@@ -537,6 +671,9 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	}
 	p.conn = c
 	p.direction = direction
+	p.version = h.Version
+	p.skew = time.Duration(h.Time)
+	p.features = h.Features
 	p.attempt = 0
 	p.state = stateConnected
 	p.since = time.Now().UTC()
@@ -544,14 +681,31 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	p.mu.Unlock()
 
 	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
-	m.spawn(func() { m.serveLink(ctx, p, c, reader, key, direction) })
+	if skew := time.Duration(h.Time); skew > ClockSkewWarn || skew < -ClockSkewWarn {
+		m.logger.Warn("peer clock differs from this machine's; conflicting edits are decided by modification time, so the faster clock wins them",
+			"peer", h.Name, "skew", skew.Round(time.Millisecond).String())
+	}
+	if !m.spawn(func() { m.serveLink(ctx, p, c, reader, key, direction) }) {
+		m.dropLink(p, c, key)
+	}
 }
 
 // serveLink consumes one live connection: it answers pings and detects the
 // peer going away.
 func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key, direction string) {
 	w := newLinkWriter(c)
+	p.mu.Lock()
+	w.features = p.features
+	p.mu.Unlock()
+	// Anything read counts: the peer pings every m.ping even while its own
+	// frame handling is stalled.
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	w.alive = func() bool {
+		return time.Since(time.Unix(0, lastRead.Load())) < 2*m.ping
+	}
 	handler := m.getHandler()
+	urgent, _ := handler.(UrgentHandler)
 	p.mu.Lock()
 	current := p.conn == c
 	p.mu.Unlock()
@@ -567,7 +721,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		framesStop = cancelFrames
 		frames = make(chan []byte, 1024)
 		framesDone = make(chan struct{})
-		m.spawn(func() {
+		started := m.spawn(func() {
 			defer close(framesDone)
 			for {
 				select {
@@ -586,6 +740,12 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 				}
 			}
 		})
+		if !started {
+			// Shutting down: nothing will consume frames, so serve none.
+			cancelFrames()
+			m.dropLink(p, c, key)
+			return
+		}
 		m.spawn(func() {
 			p.mu.Lock()
 			stillCurrent := p.conn == c
@@ -609,7 +769,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		m.dropLink(p, c, key)
 	}()
 	go func() {
-		t := time.NewTicker(pingInterval)
+		t := time.NewTicker(m.ping)
 		defer t.Stop()
 		for {
 			select {
@@ -627,14 +787,25 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		}
 	}()
 
+	// A live peer sends a ping every pingInterval. Three missed in a row is
+	// a link that died without a FIN (a laptop lid, a dropped route), which
+	// TCP alone takes a quarter of an hour to notice - and while it holds
+	// the peer's slot, the peer's fresh connections are refused as
+	// duplicates.
+	idle := 3 * m.ping
 	for {
-		line, err := reader.ReadString('\n')
+		_ = c.SetReadDeadline(time.Now().Add(idle))
+		raw, err := readLine(reader, maxFrame)
+		if err == nil {
+			lastRead.Store(time.Now().UnixNano())
+		}
 		if err != nil {
 			if ctx.Err() == nil && !isClosed(err) {
 				m.logger.Info("link closed", "peer", p.name, "direction", direction, "error", err)
 			}
 			return
 		}
+		line := string(raw)
 		switch trimmed := strings.TrimSpace(line); trimmed {
 		case "{\"ping\"}":
 			if err := w.Send([]byte("{\"pong\"}\n")); err != nil {
@@ -642,6 +813,9 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			}
 		case "{\"pong\"}", "":
 		default:
+			if urgent != nil && urgent.OnPeerUrgent(p.name, []byte(trimmed)) {
+				continue
+			}
 			if frames != nil {
 				select {
 				case frames <- []byte(trimmed):
@@ -660,8 +834,8 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
 	c.Close()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.conn == c {
+	dropped := p.conn == c
+	if dropped {
 		p.conn = nil
 		p.attempt++
 		p.state = stateBackoff
@@ -669,6 +843,12 @@ func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
 		p.lastErr = "connection closed"
 		close(p.linkReset)
 		p.linkReset = make(chan struct{})
+	}
+	p.mu.Unlock()
+	// Outside the lock: the handler can wait on store locks held by a long
+	// scan, and the status snapshot and the next registration both need
+	// p.mu in the meantime.
+	if dropped {
 		if h := m.getHandler(); h != nil {
 			h.OnPeerDisconnected(p.name)
 		}
@@ -699,6 +879,7 @@ func (m *Manager) Snapshot() []api.Connection {
 // works whether or not the caller got there first.
 func (m *Manager) Close() {
 	m.mu.Lock()
+	m.closing = true
 	if m.cancel != nil {
 		m.cancel()
 	}

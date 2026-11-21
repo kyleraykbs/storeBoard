@@ -260,7 +260,20 @@ rec {
         }
       ) cfg.groups;
     }
-    // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; };
+    // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; }
+    # Both were options the daemon module exposed and this file never wrote,
+    # so `backup.enable = true` and per-store permissions silently did
+    # nothing. Null fields are dropped: the config is strict, and absent is
+    # what means "inherit" or "the default".
+    // lib.optionalAttrs (cfg ? permissions && cfg.permissions != { }) {
+      permissions = lib.mapAttrs (_: p: lib.filterAttrs (_: v: v != null) p) cfg.permissions;
+    }
+    // lib.optionalAttrs (cfg ? backup && cfg.backup != null) {
+      backup =
+        { enable = cfg.backup.enable; }
+        // lib.optionalAttrs (cfg.backup.keep != null) { keep = cfg.backup.keep; }
+        // lib.optionalAttrs (cfg.backup.stores != { }) { stores = cfg.backup.stores; };
+    };
   checkedConfig =
     package: cfg: name:
     let

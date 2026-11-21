@@ -61,7 +61,12 @@ done
 [ -n "$holder_root" ] || die "--holder-root is required"
 command -v jq >/dev/null || die "jq is required"
 [ -x "$cli" ] || command -v "$cli" >/dev/null || die "storeboard binary not found"
-[ -n "$config" ] && export STOREBOARD_CONFIG="$config"
+# The config goes to the CLI as a flag, never through the environment: the
+# CLI prefers an existing per-user config over STOREBOARD_CONFIG, so exporting
+# it could silently check a different daemon than the one asked for.
+cli_args=()
+[ -n "$config" ] && cli_args=(--config "$config")
+sb() { "$cli" ${cli_args[@]+"${cli_args[@]}"} "$@"; }
 
 # holder runs a command on the holder and returns its stdout. With no --holder-ssh
 # the holder is this machine, which is how the script is tested.
@@ -83,6 +88,20 @@ holder_start() {
 	holder "$cmd"
 }
 
+# A failure (or Ctrl-C) between holder_stop and holder_start must not leave
+# the holder's daemon down: every store on that host would stop syncing until
+# somebody noticed. The trap starts it again on any exit while it is stopped.
+holder_stopped=0
+restore_holder() {
+	if [ "$holder_stopped" = 1 ]; then
+		printf 'verify-streamed: restarting the holder daemon stopped by this run\n' >&2
+		holder_start || printf 'verify-streamed: RESTART FAILED: start the holder daemon by hand\n' >&2
+		holder_stopped=0
+	fi
+}
+trap restore_holder EXIT
+trap 'exit 130' INT TERM
+
 sum()  { sha256sum "$1" | cut -d' ' -f1; }
 hsum() { holder "sha256sum '$1' | cut -d' ' -f1"; }
 
@@ -102,7 +121,7 @@ wait_for() {
 
 echo "== storeboard streamed store: $store =="
 
-status="$("$cli" status --json)" || die "cannot reach the daemon (is it running?)"
+status="$(sb status --json)" || die "cannot reach the daemon (is it running?)"
 root="$(jq -r --arg s "$store" '.sync[] | select(.store == $s) | .root' <<<"$status")"
 state="$(jq -r --arg s "$store" '.sync[] | select(.store == $s) | .state' <<<"$status")"
 [ -n "$root" ] && [ "$root" != "null" ] || die "store $store is not in the daemon's status"
@@ -133,6 +152,7 @@ say "write  ok (holder has the exact bytes)"
 if [ "$allow_restart" = 1 ]; then
 	name="verify-offline-$$.txt"
 	say "offline stopping the holder's daemon..."
+	holder_stopped=1
 	holder_stop
 	sleep 2
 	printf 'offline path %s\n' "$(date -Is)" > "$root/$name" ||
@@ -143,6 +163,7 @@ if [ "$allow_restart" = 1 ]; then
 	say "queued $name (visible through the mount, absent on the holder)"
 	say "offline starting the holder's daemon..."
 	holder_start
+	holder_stopped=0
 	wait_for "the queued write to flush" 180 holder "test -f '$holder_root/$store/$name'"
 	[ "$(sum "$root/$name")" = "$(hsum "$holder_root/$store/$name")" ] ||
 		die "the flushed copy of $name differs"

@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
@@ -207,7 +210,10 @@ func listDir(dir string) []string {
 // it becomes a new version, propagates like any other, and never replaces
 // anything without keeping what was there (the journal keeps the old blob).
 // With `to` set, the content is written there instead and the store is left
-// alone.
+// alone. `to` must be absolute and clean, and the caller must be root or own
+// the directory it lands in (see writeRestoreCopy): the daemon writes it as
+// root, so without that rule any local user could have had it overwrite a
+// file anywhere on the machine.
 //
 // uid is the requesting user, from the socket's peer credentials: root and
 // the store's owner may restore, nobody else.
@@ -222,7 +228,18 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	if err := e.checkOwner(fs, uid, "restore from"); err != nil {
 		return api.RestoreResult{}, err
 	}
+	if to != "" {
+		if err := checkRestoreTarget(to); err != nil {
+			return api.RestoreResult{}, err
+		}
+	}
 	if fs.stream {
+		if to != "" {
+			// The holder would be the one writing `to`, on its own disk, as
+			// the store's owner — a path named on another machine is not
+			// one it can authorize, so holders refuse it outright.
+			return api.RestoreResult{}, fmt.Errorf("store %q is streamed on this machine: restore --to is not available; restore into the store, then copy the file", name)
+		}
 		// The versions and the bytes both live on the holder; it performs the
 		// restore and reports where the content landed.
 		req := verbsRequest{Action: "restore", Path: path, Blob: blob, To: to}
@@ -279,7 +296,7 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	defer fs.scanMu.Unlock()
 
 	if to != "" {
-		if err := e.writeBlobTo(fs, to, pick.Blob, pick.Mode, pick.MTime); err != nil {
+		if err := e.writeRestoreCopy(to, uid, pick.Blob, pick.Mode, pick.MTime); err != nil {
 			return api.RestoreResult{}, err
 		}
 		return api.RestoreResult{Store: name, Path: to, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC(), Copied: true}, nil
@@ -292,13 +309,22 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	if err := e.writeBlobTo(fs, dst, pick.Blob, pick.Mode, pick.MTime); err != nil {
 		return api.RestoreResult{}, err
 	}
+	// A restore is a local edit and builds on what this replica knew, exactly
+	// like the scanner's: a fresh {me: n} vector is concurrent with a current
+	// version written on another peer, so the restore would lose the next
+	// conflict it was meant to win.
+	var seen map[string]uint64
+	if cur := fs.db.Get(path); cur != nil {
+		seen = cur.VV
+	}
 	ent := &Entry{
 		Path:  path,
 		Blob:  pick.Blob,
 		Size:  pick.Size,
 		MTime: pick.MTime,
 		Mode:  pick.Mode,
-		VV:    map[string]uint64{e.me: fs.db.Next()},
+		VV:    MergeVV(seen, map[string]uint64{e.me: fs.db.Next()}),
+		Local: true, // written to the canonical path just above
 	}
 	if err := fs.db.Put(ent); err != nil {
 		return api.RestoreResult{}, err
@@ -308,6 +334,128 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	e.logger.Info("restored a version", "store", name, "path", path,
 		"blob", pick.Blob[:8], "at", time.Unix(0, pick.Time).UTC().Format(time.RFC3339))
 	return api.RestoreResult{Store: name, Path: path, Blob: pick.Blob, At: time.Unix(0, pick.Time).UTC()}, nil
+}
+
+// checkRestoreTarget is the syntax half of the `to` rule: the daemon's
+// working directory is its data dir, so a relative path would land among its
+// own state, and an unclean one hides where it really points.
+func checkRestoreTarget(to string) error {
+	if !filepath.IsAbs(to) || filepath.Clean(to) != to || strings.ContainsRune(to, 0) {
+		return fmt.Errorf("restore target %q must be an absolute, clean path", to)
+	}
+	if filepath.Dir(to) == to {
+		return fmt.Errorf("restore target %q names no file", to)
+	}
+	return nil
+}
+
+// writeRestoreCopy writes a version to a path outside the store on behalf of
+// uid, and only where uid could have written it themselves: the directory it
+// lands in must already exist and belong to uid, and a file already at `to`
+// must be a regular file of theirs. Root may write anywhere but still never
+// replaces a directory, a symlink or a device. Nothing is created but the file
+// itself, and nothing is chowned but the file: the old path went through
+// ensureDir, which made every missing parent and handed the leaf directory to
+// the store's owner — `--to /etc/x` would have given /etc away.
+//
+// Every step is relative to the directory as opened (an os.Root), so the
+// ownership checked is the ownership of the directory written: swapping a
+// path component for a symlink between check and write changes nothing.
+func (e *Engine) writeRestoreCopy(to string, uid int, sum string, mode uint32, mtime int64) error {
+	dir, base := filepath.Dir(to), filepath.Base(to)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("restore target directory: %w", err)
+	}
+	defer root.Close()
+	dirInfo, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("restore target directory: %w", err)
+	}
+	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("restore target directory %s: cannot read its owner", dir)
+	}
+	if uid != 0 && int(dirStat.Uid) != uid {
+		return fmt.Errorf("restore target directory %s belongs to uid %d: restore --to writes only into a directory you own", dir, dirStat.Uid)
+	}
+	ownerUID, ownerGID := uid, int(dirStat.Gid)
+	if existing, err := root.Lstat(base); err == nil {
+		if !existing.Mode().IsRegular() {
+			return fmt.Errorf("restore target %s exists and is not a regular file", to)
+		}
+		st, ok := existing.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("restore target %s: cannot read its owner", to)
+		}
+		if uid != 0 && int(st.Uid) != uid {
+			return fmt.Errorf("restore target %s belongs to uid %d: it can only be replaced by its owner or root", to, st.Uid)
+		}
+		// Replacing a file keeps who it belonged to.
+		ownerUID, ownerGID = int(st.Uid), int(st.Gid)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("restore target %s: %w", to, err)
+	}
+
+	blob, err := e.store.Open(sum)
+	if err != nil {
+		return err
+	}
+	defer blob.Close()
+
+	tmp := fmt.Sprintf("%s-restore-%d-%d", tmpPrefix, os.Getpid(), time.Now().UnixNano())
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("restore target: %w", err)
+	}
+	fail := func(err error) error {
+		f.Close()
+		root.Remove(tmp)
+		return err
+	}
+	if _, err := io.Copy(f, blob); err != nil {
+		return fail(err)
+	}
+	perm := os.FileMode(mode).Perm()
+	if perm == 0 {
+		perm = 0o644
+	}
+	if err := f.Chmod(perm); err != nil {
+		return fail(err)
+	}
+	if ownerUID >= 0 && ownerUID != os.Geteuid() {
+		if err := f.Chown(ownerUID, ownerGID); err != nil {
+			e.logger.Warn("restore --to: chown", "path", to, "uid", ownerUID, "error", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		root.Remove(tmp)
+		return err
+	}
+	if mtime != 0 {
+		when := time.Unix(0, mtime)
+		if err := root.Chtimes(tmp, when, when); err != nil {
+			e.logger.Warn("restore --to: set mtime", "path", to, "error", err)
+		}
+	}
+	if err := root.Rename(tmp, base); err != nil {
+		root.Remove(tmp)
+		return fmt.Errorf("restore target: %w", err)
+	}
+	return nil
+}
+
+// CheckOwner is checkOwner by store name, for callers outside the engine (the
+// daemon's read-only verbs that still reveal a store's contents).
+func (e *Engine) CheckOwner(name string, uid int, what string) error {
+	fs := e.byName[name]
+	if fs == nil {
+		return fmt.Errorf("unknown store %q", name)
+	}
+	return e.checkOwner(fs, uid, what)
 }
 
 // checkOwner is the authorization shared by the acting verbs: root, or the

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"codeberg.org/kyleraykbs/storeboard/internal/config"
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
 )
 
@@ -53,9 +54,27 @@ type streamFetcher struct {
 	fs *StoreState
 }
 
+// holderRefusal is a holder's definite answer that it cannot serve a range:
+// asking it again will not help, unlike a timeout or a dropped link.
+type holderRefusal struct {
+	peer string
+	code string
+	msg  string
+}
+
+func (r *holderRefusal) Error() string { return r.peer + ": " + r.msg }
+
+// Refusal codes on readErr frames. A holder that predates them sends none.
+const (
+	refuseStale   = "stale"   // the holder does not have the version the reader opened
+	refuseMissing = "missing" // the holder has no such entry
+)
+
 // ReadRange retries a failed range after a holder reconnects. The peer link
 // can briefly drop while the transport redials; returning a short read or
 // giving up after one connection turns that transient into a truncated photo.
+// When every reachable peer refuses outright there is nothing to wait for,
+// and the reader gets an answer at once rather than after the deadline.
 func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, offset, length int64) ([]byte, error) {
 	if entry.Dir || entry.Blob == "" {
 		return nil, fmt.Errorf("%s: no content to read", entry.Path)
@@ -66,17 +85,25 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 	if length > maxReadChunk {
 		length = maxReadChunk
 	}
+	// A version this machine wrote and has not handed over yet is only in
+	// the queue: no holder has those bytes, and asking for them by path would
+	// serve the previous version under the new size.
+	if data, ok, err := f.e.readQueued(f.fs, entry.Blob, offset, length); ok {
+		return data, err
+	}
 	deadline := time.Now().Add(readTimeout)
 	var firstErr error
 	for {
 		peers := f.e.holdersFor(f.fs)
+		refused := 0
+		var refusal *holderRefusal
 		for _, peer := range peers {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				break
 			}
 			attemptCtx, cancel := context.WithTimeout(ctx, min(remaining, readTimeout/2))
-			data, err := f.e.readRangeFrom(attemptCtx, peer, f.fs, entry.Path, offset, length)
+			data, err := f.e.readRangeFrom(attemptCtx, peer, f.fs, entry, offset, length)
 			cancel()
 			if err == nil && int64(len(data)) != length {
 				err = fmt.Errorf("%s: holder %s returned %d of %d requested bytes", entry.Path, peer, len(data), length)
@@ -84,9 +111,24 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 			if err == nil {
 				return data, nil
 			}
+			if errors.As(err, &refusal) {
+				refused++
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		if len(peers) > 0 && refused == len(peers) {
+			switch refusal.code {
+			case refuseStale:
+				return nil, fmt.Errorf("%s: no holder has the version that was opened: %w", entry.Path, syscall.ESTALE)
+			case refuseMissing:
+				return nil, fmt.Errorf("%s: no holder has this file: %w", entry.Path, syscall.ENOENT)
+			}
+			return nil, fmt.Errorf("%s: %w", entry.Path, firstErr)
 		}
 		if !time.Now().Before(deadline) {
 			if firstErr == nil {
@@ -104,6 +146,28 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// readQueued serves a range of a blob that sits in this store's offline
+// queue. ok reports whether the queue held the blob at all.
+func (e *Engine) readQueued(fs *StoreState, sum string, offset, length int64) ([]byte, bool, error) {
+	path, ok := e.queuedBlob(fs, sum)
+	if !ok {
+		return nil, false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		// Handed over and dropped between the lookup and the open: the
+		// holder has it now.
+		return nil, false, nil
+	}
+	defer f.Close()
+	buf := make([]byte, length)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, true, err
+	}
+	return buf[:n], true, nil
 }
 
 // holdersFor orders the peers that could serve this store: the declared
@@ -151,8 +215,9 @@ func (e *Engine) noteRead(peer string, n int, took time.Duration) {
 	e.mu.Unlock()
 }
 
-// readRangeFrom asks one peer for a window and waits for its answer.
-func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState, path string, offset, length int64) ([]byte, error) {
+// readRangeFrom asks one peer for a window of one version and waits for its
+// answer.
+func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState, entry streamfs.Entry, offset, length int64) ([]byte, error) {
 	ch := make(chan readReply, 1)
 	e.mu.Lock()
 	e.readSeq++
@@ -166,7 +231,8 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 	}()
 
 	start := time.Now()
-	if err := e.sendTo(peer, frame{Type: "read", ID: id, Store: fs.name, Path: path, Offset: offset, Length: length}); err != nil {
+	fr := frame{Type: "read", ID: id, Store: fs.name, Path: entry.Path, Blob: entry.Blob, Offset: offset, Length: length}
+	if err := e.sendTo(peer, fr); err != nil {
 		return nil, err
 	}
 	var timer <-chan time.Time
@@ -189,7 +255,7 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 	case <-e.closed:
 		return nil, errors.New("engine closed")
 	case <-timer:
-		return nil, fmt.Errorf("%s: holder %s did not answer within read deadline", path, peer)
+		return nil, fmt.Errorf("%s: holder %s did not answer within read deadline", entry.Path, peer)
 	case r := <-ch:
 		if r.err != nil {
 			return nil, r.err
@@ -210,54 +276,71 @@ func (e *Engine) deliverRead(fr *frame) {
 		return
 	}
 	if fr.Error != "" {
-		ch <- readReply{err: fmt.Errorf("%s: %s", fr.Path, fr.Error)}
+		ch <- readReply{err: &holderRefusal{peer: fr.Path, code: fr.Code, msg: fr.Error}}
 		return
 	}
 	ch <- readReply{data: fr.Data}
 }
 
+// readWorkers bounds how many ranged reads one store serves at once. Serving
+// them one at a time made every reader of a store - a thumbnailer opening a
+// folder, a video seeking - wait behind every other.
+const readWorkers = 8
+
 // handleRead serves one ranged read from this machine's copy: the content
-// store when it holds the blob, else the canonical file, hashed first so a
-// peer never receives bytes that do not match the entry it asked for.
+// store when it holds the blob, else the canonical file.
 func (e *Engine) handleRead(peer string, fr *frame) {
 	fs := e.byName[fr.Store]
-	if fs == nil || !validRel(fr.Path) {
-		e.replyReadErr(peer, fr, "unknown store or unsafe path")
+	if fs == nil || !validRel(fr.Path) || !e.storeSharedWith(fs, peer) {
+		e.replyReadErr(peer, fr, "", "unknown store or unsafe path")
 		return
 	}
 	ent := fs.db.Get(fr.Path)
-	if ent == nil || ent.Deleted || ent.Dir {
-		e.replyReadErr(peer, fr, "no such entry")
+	var blob *os.File
+	if fr.Blob != "" && (ent == nil || ent.Deleted || ent.Blob != fr.Blob) {
+		// The reader opened a version this machine has moved past, renamed,
+		// or not reached yet. Serving today's bytes under that version's
+		// size splices two files together inside one open; serve the version
+		// it asked for from wherever it is kept, else say so.
+		f, held, err := e.openBlobFor(fs, fr.Path, fr.Blob)
+		if err != nil {
+			if ent == nil || ent.Deleted {
+				e.replyReadErr(peer, fr, refuseMissing, "no such entry")
+			} else {
+				e.replyReadErr(peer, fr, refuseStale, "version not held here")
+			}
+			return
+		}
+		blob, ent = f, held
+	} else if ent == nil || ent.Deleted || ent.Dir {
+		e.replyReadErr(peer, fr, refuseMissing, "no such entry")
 		return
 	}
 	if fr.Offset < 0 || fr.Length <= 0 || fr.Offset > ent.Size {
-		e.replyReadErr(peer, fr, "range out of bounds")
+		if blob != nil {
+			blob.Close()
+		}
+		e.replyReadErr(peer, fr, "", "range out of bounds")
 		return
 	}
-	length := fr.Length
-	if rest := ent.Size - fr.Offset; length > rest {
-		length = rest
-	}
-	if length > maxReadChunk {
-		length = maxReadChunk
-	}
+	length := min(fr.Length, ent.Size-fr.Offset, maxReadChunk)
 
-	blob, err := e.openEntryBlob(fs, ent)
-	if err != nil {
-		e.replyReadErr(peer, fr, "no readable copy here")
-		return
-	}
-	defer blob.Close()
-	if fr.Offset > 0 {
-		if _, err := io.CopyN(io.Discard, blob, fr.Offset); err != nil {
-			e.replyReadErr(peer, fr, "cannot seek")
+	if blob == nil {
+		f, err := e.openEntryBlob(fs, ent)
+		if err != nil {
+			e.replyReadErr(peer, fr, refuseMissing, "no readable copy here")
 			return
 		}
+		blob = f
 	}
+	defer blob.Close()
+	// ReadAt, not a skip: discarding the prefix made every range of a large
+	// file cost its offset, so the end of a 20 GiB video read 20 GiB per
+	// window.
 	buf := make([]byte, length)
-	n, err := io.ReadFull(blob, buf)
-	if err != nil {
-		e.replyReadErr(peer, fr, fmt.Sprintf("short holder file: read %d of %d bytes", n, length))
+	n, err := blob.ReadAt(buf, fr.Offset)
+	if int64(n) < length {
+		e.replyReadErr(peer, fr, "", fmt.Sprintf("short holder file: read %d of %d bytes (%v)", n, length, err))
 		return
 	}
 	if err := e.sendBulkTo(peer, frame{Type: "readData", ID: fr.ID, Store: fs.name, Path: fr.Path, Offset: fr.Offset, Data: buf}); err != nil {
@@ -265,50 +348,69 @@ func (e *Engine) handleRead(peer string, fr *frame) {
 	}
 }
 
-func (e *Engine) replyReadErr(peer string, fr *frame, msg string) {
-	if err := e.sendTo(peer, frame{Type: "readErr", ID: fr.ID, Store: fr.Store, Path: fr.Path, Error: msg}); err != nil {
+// storedSize reports the size of a blob the content store holds.
+func (e *Engine) storedSize(sum string) (int64, bool) {
+	p := e.store.BlobPath(sum)
+	if p == "" {
+		return 0, false
+	}
+	info, err := os.Stat(p)
+	if err != nil || !info.Mode().IsRegular() {
+		return 0, false
+	}
+	return info.Size(), true
+}
+
+func (e *Engine) replyReadErr(peer string, fr *frame, code, msg string) {
+	if err := e.sendTo(peer, frame{Type: "readErr", ID: fr.ID, Store: fr.Store, Path: fr.Path, Code: code, Error: msg}); err != nil {
 		e.logger.Debug("read error reply", "peer", peer, "error", err)
 	}
 }
 
-// treeEntries is the journal as the mounted view sees it: live entries only,
-// with the deletion records and byte-holding fields the filesystem needs.
-func treeEntries(fs *StoreState) map[string]streamfs.Entry {
-	out := map[string]streamfs.Entry{}
-	for _, ent := range fs.db.All() {
-		if ent.Deleted {
-			continue
-		}
-		e := streamfs.Entry{
-			Path: ent.Path,
-			Dir:  ent.Dir,
-			Blob: ent.Blob,
-			Size: ent.Size,
-			Mode: ent.Mode,
-		}
-		if ent.MTime != 0 {
-			e.MTime = time.Unix(0, ent.MTime)
-		}
-		out[ent.Path] = e
+// streamEntry is a journal entry as the mounted view sees it.
+func streamEntry(ent *Entry) streamfs.Entry {
+	out := streamfs.Entry{
+		Path: ent.Path,
+		Dir:  ent.Dir,
+		Blob: ent.Blob,
+		Size: ent.Size,
+		Mode: ent.Mode,
+	}
+	if ent.MTime != 0 {
+		out.MTime = time.Unix(0, ent.MTime)
 	}
 	return out
 }
 
-// refreshTree republishes the journal to the mounted view. It is a no-op for
-// every store that is not mounted.
-func (e *Engine) refreshTree(fs *StoreState) {
-	if fs.mount == nil {
-		return
-	}
-	fs.mount.Replace(treeEntries(fs))
+// observeTree keeps a streamed store's view in step with its journal, one
+// path at a time. Rebuilding the whole view on every journal write made the
+// first sync of a large store quadratic: each of a hundred thousand incoming
+// entries rebuilt and diffed a hundred-thousand-entry tree.
+func (fs *StoreState) observeTree() {
+	fs.tree = streamfs.NewTree(nil)
+	fs.db.Observe(func(ent *Entry) {
+		if ent.Deleted {
+			fs.tree.Delete(ent.Path)
+			return
+		}
+		fs.tree.Set(streamEntry(ent))
+	})
 }
 
 // mountStream mounts the store's canonical dir as the journal-backed view.
 // A mount failure is not fatal: the journal is still the truth, and the
-// daemon keeps syncing metadata while the paths stay plain directories.
+// daemon keeps syncing metadata while the paths stay plain directories. A
+// mount that died underneath us - detached by hand, or its connection aborted
+// - is noticed here and replaced, rather than leaving the store's folder empty
+// until the daemon restarts.
 func (e *Engine) mountStream(fs *StoreState) {
 	if fs.mount != nil {
-		return
+		if fs.mount.Alive() {
+			return
+		}
+		e.logger.Warn("streamed mount went away; mounting it again", "store", fs.name, "path", fs.root)
+		fs.mount = nil
+		fs.mountUp.Store(false)
 	}
 	if fstype := mountFSType(fs.root); fstype != "" {
 		if fstype != "fuse.storeboard" {
@@ -329,11 +431,12 @@ func (e *Engine) mountStream(fs *StoreState) {
 		e.logger.Error("create streamed mountpoint", "store", fs.name, "path", fs.root, "error", err)
 		return
 	}
-	mounted, err := streamfs.Mount(fs.root, streamfs.NewTree(treeEntries(fs)), streamfs.Options{
+	mounted, err := streamfs.Mount(fs.root, fs.tree, streamfs.Options{
 		Fetcher: &streamFetcher{e: e, fs: fs},
 		Mutator: &storeMutator{e: e, fs: fs},
 		UID:     uint32(max(fs.perm.uid, 0)),
 		GID:     uint32(max(fs.perm.gid, 0)),
+		Space:   func() (uint64, uint64) { return e.streamSpace(fs) },
 	})
 	if err != nil {
 		e.logger.Error("mount streamed store; serving the journal only",
@@ -341,11 +444,38 @@ func (e *Engine) mountStream(fs *StoreState) {
 		return
 	}
 	fs.mount = mounted
-	e.logger.Info("streamed store mounted", "store", fs.name, "path", fs.root)
+	fs.mountUp.Store(true)
+	e.logger.Info("streamed store mounted", "store", fs.name, "path", fs.root, "entries", fs.db.LiveCount())
+}
+
+// streamSpace is what a write through the mount can use: the queue's
+// filesystem, narrowed to what a capped queue has left. Writes land in the
+// queue first, so that is the space that runs out.
+func (e *Engine) streamSpace(fs *StoreState) (total, free uint64) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(e.dataDir, &st); err == nil {
+		total = st.Blocks * uint64(st.Bsize)
+		free = st.Bavail * uint64(st.Bsize)
+	}
+	switch e.offlinePolicy(fs) {
+	case config.StreamQueueReadOnly:
+		free = 0
+	case config.StreamQueueCapped:
+		if fs.offline != nil {
+			fs.queueMu.Lock()
+			left := max(fs.offline.MaxBytes-fs.queuedBytes, 0)
+			fs.queueMu.Unlock()
+			free = min(free, uint64(left))
+			total = min(total, uint64(fs.offline.MaxBytes))
+		}
+	}
+	return total, free
 }
 
 // unmountStream detaches a mounted store. Called once, at shutdown.
 func (e *Engine) unmountStream(fs *StoreState) {
+	fs.scanMu.Lock()
+	defer fs.scanMu.Unlock()
 	if fs.mount == nil {
 		return
 	}
@@ -353,8 +483,9 @@ func (e *Engine) unmountStream(fs *StoreState) {
 		e.logger.Warn("unmount streamed store", "store", fs.name, "path", fs.root, "error", err)
 	}
 	fs.mount = nil
+	fs.mountUp.Store(false)
 }
 
 // streamRootDir reports whether the canonical path is storeboard's own mount
 // rather than a directory the user owns.
-func (fs *StoreState) mounted() bool { return fs.mount != nil }
+func (fs *StoreState) mounted() bool { return fs.mountUp.Load() }

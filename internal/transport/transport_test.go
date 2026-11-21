@@ -293,3 +293,49 @@ func TestControlFramesOvertakeQueuedBulkWrites(t *testing.T) {
 		t.Fatalf("order = %v, want the queued control frame second", got)
 	}
 }
+
+// A peer that stops reading for longer than the write deadline, but is still
+// heard from, is busy rather than gone: the write waits for it instead of
+// dropping the link. A silent peer still loses the link.
+func TestSlowReaderIsNotADeadLink(t *testing.T) {
+	old := writeTimeout
+	writeTimeout = 30 * time.Millisecond
+	defer func() { writeTimeout = old }()
+
+	for _, tc := range []struct {
+		name  string
+		alive bool
+	}{{"busy", true}, {"silent", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			w := newLinkWriter(local)
+			w.alive = func() bool { return tc.alive }
+
+			frame := []byte(strings.Repeat("x", 1000) + "\n")
+			done := make(chan error, 1)
+			go func() { done <- w.Send(frame) }()
+			time.Sleep(10 * writeTimeout)
+
+			got := make(chan string, 1)
+			go func() {
+				line, _ := bufio.NewReader(remote).ReadString('\n')
+				got <- line
+			}()
+			err := <-done
+			if tc.alive {
+				if err != nil {
+					t.Fatalf("write to a busy peer failed: %v", err)
+				}
+				if line := <-got; line != string(frame) {
+					t.Fatalf("frame arrived as %d bytes, want %d", len(line), len(frame))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("write to a silent peer succeeded after its deadline")
+			}
+		})
+	}
+}

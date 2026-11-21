@@ -552,3 +552,114 @@ func TestBackupConfig(t *testing.T) {
 		t.Fatalf("err = %v, want a keep error", err)
 	}
 }
+
+// The daemon's state must never be content: a dataDir inside a store would be
+// scanned and synced as that store, and the root is where stores live. The
+// default, <root>/.storeboard, is the one place under the root that is allowed.
+func TestDataDirStaysOutOfTheStores(t *testing.T) {
+	tests := []struct {
+		name    string
+		dataDir string
+		wantErr string
+	}{
+		{"the default state dir", "/home/kyle/Storeboard/.storeboard", ""},
+		{"outside the root", "/var/lib/storeboard", ""},
+		{"the root itself", "/home/kyle/Storeboard", "is the root itself"},
+		{"a store's canonical dir", "/home/kyle/Storeboard/pictures", "inside store \"pictures\""},
+		{"inside a store", "/home/kyle/Storeboard/pictures/.state", "inside store \"pictures\""},
+		{"another dir under the root", "/home/kyle/Storeboard/state", "only state directory allowed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := valid()
+			c.DataDir = tt.dataDir
+			err := c.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Parse cleans the paths it compares: a trailing slash or a dot segment must
+// not slip a dataDir past the checks above, nor make two spellings of the root.
+func TestParseCleansPaths(t *testing.T) {
+	cfg, err := Parse([]byte(`{
+		"configVersion": 2,
+		"root": "/srv/sb/",
+		"dataDir": "/srv/sb/./.storeboard/",
+		"socket": "/run//storeboard.sock",
+		"peer": "laptop",
+		"groups": {"g": {"peers": ["laptop"]}},
+		"stores": {"photos": {"group": "g"}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Root != "/srv/sb" || cfg.DataDir != "/srv/sb/.storeboard" || cfg.Socket != "/run/storeboard.sock" {
+		t.Fatalf("paths not cleaned: root %q dataDir %q socket %q", cfg.Root, cfg.DataDir, cfg.Socket)
+	}
+	if _, err := Parse([]byte(`{
+		"configVersion": 2,
+		"root": "/srv/sb",
+		"dataDir": "/srv/sb/photos/../photos/state/",
+		"peer": "laptop",
+		"groups": {"g": {"peers": ["laptop"]}},
+		"stores": {"photos": {"group": "g"}}
+	}`)); err == nil || !strings.Contains(err.Error(), "inside store") {
+		t.Fatalf("an unclean dataDir inside a store = %v, want a refusal", err)
+	}
+}
+
+// A store's own permissions block goes through the same validator as the
+// group default and the per-machine override; it used to be accepted unread.
+func TestStorePermissionsAreValidated(t *testing.T) {
+	c := valid()
+	s := c.StoreTree["documents"]
+	s.Permissions = &Permissions{Mode: "rwx"}
+	c.StoreTree["documents"] = s
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "store documents permissions") {
+		t.Fatalf("bad store mode = %v, want a refusal", err)
+	}
+	s.Permissions = &Permissions{User: "a/b"}
+	c.StoreTree["documents"] = s
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "not a name or uid") {
+		t.Fatalf("bad store user = %v, want a refusal", err)
+	}
+	s.Permissions = &Permissions{User: "kyle", Mode: "0750"}
+	c.StoreTree["documents"] = s
+	if err := c.Validate(); err != nil {
+		t.Fatalf("good store permissions: %v", err)
+	}
+}
+
+// Two links of one store may not nest: creating the inner one would write
+// through the outer link into the other store's directory.
+func TestNestedLinksAreRefused(t *testing.T) {
+	c := valid()
+	p := c.StoreTree["pictures"]
+	p.Links = map[string]string{"bulk": "x", "documents": "x/y"}
+	c.StoreTree["pictures"] = p
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "nest") {
+		t.Fatalf("nested links = %v, want a refusal", err)
+	}
+	// Siblings, and names that merely share a prefix, are fine.
+	p.Links = map[string]string{"bulk": "x", "documents": "xy/z"}
+	c.StoreTree["pictures"] = p
+	if err := c.Validate(); err != nil {
+		t.Fatalf("sibling links: %v", err)
+	}
+}
+
+// The shipped example must keep passing the validator it documents.
+func TestExampleConfigIsValid(t *testing.T) {
+	if _, err := Load(filepath.Join("..", "..", "config.example.json")); err != nil {
+		t.Fatalf("config.example.json: %v", err)
+	}
+}

@@ -45,17 +45,20 @@ class SyncService : Service() {
             stopSelf()
             return
         }
-        if (!Engine.start(this, config.readText())) {
+        // Opening journals and binding sockets is slow work; onCreate runs on
+        // the main thread, where it froze the UI on every start. The engine
+        // thread does it, in order with any stop queued after it.
+        Engine.startAsync(this, config.readText()) { ok ->
             // The UI shows Engine.lastError; a service that cannot start must
             // not sit there pretending the mesh is up.
-            stopSelf()
+            if (!ok) stopSelf()
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
-        Engine.stop()
+        Engine.stopAsync()
         super.onDestroy()
     }
 

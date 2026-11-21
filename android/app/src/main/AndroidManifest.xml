@@ -32,5 +32,20 @@
             android:name=".SyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Every store in the system file picker and the Files app. Only the
+             system's document UI may call it (MANAGE_DOCUMENTS is held by
+             the platform, not by apps); an app it hands a document to gets
+             a per-URI grant instead. -->
+        <provider
+            android:name=".StoreboardDocumentsProvider"
+            android:authorities="dev.kyle.storeboard.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
     </application>
 </manifest>
