@@ -97,6 +97,8 @@ type StoreState struct {
 	// flushing and flushAgain coalesce flush requests (see flushQueue).
 	flushing   atomic.Bool
 	flushAgain atomic.Bool
+	// lastFlush is when the queue was last handed to a holder (unix nanos).
+	lastFlush atomic.Int64
 	// rootEmpty records that the last scan found the root empty while this
 	// machine held many of its files (see massDeleteFloor).
 	rootEmpty atomic.Bool
@@ -578,6 +580,12 @@ func (e *Engine) indexLoop(ctx context.Context) {
 // making each of them walk it, was most of an idle mesh's traffic and CPU.
 var fullIndexFloor = 10 * time.Minute
 
+// queueRetry is how long a streamed store's queue may sit unacknowledged with
+// a holder connected before it is handed over again. Flushes otherwise happen
+// only on a write or on reconnecting, so an op the holder dropped waited for
+// the next of those - possibly forever.
+var queueRetry = 2 * time.Minute
+
 type fullIndexMark struct {
 	gen uint64
 	at  time.Time
@@ -591,6 +599,17 @@ func (e *Engine) resendIndexes() {
 	}
 	e.mu.Unlock()
 	now := time.Now()
+	for _, fs := range e.stores {
+		if !fs.stream || now.Sub(time.Unix(0, fs.lastFlush.Load())) < queueRetry {
+			continue
+		}
+		fs.queueMu.Lock()
+		waiting := len(fs.queue) > 0
+		fs.queueMu.Unlock()
+		if waiting {
+			go e.flushQueue(fs)
+		}
+	}
 	for _, peer := range peers {
 		for _, fs := range e.stores {
 			if !e.storeSharedWith(fs, peer) {
@@ -662,6 +681,16 @@ func (e *Engine) ensureRoot() {
 // ownership/traversal, and applies store permissions. Content is never moved
 // into it: an existing directory is the user's, and a store adopts it.
 func (e *Engine) prepareRoot(fs *StoreState) {
+	// This runs on every link reconcile (every few seconds); say "ready"
+	// once, not four lines per store every five seconds forever.
+	fs.metaMu.Lock()
+	first := !fs.prepared
+	fs.metaMu.Unlock()
+	ready := func(args ...any) {
+		if first {
+			e.logger.Info("store ready", args...)
+		}
+	}
 	fs.scanMu.Lock()
 	defer func() {
 		fs.scanMu.Unlock()
@@ -678,7 +707,7 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 		// user owns: there is nothing to adopt, heal or chown here.
 		e.mountStream(fs)
 		fs.refreshLocked()
-		e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state, "mount", fs.mounted())
+		ready("store", fs.name, "root", fs.root, "state", fs.state, "mount", fs.mounted())
 		return
 	}
 	if err := os.MkdirAll(fs.root, 0o755); err != nil {
@@ -687,7 +716,7 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 	e.healRoot(fs)
 	e.applyDir(fs, fs.root)
 	fs.refreshLocked()
-	e.logger.Info("store ready", "store", fs.name, "root", fs.root, "state", fs.state)
+	ready("store", fs.name, "root", fs.root, "state", fs.state)
 }
 
 func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {

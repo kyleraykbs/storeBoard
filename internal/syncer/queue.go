@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -88,9 +89,26 @@ func (e *Engine) loadQueue(fs *StoreState) error {
 		if err := json.Unmarshal(line, &op); err != nil {
 			continue // a torn final line is expected after a crash
 		}
-		live[op.ID] = true
 		fs.queue = append(fs.queue, op)
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	loaded := len(fs.queue)
+	fs.queue = e.dropUnservablePuts(fs, fs.queue)
+	fs.queue, _ = compactQueue(fs.queue)
+	for _, op := range fs.queue {
+		live[op.ID] = true
 		fs.queuedBytes += op.Size
+	}
+	if len(fs.queue) != loaded {
+		// A queue written before these rules, or one holding uploads whose
+		// bytes are gone: rewrite it so the ops that can never complete stop
+		// being re-sent and counted.
+		e.logger.Info("compacted write queue", "store", fs.name, "before", loaded, "after", len(fs.queue))
+		if err := e.writeQueue(fs); err != nil {
+			return err
+		}
 	}
 	entries, err := os.ReadDir(queueBytesDir(e.dataDir, fs.name))
 	if err != nil {
@@ -101,7 +119,82 @@ func (e *Engine) loadQueue(fs *StoreState) error {
 			_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), ent.Name()))
 		}
 	}
-	return sc.Err()
+	return nil
+}
+
+// dropUnservablePuts removes uploads whose bytes are nowhere on this machine.
+// No holder can ever fetch them - every want is answered "missing" - so the op
+// would sit in the queue for good, holding up nothing but the count. The
+// version is already lost; keeping the op only hides that.
+func (e *Engine) dropUnservablePuts(fs *StoreState, ops []queueOp) []queueOp {
+	kept := ops[:0]
+	for _, op := range ops {
+		if op.Op == opPut {
+			_, err := os.Stat(filepath.Join(queueBytesDir(e.dataDir, fs.name), op.ID))
+			if err != nil && !e.store.Has(op.Blob) {
+				e.logger.Warn("queued upload has no bytes; dropping it", "store", fs.name, "path", op.Path, "blob", op.Blob)
+				continue
+			}
+		}
+		kept = append(kept, op)
+	}
+	return kept
+}
+
+// compactQueue drops uploads no holder will ever need: a put followed by a
+// later put or delete of the same path, with no rename in between carrying
+// the path away. (A rename does need the bytes under the old name: the holder
+// moves what it has.) It returns the ops kept and the ones dropped, in order.
+func compactQueue(ops []queueOp) (kept, dropped []queueOp) {
+	overwritten := map[string]bool{}
+	keep := make([]bool, len(ops))
+	for i := len(ops) - 1; i >= 0; i-- {
+		op := ops[i]
+		keep[i] = true
+		switch op.Op {
+		case opPut:
+			if overwritten[op.Path] {
+				keep[i] = false
+			}
+			overwritten[op.Path] = true
+		case opDelete:
+			overwritten[op.Path] = true
+		case opRename:
+			delete(overwritten, op.Path)
+			for _, move := range op.Moves {
+				delete(overwritten, move.From)
+			}
+		}
+	}
+	kept = make([]queueOp, 0, len(ops))
+	for i, op := range ops {
+		if keep[i] {
+			kept = append(kept, op)
+		} else {
+			dropped = append(dropped, op)
+		}
+	}
+	return kept, dropped
+}
+
+// compactLocked applies compactQueue to a store's live queue and removes the
+// bytes of what it dropped. Callers hold queueMu and rewrite the queue file.
+func (e *Engine) compactLocked(fs *StoreState) {
+	kept, dropped := compactQueue(fs.queue)
+	if len(dropped) == 0 {
+		return
+	}
+	ids := make(map[string]bool, len(kept))
+	for _, op := range kept {
+		ids[op.ID] = true
+	}
+	for _, op := range dropped {
+		fs.queuedBytes -= op.Size
+		if !ids[op.ID] {
+			_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), op.ID))
+		}
+	}
+	fs.queue = kept
 }
 
 // writeQueue persists the whole index: queues hold a handful of offline
@@ -151,23 +244,13 @@ func (e *Engine) writeQueue(fs *StoreState) error {
 // at once, lose an op, or interleave two rewrites of the queue file.)
 //
 // A put or a delete supersedes an earlier put of the same path that no holder
-// has acknowledged: those bytes are a version nobody will ever ask for again,
-// and keeping them grew the queue - and a capped queue's count - forever.
+// has acknowledged (compactQueue): those bytes are a version nobody will ever
+// ask for again, and keeping them grew the queue - and a capped queue's count
+// - forever. An upload a later rename still needs is kept.
 func (e *Engine) enqueue(fs *StoreState, op queueOp) error {
-	if op.Op == opPut || op.Op == opDelete {
-		kept := fs.queue[:0]
-		for _, prev := range fs.queue {
-			if prev.Op == opPut && prev.Path == op.Path && prev.ID != op.ID {
-				fs.queuedBytes -= prev.Size
-				_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), prev.ID))
-				continue
-			}
-			kept = append(kept, prev)
-		}
-		fs.queue = kept
-	}
 	fs.queue = append(fs.queue, op)
 	fs.queuedBytes += op.Size
+	e.compactLocked(fs)
 	if err := e.writeQueue(fs); err != nil {
 		return err
 	}
@@ -230,8 +313,12 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 				e.dropQueued(fs, op.ID)
 			}
 		case opRename:
+			// Landed, or landed and since deleted: a tombstone that covers
+			// the moved entry's counter was made by a holder that saw the
+			// move. (Requiring a live entry kept a rename whose destination
+			// was later removed queued forever.)
 			for _, move := range op.Moves {
-				if rem.Path == move.New.Path && !rem.Deleted && vvCovers(rem.VV, move.New.VV) {
+				if move.New != nil && rem.Path == move.New.Path && vvCovers(rem.VV, move.New.VV) {
 					e.dropQueued(fs, op.ID)
 					break
 				}
@@ -289,6 +376,7 @@ func (e *Engine) flushQueueOnce(fs *StoreState) {
 		return
 	}
 	peer := peers[0]
+	fs.lastFlush.Store(time.Now().UnixNano())
 	var batch []*Entry
 	send := func() bool {
 		if len(batch) == 0 {
@@ -604,19 +692,8 @@ func (e *Engine) moveQueuedPut(fs *StoreState, from, to string, vv map[string]ui
 	// The upload now happens after everything already queued - including
 	// the delete of the file it replaces, which must not reach the holder
 	// after it - and an older upload of the destination is superseded.
-	kept := fs.queue[:0]
-	for i, prev := range fs.queue {
-		if i == idx {
-			continue
-		}
-		if prev.Op == opPut && prev.Path == to {
-			fs.queuedBytes -= prev.Size
-			_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), prev.ID))
-			continue
-		}
-		kept = append(kept, prev)
-	}
-	fs.queue = append(kept, op)
+	fs.queue = append(slices.Delete(fs.queue, idx, idx+1), op)
+	e.compactLocked(fs)
 	_ = e.writeQueue(fs)
 	return true
 }

@@ -234,6 +234,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		switch {
 		case rem.Deleted:
 			if loc == nil || loc.Deleted {
+				e.foldTombstone(fs, rem, loc)
 				continue
 			}
 			if Dominates(rem.VV, loc.VV) {
@@ -339,6 +340,27 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 	}
 }
 
+// foldTombstone records a peer's deletion of a path this side has no live
+// entry for. There is nothing to delete, but the deletion still has to be
+// remembered: it is what this side echoes back, and a streamed store's queued
+// delete is acknowledged only by an entry that covers it. Ignoring it - the
+// old rule - left every delete of a file the holder never received (an
+// editor's temporary file, a test directory) queued on the writer forever.
+// It also carries the deletion on to a third peer that still has the file.
+func (e *Engine) foldTombstone(fs *StoreState, rem, loc *Entry) {
+	if loc != nil && Dominates(loc.VV, rem.VV) {
+		return // already known
+	}
+	var vv map[string]uint64
+	if loc != nil {
+		vv = loc.VV
+	}
+	vv = MergeVV(vv, rem.VV)
+	if err := fs.db.Put(&Entry{Path: rem.Path, Dir: rem.Dir, Deleted: true, VV: vv}); err != nil {
+		e.logger.Debug("record tombstone", "store", fs.name, "path", rem.Path, "error", err)
+	}
+}
+
 // handleDirEntry folds a peer's directory entry into the journal. Directories
 // carry no bytes, so none of the blob machinery applies: the entry's existence
 // is the content, and the version vector decides who is right.
@@ -346,6 +368,7 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 	switch {
 	case rem.Deleted:
 		if loc == nil || loc.Deleted {
+			e.foldTombstone(fs, rem, loc)
 			return
 		}
 		if Dominates(rem.VV, loc.VV) {

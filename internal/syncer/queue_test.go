@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -740,5 +741,106 @@ func TestRenameOverExistingQueuesUploadAfterDelete(t *testing.T) {
 	}
 	if !Dominates(ops[putAt].VV, map[string]uint64{"b": 4}) {
 		t.Fatalf("upload vv %v does not dominate the replaced version", ops[putAt].VV)
+	}
+}
+
+// A queue left by an older build - what the live BulkPictures store carried:
+// uploads of editor temporary files whose bytes were gone, deletes of paths
+// the holder never had, a directory renamed and then removed - drains once a
+// holder is connected, instead of sitting at the same count forever.
+func TestStuckLegacyQueueDrains(t *testing.T) {
+	oldScan, oldIndex := scanInterval, indexInterval
+	scanInterval, indexInterval = 50*time.Millisecond, 100*time.Millisecond
+	defer func() { scanInterval, indexInterval = oldScan, oldIndex }()
+
+	epA, epB := twoEndpoints(t)
+	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{
+		"docs": {Group: "g"},
+	})
+	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	vv := func(n uint64) map[string]uint64 { return map[string]uint64{"b": n} }
+	tmp := "album/.goutputstream-ABC123"
+	mv := func(from, to string, n uint64) renameMove {
+		return renameMove{From: from, Old: &Entry{Path: from, Dir: true, VV: vv(n - 1)}, New: &Entry{Path: to, Dir: true, VV: vv(n)}}
+	}
+	legacy := []queueOp{
+		{ID: "op1", Op: opDelete, Path: tmp, VV: vv(1)},
+		{ID: "op2", Op: opPut, Path: tmp, Blob: strings.Repeat("ab", 32), Size: 6 << 20, VV: vv(2)}, // bytes long gone
+		{ID: "op3", Op: opRmdir, Path: ".subtree-test/nested", VV: vv(3)},
+		{ID: "op4", Op: opRmdir, Path: ".subtree-test", VV: vv(4)},
+		{ID: "op5", Op: opRename, Path: "rename-check", To: "rename-check-moved", Dir: true, VV: vv(6),
+			Moves: []renameMove{mv("rename-check", "rename-check-moved", 6)}},
+		{ID: "op6", Op: opRmdir, Path: "rename-check-moved", VV: vv(7)},
+		{ID: "op7", Op: opDelete, Path: tmp, VV: vv(8)},
+	}
+	var lines []byte
+	for _, op := range legacy {
+		line, err := json.Marshal(op)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(append(lines, line...), '\n')
+	}
+	index := queueIndexPath(b.cfg.DataDir, "docs")
+	if err := os.MkdirAll(filepath.Dir(index), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(index, lines, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs := b.store("docs")
+	if err := b.eng.loadQueue(fs); err != nil { // as at startup
+		t.Fatal(err)
+	}
+	if len(fs.queue) != 6 {
+		t.Fatalf("loaded %d ops, want 6 (the upload with no bytes dropped)", len(fs.queue))
+	}
+
+	startNode(t, a)
+	startNode(t, b)
+	waitPrepared(t, b.store("docs"))
+	waitFor(t, testWait, "the legacy queue to drain", func() bool {
+		fs := b.store("docs")
+		fs.queueMu.Lock()
+		defer fs.queueMu.Unlock()
+		return len(fs.queue) == 0 && fs.queuedBytes == 0
+	})
+	if ent := a.store("docs").db.Get(tmp); ent == nil || !ent.Deleted {
+		t.Fatalf("holder entry for the temporary file = %+v, want a tombstone", ent)
+	}
+}
+
+// A later put or delete supersedes an earlier upload of the same path - but
+// not one a rename in between still needs: the holder moves the bytes it has.
+func TestCompactQueue(t *testing.T) {
+	put := func(id, path string) queueOp { return queueOp{ID: id, Op: opPut, Path: path, Size: 1} }
+	del := func(id, path string) queueOp { return queueOp{ID: id, Op: opDelete, Path: path} }
+	ren := func(id, from, to string) queueOp {
+		return queueOp{ID: id, Op: opRename, Path: from, To: to, Moves: []renameMove{{From: from, New: &Entry{Path: to}}}}
+	}
+	ids := func(ops []queueOp) string {
+		var out []string
+		for _, op := range ops {
+			out = append(out, op.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	for _, tc := range []struct {
+		name       string
+		ops        []queueOp
+		kept, drop string
+	}{
+		{"delete supersedes", []queueOp{put("1", "p"), del("2", "p")}, "2", "1"},
+		{"put supersedes", []queueOp{put("1", "p"), put("2", "p")}, "2", "1"},
+		{"rename keeps the bytes", []queueOp{put("1", "p"), ren("2", "p", "q"), del("3", "p")}, "1,2,3", ""},
+		{"other paths untouched", []queueOp{put("1", "p"), del("2", "q")}, "1,2", ""},
+		{"delete then put kept", []queueOp{del("1", "p"), put("2", "p")}, "1,2", ""},
+	} {
+		kept, dropped := compactQueue(tc.ops)
+		if ids(kept) != tc.kept || ids(dropped) != tc.drop {
+			t.Errorf("%s: kept %q dropped %q, want %q / %q", tc.name, ids(kept), ids(dropped), tc.kept, tc.drop)
+		}
 	}
 }

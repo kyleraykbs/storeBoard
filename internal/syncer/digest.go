@@ -109,30 +109,43 @@ func (e *Engine) entrySum(ent *Entry, unsettled bool) uint64 {
 	return binary.BigEndian.Uint64(h.Sum(nil))
 }
 
-// unsettledFunc reports, per entry, whether this side still has work to do on
-// it (see entrySum).
-func (e *Engine) unsettledFunc(fs *StoreState) func(*Entry) bool {
-	if fs.stream {
-		fs.queueMu.Lock()
-		queued := make(map[string]bool, len(fs.queue))
-		for _, op := range fs.queue {
-			queued[op.Path] = true
-			if op.To != "" {
-				queued[op.To] = true
-			}
+// queuedPaths is every path a streamed store's queue still has an op for.
+func queuedPaths(fs *StoreState) map[string]bool {
+	fs.queueMu.Lock()
+	defer fs.queueMu.Unlock()
+	queued := make(map[string]bool, len(fs.queue))
+	for _, op := range fs.queue {
+		queued[op.Path] = true
+		if op.To != "" {
+			queued[op.To] = true
 		}
-		fs.queueMu.Unlock()
-		return func(ent *Entry) bool { return queued[ent.Path] }
 	}
-	return func(ent *Entry) bool { return !ent.Deleted && !ent.Dir && !ent.Local }
+	return queued
 }
 
 // digest summarises a journal into 1<<nbits bucket sums.
+//
+// An entry this side has not finished with is perturbed (see entrySum). For
+// a streamed store that is every path with an op still queued - including
+// paths the journal no longer has an entry for at all (a temporary file
+// written and removed): their bucket must differ too, or the holder's answer
+// that would acknowledge the op is never asked for.
 func (e *Engine) digest(fs *StoreState, entries []*Entry, nbits int) []uint64 {
-	unsettled := e.unsettledFunc(fs)
 	sums := make([]uint64, 1<<nbits)
+	if !fs.stream {
+		for _, ent := range entries {
+			unsettled := !ent.Deleted && !ent.Dir && !ent.Local
+			sums[bucketOf(ent.Path, nbits)] += e.entrySum(ent, unsettled)
+		}
+		return sums
+	}
+	queued := queuedPaths(fs)
 	for _, ent := range entries {
-		sums[bucketOf(ent.Path, nbits)] += e.entrySum(ent, unsettled(ent))
+		sums[bucketOf(ent.Path, nbits)] += e.entrySum(ent, queued[ent.Path])
+		delete(queued, ent.Path)
+	}
+	for path := range queued {
+		sums[bucketOf(path, nbits)] += e.entrySum(&Entry{Path: path}, true)
 	}
 	return sums
 }
