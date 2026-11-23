@@ -535,13 +535,13 @@ func TestRestoreParksUnscannedEdit(t *testing.T) {
 	if got := readFile(t, p); got != "v1" {
 		t.Fatalf("restored %q", got)
 	}
-	sum3 := sumOf("unscanned v3")
+	sum3 := sumOfString("unscanned v3")
 	if got := readFile(t, filepath.Join(fs.root, conflictPath("note.txt", sum3))); got != "unscanned v3" {
 		t.Fatalf("unscanned edit not parked: %q", got)
 	}
 }
 
-func sumOf(s string) string {
+func sumOfString(s string) string {
 	sum, _ := store.Sum(strings.NewReader(s))
 	return sum
 }
@@ -600,7 +600,7 @@ func TestApplyParksEditDuringCopy(t *testing.T) {
 	if got := readFile(t, p); got != "remote v2" {
 		t.Fatalf("file = %q", got)
 	}
-	if got := readFile(t, filepath.Join(fs.root, conflictPath("a.txt", sumOf("edit during copy")))); got != "edit during copy" {
+	if got := readFile(t, filepath.Join(fs.root, conflictPath("a.txt", sumOfString("edit during copy")))); got != "edit during copy" {
 		t.Fatalf("edit not parked: %q", got)
 	}
 }
