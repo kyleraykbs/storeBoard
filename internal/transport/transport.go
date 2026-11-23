@@ -3,7 +3,7 @@
 // other peer, exchanging newline-delimited JSON.
 //
 // The first line in both directions is a hello; after that the connection
-// carries ping/pong keepalives and (later) the sync protocol. Nothing here
+// carries ping keepalives and (later) the sync protocol. Nothing here
 // is privileged: a connection learns a peer's name and version and nothing
 // else, matching the status-document trust tier. Peers are never learned
 // from the wire — an undeclared name is a rejected connection.
@@ -11,6 +11,7 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,7 +20,6 @@ import (
 	"net"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,7 +108,27 @@ type peerState struct {
 	skew     time.Duration
 	features []string
 
+	// events are lifecycle callbacks waiting for delivery, in the order the
+	// links were installed and dropped; evRunning is set while a goroutine
+	// drains them. Posting happens under mu, in the same critical section
+	// that installs or drops the link, so a replacement's "connected" can
+	// never be overtaken by its predecessor's, and a dying link's
+	// "disconnected" can never land after the next link's "connected".
+	events    []linkEvent
+	evRunning bool
+
 	mu sync.Mutex
+}
+
+// linkEvent is one lifecycle callback for a peer.
+type linkEvent struct {
+	connected bool
+	c         net.Conn
+	w         *linkWriter
+	// ready is closed once a "connected" event has been delivered (or
+	// skipped as stale): the link's frames wait for it, so the handler never
+	// sees a frame from a link it has not been told about yet.
+	ready chan struct{}
 }
 
 func (p *peerState) connected() bool {
@@ -157,8 +177,11 @@ type Handler interface {
 	OnPeerConnected(peer string, send Sender)
 	// OnPeerFrame delivers one frame line from a peer.
 	OnPeerFrame(peer string, line []byte)
-	// OnPeerDisconnected reports a link going away.
-	OnPeerDisconnected(peer string)
+	// OnPeerDisconnected reports a link going away. send is the Sender
+	// OnPeerConnected was given for that link: a handler forgets it only if
+	// it is still the one installed. Callbacks for one peer are delivered
+	// one at a time, in the order the links came and went.
+	OnPeerDisconnected(peer string, send Sender)
 }
 
 // UrgentHandler is an optional Handler extension. The link's read loop offers
@@ -216,6 +239,12 @@ type Manager struct {
 
 	// ping is pingInterval as it was when the manager was made.
 	ping time.Duration
+
+	// listenFn opens a listener; acceptRebind is how long Accept may keep
+	// failing before the listener is closed and bound again. Both are copied
+	// from package variables so tests can turn them.
+	listenFn     func(ep string) (net.Listener, error)
+	acceptRebind time.Duration
 
 	// cancel ends the context Run derived from the caller's. Close uses it
 	// so teardown never depends on the caller cancelling first: a caller
@@ -282,7 +311,16 @@ type linkWriter struct {
 	// alive reports that the peer has been heard from recently. A write
 	// that times out while it is true is a busy reader, not a dead link.
 	alive func() bool
+	// heard is when the link's read loop last read a line (unix nanos).
+	heard atomic.Int64
 }
+
+// linkFrameQueue is how many frames a link buffers for the handler. The
+// handler only makes the link wait for backpressure that is real (blob chunks
+// arriving faster than the disk takes them), so this is a cushion rather
+// than the only thing between a slow store and a stalled read loop - and at
+// up to a blob chunk a frame, a large one is a lot of memory per link.
+const linkFrameQueue = 128
 
 // Lanes, most urgent first. A writer waits while the socket is busy or while
 // anyone is queued at a more urgent lane, so it only ever waits behind the
@@ -381,7 +419,8 @@ func New(cfg *config.Config, logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	m := &Manager{cfg: cfg, logger: logger, peers: map[string]*peerState{}, ping: pingInterval}
+	m := &Manager{cfg: cfg, logger: logger, peers: map[string]*peerState{}, ping: pingInterval,
+		listenFn: listenTCP, acceptRebind: acceptRebindAfter}
 	now := time.Now().UTC()
 	for name, p := range cfg.Peers {
 		if name == cfg.Peer {
@@ -423,7 +462,7 @@ func (m *Manager) Run(ctx context.Context) {
 	m.runListeners(ctx)
 
 	for _, p := range m.sortedPeers() {
-		if p.state == stateUnaddressed {
+		if len(p.endps) == 0 { // unaddressed; endps never changes, unlike state
 			continue
 		}
 		m.spawn(func() { m.dialLoop(ctx, p) })
@@ -449,16 +488,41 @@ func (m *Manager) runListeners(ctx context.Context) {
 	}
 }
 
+// listenTCP and acceptRebindAfter are the defaults New copies; vars only for
+// tests.
+var (
+	listenTCP         = func(ep string) (net.Listener, error) { return net.Listen("tcp", ep) }
+	acceptRebindAfter = 30 * time.Second
+)
+
+const (
+	acceptBackoffMin = 5 * time.Millisecond
+	acceptBackoffMax = time.Second
+)
+
 func (m *Manager) listenLoop(ctx context.Context, ep string) {
 	for {
-		ln, err := net.Listen("tcp", ep)
+		ln, err := m.listenFn(ep)
 		if err == nil {
 			m.mu.Lock()
+			if m.closing {
+				m.mu.Unlock()
+				ln.Close()
+				return
+			}
 			m.listen = append(m.listen, ln)
 			m.mu.Unlock()
 			m.logger.Info("transport listening", "endpoint", ep)
-			m.acceptLoop(ctx, ln)
-			return
+			rebind := m.acceptLoop(ctx, ln)
+			m.mu.Lock()
+			m.listen = slices.DeleteFunc(m.listen, func(l net.Listener) bool { return l == ln })
+			m.mu.Unlock()
+			ln.Close()
+			if !rebind || ctx.Err() != nil {
+				return
+			}
+			m.logger.Warn("transport listener kept failing; binding it again", "endpoint", ep)
+			continue
 		}
 		if ctx.Err() != nil {
 			return
@@ -472,15 +536,42 @@ func (m *Manager) listenLoop(ctx context.Context, ep string) {
 	}
 }
 
-func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
+// acceptLoop serves one listener until ctx ends or the listener is closed. It
+// reports true when it gave up on a listener that kept failing, which the
+// caller binds again. An Accept error is usually transient - out of
+// descriptors (EMFILE), a connection reset before it was taken (ECONNABORTED)
+// - and used to end the loop for good, leaving the daemon unreachable until it
+// restarted.
+func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) (rebind bool) {
 	acceptErr := make(chan error, 1)
 	go func() {
+		var failing time.Time
+		delay := acceptBackoffMin
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				acceptErr <- err
-				return
+				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+					acceptErr <- nil
+					return
+				}
+				now := time.Now()
+				if failing.IsZero() {
+					failing = now
+					m.logger.Warn("transport accept failed; retrying", "error", err)
+				} else if now.Sub(failing) >= m.acceptRebind {
+					acceptErr <- err
+					return
+				}
+				select {
+				case <-ctx.Done():
+					acceptErr <- nil
+					return
+				case <-time.After(delay):
+				}
+				delay = min(2*delay, acceptBackoffMax)
+				continue
 			}
+			failing, delay = time.Time{}, acceptBackoffMin
 			if !m.spawn(func() { m.accept(ctx, c) }) {
 				c.Close()
 			}
@@ -489,8 +580,14 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
 	select {
 	case <-ctx.Done():
 		ln.Close()
+		<-acceptErr
+		return false
 	case err := <-acceptErr:
-		m.logger.Warn("transport accept loop ended", "error", err)
+		if err != nil {
+			m.logger.Warn("transport accept keeps failing", "error", err)
+			return true
+		}
+		return false
 	}
 }
 
@@ -632,17 +729,6 @@ func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
 	return got, reader, nil
 }
 
-// connKey identifies a connection independently of which end looks at it:
-// the sorted pair of local and remote addresses. Two daemons that dial each
-// other simultaneously compute the same keys, so both keep the same
-// connection and the tie-break is stable.
-func connKey(c net.Conn) string {
-	local, remote := c.LocalAddr().String(), c.RemoteAddr().String()
-	pair := []string{local, remote}
-	sort.Strings(pair)
-	return pair[0] + "|" + pair[1]
-}
-
 // preferredDirection gives each peer pair one stable link: the lexically
 // lower peer dials, so it keeps outbound; the higher peer keeps inbound.
 func (m *Manager) preferredDirection(peer string) string {
@@ -657,8 +743,6 @@ func (m *Manager) preferredDirection(peer string) string {
 // large initial indexes: choosing different links makes both sides close the
 // other's connection and leaves the index exchange deadlocked.
 func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *bufio.Reader, direction string) {
-	key := connKey(c)
-
 	m.mu.Lock()
 	p, ok := m.peers[h.Name]
 	m.mu.Unlock()
@@ -707,6 +791,17 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 	p.state = stateConnected
 	p.since = time.Now().UTC()
 	p.lastErr = ""
+	w := newLinkWriter(c)
+	w.features = h.Features
+	// Anything read counts: the peer pings every m.ping even while its own
+	// frame handling is stalled.
+	w.heard.Store(time.Now().UnixNano())
+	ping := m.ping
+	w.alive = func() bool { return time.Since(time.Unix(0, w.heard.Load())) < 2*ping }
+	// Told to the handler in the same critical section that installed the
+	// link: see peerState.events.
+	ready := make(chan struct{})
+	m.postLocked(p, linkEvent{connected: true, c: c, w: w, ready: ready})
 	p.mu.Unlock()
 
 	m.logger.Info("peer connected", "peer", h.Name, "direction", direction, "version", h.Version, "remote", c.RemoteAddr().String())
@@ -714,31 +809,78 @@ func (m *Manager) register(ctx context.Context, h hello, c net.Conn, reader *buf
 		m.logger.Warn("peer clock differs from this machine's; conflicting edits are decided by modification time, so the faster clock wins them",
 			"peer", h.Name, "skew", skew.Round(time.Millisecond).String())
 	}
-	if !m.spawn(func() { m.serveLink(ctx, p, c, reader, key, direction) }) {
-		m.dropLink(p, c, key)
+	if !m.spawn(func() { m.serveLink(ctx, p, c, w, ready, reader, direction) }) {
+		m.dropLink(p, c, w)
 	}
 }
 
-// serveLink consumes one live connection: it answers pings and detects the
-// peer going away.
-func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reader *bufio.Reader, key, direction string) {
-	w := newLinkWriter(c)
-	p.mu.Lock()
-	w.features = p.features
-	p.mu.Unlock()
-	// Anything read counts: the peer pings every m.ping even while its own
-	// frame handling is stalled.
-	var lastRead atomic.Int64
-	lastRead.Store(time.Now().UnixNano())
-	w.alive = func() bool {
-		return time.Since(time.Unix(0, lastRead.Load())) < 2*m.ping
+// postLocked queues a lifecycle callback for the peer and makes sure a
+// goroutine is delivering them. Callers hold p.mu. With no handler there is
+// nothing to tell; a "connected" event's frames are released at once.
+func (m *Manager) postLocked(p *peerState, ev linkEvent) {
+	if m.getHandler() == nil {
+		if ev.ready != nil {
+			close(ev.ready)
+		}
+		return
 	}
+	p.events = append(p.events, ev)
+	if p.evRunning {
+		return
+	}
+	p.evRunning = true
+	if !m.spawn(func() { m.deliverEvents(p) }) {
+		// Shutting down: nobody will be told, and nothing waits on ready
+		// past the link's context.
+		p.evRunning = false
+		p.events = nil
+	}
+}
+
+// deliverEvents drains one peer's lifecycle callbacks, one at a time.
+func (m *Manager) deliverEvents(p *peerState) {
+	h := m.getHandler()
+	for {
+		p.mu.Lock()
+		if len(p.events) == 0 {
+			p.evRunning = false
+			p.mu.Unlock()
+			return
+		}
+		ev := p.events[0]
+		p.events[0] = linkEvent{}
+		p.events = p.events[1:]
+		// A link replaced or dropped before its turn came is not worth
+		// announcing: its "disconnected" (if any) is queued behind, and the
+		// handler would only install a dead sender to remove it again.
+		stale := ev.connected && p.conn != ev.c
+		p.mu.Unlock()
+		switch {
+		case ev.connected && !stale:
+			h.OnPeerConnected(p.name, ev.w)
+		case !ev.connected:
+			h.OnPeerDisconnected(p.name, ev.w)
+		}
+		if ev.ready != nil {
+			close(ev.ready)
+		}
+	}
+}
+
+// serveLink consumes one live connection: it hands frames to the handler and
+// detects the peer going away. It never writes: a write here waits for the
+// socket, which a bulk transfer can hold for as long as the peer is slow to
+// read, and a read loop stuck behind it stopped hearing the peer at all -
+// the link then looked dead (see linkWriter.alive) and was dropped while both
+// ends were busy and well.
+func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, w *linkWriter, ready chan struct{}, reader *bufio.Reader, direction string) {
 	handler := m.getHandler()
 	urgent, _ := handler.(UrgentHandler)
 	p.mu.Lock()
 	current := p.conn == c
 	p.mu.Unlock()
 	if !current {
+		c.Close()
 		return
 	}
 
@@ -748,10 +890,17 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 	if handler != nil {
 		framesCtx, cancelFrames := context.WithCancel(ctx)
 		framesStop = cancelFrames
-		frames = make(chan []byte, 1024)
+		frames = make(chan []byte, linkFrameQueue)
 		framesDone = make(chan struct{})
 		started := m.spawn(func() {
 			defer close(framesDone)
+			// Not a frame before the handler has this link's sender: a
+			// want answered on the previous link's would be lost.
+			select {
+			case <-framesCtx.Done():
+				return
+			case <-ready:
+			}
 			for {
 				select {
 				case <-framesCtx.Done():
@@ -772,17 +921,9 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 		if !started {
 			// Shutting down: nothing will consume frames, so serve none.
 			cancelFrames()
-			m.dropLink(p, c, key)
+			m.dropLink(p, c, w)
 			return
 		}
-		m.spawn(func() {
-			p.mu.Lock()
-			stillCurrent := p.conn == c
-			p.mu.Unlock()
-			if stillCurrent {
-				handler.OnPeerConnected(p.name, w)
-			}
-		})
 	}
 
 	stop := make(chan struct{})
@@ -795,7 +936,7 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 			close(frames)
 			<-framesDone
 		}
-		m.dropLink(p, c, key)
+		m.dropLink(p, c, w)
 	}()
 	go func() {
 		t := time.NewTicker(m.ping)
@@ -821,38 +962,38 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 	// TCP alone takes a quarter of an hour to notice - and while it holds
 	// the peer's slot, the peer's fresh connections are refused as
 	// duplicates.
+	//
+	// Pings are not answered. Both ends ping on their own schedule and any
+	// line read is proof of life, so a pong carried nothing the peer's own
+	// ping did not - and writing it is what blocked this loop. A peer from
+	// before this change does not miss the pongs for the same reason: its
+	// liveness is any read too, and this side's pings keep arriving.
 	idle := 3 * m.ping
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(idle))
 		raw, err := readLine(reader, maxFrame)
-		if err == nil {
-			lastRead.Store(time.Now().UnixNano())
-		}
 		if err != nil {
 			if ctx.Err() == nil && !isClosed(err) {
 				m.logger.Info("link closed", "peer", p.name, "direction", direction, "error", err)
 			}
 			return
 		}
-		line := string(raw)
-		switch trimmed := strings.TrimSpace(line); trimmed {
-		case "{\"ping\"}":
-			if err := w.Send([]byte("{\"pong\"}\n")); err != nil {
-				return
-			}
-		case "{\"pong\"}", "":
+		w.heard.Store(time.Now().UnixNano())
+		trimmed := bytes.TrimSpace(raw)
+		switch string(trimmed) {
+		case "{\"ping\"}", "{\"pong\"}", "":
 		default:
-			if urgent != nil && urgent.OnPeerUrgent(p.name, []byte(trimmed)) {
+			if urgent != nil && urgent.OnPeerUrgent(p.name, trimmed) {
 				continue
 			}
 			if frames != nil {
 				select {
-				case frames <- []byte(trimmed):
+				case frames <- trimmed:
 				case <-ctx.Done():
 					return
 				}
 			} else {
-				m.logger.Debug("unhandled frame", "peer", p.name, "bytes", len(line))
+				m.logger.Debug("unhandled frame", "peer", p.name, "bytes", len(raw))
 			}
 		}
 	}
@@ -860,11 +1001,14 @@ func (m *Manager) serveLink(ctx context.Context, p *peerState, c net.Conn, reade
 
 // dropLink tears down a connection that just died, if it is still the
 // registered one, and wakes the dial loop.
-func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
+//
+// The handler hears of it on the peer's event goroutine, never here: it can
+// wait on store locks held by a long scan, and the status snapshot and the
+// next registration both need p.mu in the meantime.
+func (m *Manager) dropLink(p *peerState, c net.Conn, w *linkWriter) {
 	c.Close()
 	p.mu.Lock()
-	dropped := p.conn == c
-	if dropped {
+	if p.conn == c {
 		p.conn = nil
 		p.attempt++
 		p.state = stateBackoff
@@ -872,16 +1016,9 @@ func (m *Manager) dropLink(p *peerState, c net.Conn, key string) {
 		p.lastErr = "connection closed"
 		close(p.linkReset)
 		p.linkReset = make(chan struct{})
+		m.postLocked(p, linkEvent{connected: false, c: c, w: w})
 	}
 	p.mu.Unlock()
-	// Outside the lock: the handler can wait on store locks held by a long
-	// scan, and the status snapshot and the next registration both need
-	// p.mu in the meantime.
-	if dropped {
-		if h := m.getHandler(); h != nil {
-			h.OnPeerDisconnected(p.name)
-		}
-	}
 }
 
 // Snapshot lists every declared peer's link state, sorted by name; the
