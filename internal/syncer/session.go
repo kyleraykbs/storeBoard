@@ -959,6 +959,16 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 	e.mu.Lock()
 	inc := e.incoming[key]
 	delete(e.incoming, key)
+	if inc == nil && !emptyBlobEnd(fr, blob) {
+		// No transfer is open, so there are no bytes to apply: the start was
+		// lost, or the transfer was abandoned at a gap. The want is not
+		// answered - it is due again at the next exchange, not consumed.
+		if store.ValidSum(blob) {
+			e.resetWantsLocked(fr.Store, fr.Path, blob)
+		}
+		e.mu.Unlock()
+		return
+	}
 	var wants []*pending
 	if store.ValidSum(blob) {
 		for _, conflict := range []bool{false, true} {
@@ -980,21 +990,40 @@ func (e *Engine) handleBlobEnd(peer string, fr *frame) {
 		}
 		return
 	}
-	select {
-	case e.finishSem <- struct{}{}:
-	case <-e.closed:
+	// The chunk worker waits only for room in the backlog; the finish slot
+	// is waited for off it (see finishBacklog).
+	discard := func() {
 		if inc != nil {
 			inc.f.Close()
 			os.Remove(inc.f.Name())
 		}
+	}
+	select {
+	case e.finishQueue <- struct{}{}:
+	case <-e.closed:
+		discard()
 		return
 	}
 	e.finishWG.Add(1)
 	go func() {
 		defer e.finishWG.Done()
+		defer func() { <-e.finishQueue }()
+		select {
+		case e.finishSem <- struct{}{}:
+		case <-e.closed:
+			discard()
+			return
+		}
 		defer func() { <-e.finishSem }()
 		e.finishBlob(peer, fs, fr, blob, inc, wants)
 	}()
+}
+
+// emptyBlobEnd reports a blobEnd that legitimately has no transfer behind it:
+// a zero-byte file from a sender that sent no chunk at all.
+func emptyBlobEnd(fr *frame, blob string) bool {
+	ent := fr.Entry
+	return ent != nil && !ent.Deleted && ent.Size == 0 && ent.Blob == blob
 }
 
 // finishBlob verifies a completed transfer against the version that was
@@ -1006,41 +1035,55 @@ func (e *Engine) finishBlob(peer string, fs *StoreState, fr *frame, blob string,
 		// No transfer was opened. That is legitimate only for a zero-byte
 		// file whose sender never sent a chunk: apply it directly rather than
 		// dropping the want and leaving an empty file missing forever.
-		if ent := fr.Entry; ent != nil && !ent.Deleted && ent.Size == 0 && ent.Blob == blob {
+		if emptyBlobEnd(fr, blob) {
 			if err := e.ensureEmptyBlob(blob); err != nil {
 				e.logger.Warn("empty blob", "store", fs.name, "path", fr.Path, "error", err)
+				e.restoreWants(fs, fr.Path, wants)
 				return
 			}
 			e.applyWants(fs, wants)
+			return
 		}
+		e.restoreWants(fs, fr.Path, wants)
 		return
 	}
 	defer os.Remove(inc.f.Name())
 
+	// A transfer that fails here never applied anything: its wants go back,
+	// due again, instead of being consumed by bytes that were never used.
 	sum := hex.EncodeToString(inc.hash.Sum(nil))
 	if sum != blob {
 		inc.f.Close()
 		e.logger.Warn("blob failed verification", "store", fs.name, "path", fr.Path, "peer", peer, "want", blob, "got", sum)
+		e.restoreWants(fs, fr.Path, wants)
 		return
 	}
 	if err := inc.f.Sync(); err != nil {
 		inc.f.Close()
-		if isNoSpace(err) {
-			e.backOffFetch(fs, fr.Path, err.Error())
-		}
+		e.failedFinish(fs, fr.Path, wants, err)
 		return
 	}
 	if err := inc.f.Close(); err != nil {
-		if isNoSpace(err) {
-			e.backOffFetch(fs, fr.Path, err.Error())
-		}
+		e.failedFinish(fs, fr.Path, wants, err)
 		return
 	}
 	if err := e.store.Adopt(inc.f.Name(), sum); err != nil {
 		e.logger.Error("adopt blob", "error", err)
+		e.restoreWants(fs, fr.Path, wants)
 		return
 	}
 	e.applyWants(fs, wants)
+}
+
+// failedFinish handles a transfer whose bytes could not be made durable: a
+// full disk pauses fetching the path (asking again at once would only fill it
+// again); anything else puts the wants back, due again.
+func (e *Engine) failedFinish(fs *StoreState, path string, wants []*pending, err error) {
+	if isNoSpace(err) {
+		e.backOffFetch(fs, path, err.Error())
+		return
+	}
+	e.restoreWants(fs, path, wants)
 }
 
 // applyWants applies a verified, stored blob to what asked for it. A

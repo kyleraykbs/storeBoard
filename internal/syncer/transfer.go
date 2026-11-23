@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"slices"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
+	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 )
 
 // Transfers are addressed by content. A want names the store, the path it is
@@ -292,6 +294,11 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 		cancel: cancel,
 	}
 	e.sendMu.Lock()
+	if e.sendsClosed {
+		e.sendMu.Unlock()
+		cancel()
+		return
+	}
 	ps := e.sendq[peer]
 	if ps == nil {
 		ps = &peerSends{queued: map[string]*sendJob{}, active: map[string]*sendJob{}}
@@ -328,8 +335,12 @@ func (e *Engine) handleWant(peer string, fr *frame) {
 }
 
 // startSendsLocked starts whatever the free slots allow, in queue order.
-// Callers hold sendMu.
+// Callers hold sendMu. Nothing starts once Close has begun: sendWG.Add must
+// never race the Wait.
 func (e *Engine) startSendsLocked(peer string, ps *peerSends) {
+	if e.sendsClosed {
+		return
+	}
 	start := func(j *sendJob) {
 		delete(ps.queued, j.key)
 		ps.active[j.key] = j
@@ -369,20 +380,63 @@ func (e *Engine) startSendsLocked(peer string, ps *peerSends) {
 	ps.large = fill(ps.large, &ps.nLarge, sendLargeSlots)
 }
 
-// cancelSends stops every transfer, queued or running.
+// cancelSends stops every transfer, queued or running, and refuses new ones:
+// it is Close's, and after it sendWG only goes down.
 func (e *Engine) cancelSends() {
 	e.sendMu.Lock()
+	e.sendsClosed = true
 	for _, ps := range e.sendq {
-		for _, j := range ps.active {
-			j.cancel()
-		}
-		for _, j := range ps.queued {
-			j.cancel()
-		}
-		ps.small, ps.large = nil, nil
-		ps.queued = map[string]*sendJob{}
+		ps.cancelLocked()
 	}
 	e.sendMu.Unlock()
+}
+
+// cancelPeerSends stops one peer's transfers, queued or running, when its
+// link goes or is replaced. A running one would otherwise carry on over the
+// next link, missing the chunks the old one lost: the receiver abandons a
+// transfer at the first gap and silently drops the rest - gigabytes of it for
+// a large file. The peer asks again on the new link.
+func (e *Engine) cancelPeerSends(peer string) {
+	e.sendMu.Lock()
+	if ps := e.sendq[peer]; ps != nil {
+		ps.cancelLocked()
+	}
+	e.sendMu.Unlock()
+}
+
+// cancelLocked cancels every job. A running one stays in active until it
+// winds down, so a repeat of it waits rather than interleaving. Callers hold
+// Engine.sendMu.
+func (ps *peerSends) cancelLocked() {
+	for _, j := range ps.active {
+		j.cancel()
+	}
+	for _, j := range ps.queued {
+		j.cancel()
+	}
+	ps.small, ps.large = nil, nil
+	ps.queued = map[string]*sendJob{}
+}
+
+// senderFor is the peer's sender right now, or nil.
+func (e *Engine) senderFor(peer string) transport.Sender {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sends[peer]
+}
+
+// sendOn writes one frame to a given link: bulk for blob chunks, priority for
+// everything else.
+func sendOn(send transport.Sender, fr frame, bulk bool) error {
+	b, err := json.Marshal(fr)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	if bulk {
+		return send.SendBulk(b)
+	}
+	return send.Send(b)
 }
 
 // sendingCount is the number of transfers running or queued, per peer.
@@ -400,12 +454,19 @@ func (e *Engine) runSend(j *sendJob) {
 	if j.ctx.Err() != nil {
 		return
 	}
+	// The whole transfer goes out on one link. Looking the sender up per
+	// chunk moved a running transfer onto a replacement link mid-file, with
+	// whatever the dead one swallowed missing from the middle.
+	send := e.senderFor(j.peer)
+	if send == nil {
+		return
+	}
 	fs := j.fs
 	blob, ent, err := e.openBlobFor(fs, j.path, j.blob)
 	if err != nil {
 		e.logger.Info("no readable copy for want", "store", fs.name, "path", j.path, "blob", j.blob, "peer", j.peer, "error", err)
 		if j.blob != "" {
-			_ = e.sendTo(j.peer, frame{Type: "wantErr", Store: fs.name, Path: j.path, Blob: j.blob, Code: wantMissing, Error: "no copy here"})
+			_ = sendOn(send, frame{Type: "wantErr", Store: fs.name, Path: j.path, Blob: j.blob, Code: wantMissing, Error: "no copy here"}, false)
 		}
 		return
 	}
@@ -431,7 +492,7 @@ func (e *Engine) runSend(j *sendJob) {
 		if n > 0 {
 			// Bulk: index frames for every store overtake a transfer in
 			// progress instead of waiting behind gigabytes of video.
-			if err := e.sendBulkTo(j.peer, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: seq, Data: buf[:n]}); err != nil {
+			if err := sendOn(send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: seq, Data: buf[:n]}, true); err != nil {
 				return
 			}
 			seq++
@@ -441,7 +502,7 @@ func (e *Engine) runSend(j *sendJob) {
 			// never opened a transfer and dropped the blobEnd on the floor.
 			// Send the empty first chunk to open the transfer.
 			if seq == 0 {
-				if err := e.sendBulkTo(j.peer, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: 0}); err != nil {
+				if err := sendOn(send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: 0}, true); err != nil {
 					return
 				}
 			}
@@ -455,7 +516,7 @@ func (e *Engine) runSend(j *sendJob) {
 	if j.ctx.Err() != nil {
 		return
 	}
-	if err := e.sendTo(j.peer, frame{Type: "blobEnd", Store: fs.name, Path: j.path, Blob: ent.Blob, Entry: ent, Offset: j.offset, Length: j.length}); err != nil {
+	if err := sendOn(send, frame{Type: "blobEnd", Store: fs.name, Path: j.path, Blob: ent.Blob, Entry: ent, Offset: j.offset, Length: j.length}, false); err != nil {
 		e.logger.Debug("blobEnd", "peer", j.peer, "error", err)
 	}
 }
@@ -472,6 +533,50 @@ const blobShards = 4
 // it into the tree, and a chunk worker stuck doing that for a 20 GiB file
 // backed the link up until the sender's write deadline dropped it.
 const finishSlots = 4
+
+// finishBacklog bounds the completed transfers waiting for a finish slot. The
+// chunk worker used to wait for the slot itself, so four slow applies (each
+// behind a long scan's lock) stopped every transfer on the shard and, behind
+// it, the link's reads. Waiting transfers hold a file descriptor each, so
+// they are bounded too; past this the chunk worker waits after all.
+const finishBacklog = 256
+
+// restoreWants puts back wants a finished transfer could not satisfy (the
+// bytes failed verification, could not be stored), due to be asked again at
+// the next exchange. A want registered since, or a newer version of the path
+// wanted since, takes precedence and the old one stays gone.
+func (e *Engine) restoreWants(fs *StoreState, path string, wants []*pending) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, p := range wants {
+		if e.wantLocked(fs.name, path, p.slot()) != nil {
+			continue
+		}
+		if !p.conflict && p.entry != nil {
+			superseded := false
+			for _, other := range e.wants[wantKey(fs.name, path)] {
+				if !other.conflict && other.entry != nil && other.entry.Blob != p.entry.Blob {
+					superseded = true
+				}
+			}
+			if superseded {
+				continue
+			}
+		}
+		p.asked = time.Time{}
+		e.setWantLocked(fs.name, path, p)
+	}
+}
+
+// resetWantsLocked makes the wants for one version of a path due again
+// without removing them. Callers hold e.mu.
+func (e *Engine) resetWantsLocked(store, path, blob string) {
+	for _, conflict := range []bool{false, true} {
+		if p := e.wantLocked(store, path, wantSlot(blob, conflict)); p != nil {
+			p.asked = time.Time{}
+		}
+	}
+}
 
 func blobShard(peer string, fr *frame) int {
 	var h uint32 = 2166136261

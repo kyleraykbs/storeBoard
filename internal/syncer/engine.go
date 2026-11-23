@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -232,30 +233,43 @@ type Engine struct {
 	frameStartOnce sync.Once
 	frameWG        sync.WaitGroup
 	readWG         sync.WaitGroup
-	indexFrames    map[string]chan peerFrame
-	wantFrames     map[string]chan peerFrame
+	// Per-store frame queues by class (see the dispatch notes at
+	// frameQueue).
+	indexFrames map[string]*frameQueue
+	wantFrames  map[string]*frameQueue
+	opsFrames   map[string]*frameQueue
+	readFrames  map[string]*frameQueue
 
 	// The loop intervals as they were when the engine was made: the package
 	// variables are knobs for tests, and reading them from running loops
 	// raced every test that turned one.
 	scanEvery, linkEvery, indexEvery, pruneEvery time.Duration
 
-	readFrames map[string]chan peerFrame
 	blobFrames [blobShards]chan peerFrame
 
+	// evalCh asks evaluateLoop to re-check which streamed stores have a
+	// holder; capacity one, so requests coalesce.
+	evalCh chan struct{}
+
 	// finishSem bounds completed transfers being verified and applied, and
-	// finishWG lets Close wait for them.
-	finishSem chan struct{}
-	finishWG  sync.WaitGroup
+	// finishWG lets Close wait for them. finishQueue bounds the finished
+	// transfers waiting for a slot: each holds a temporary file open.
+	finishSem   chan struct{}
+	finishQueue chan struct{}
+	finishWG    sync.WaitGroup
 	// blobLocks serialises finishing per blob (see lockBlob).
 	blobLockMu sync.Mutex
 	blobLocks  map[string]*blobLock
 
 	// sendMu guards sendq, each peer's outgoing transfers; sendWG lets Close
 	// wait for the running ones.
-	sendMu sync.Mutex
-	sendq  map[string]*peerSends
-	sendWG sync.WaitGroup
+	// sendsClosed (under sendMu) refuses new transfers once Close has
+	// cancelled the running ones, so none can Add to sendWG while Close
+	// waits on it.
+	sendMu      sync.Mutex
+	sendq       map[string]*peerSends
+	sendWG      sync.WaitGroup
+	sendsClosed bool
 
 	// safety is the replica data-safety bookkeeping (safety.go): fetches
 	// backed off for lack of space.
@@ -265,90 +279,213 @@ type Engine struct {
 type peerFrame struct {
 	peer string
 	fr   frame
+	size int // the frame's wire size, for the queue's memory bound
 }
 
-const syncFrameQueue = 256
+// Frame dispatch. A link hands its frames to OnPeerFrame one at a time, from
+// one goroutine, and anything OnPeerFrame waits for, the whole link waits for:
+// its read loop stops, and with it the streamed reads' replies every mount on
+// this machine is blocked on. A single store's index worker waiting out a long
+// scan used to be enough to turn every other store's reads into EIO.
+//
+// So every class of frame has its own worker per store, behind a queue that
+// never blocks the link. A queue bounds its memory instead; what overflows is
+// dropped by class:
+//
+//   - index, digest, pull: idempotent, and the digest exchange recovers
+//     anything missing. The queue remembers the peer, and once it has drained
+//     sends that peer a fresh digest of the store (frameQueue.resync).
+//   - want, wantErr: the asker re-asks on its next exchange or after
+//     wantRefresh.
+//   - read: the reader's stall detection retries.
+//   - rename, verbs: tiny frames behind a generous bound; a streamed peer
+//     resends its queue, and a verbs caller times out.
+//
+// Blob chunks are the exception: they keep backpressure, because dropping one
+// abandons a transfer. Their workers only ever wait on the disk (finishing a
+// transfer is handed off, see handleBlobEnd), so when they make the link wait
+// it is because bytes are arriving faster than this machine can store them.
+//
+// indexQueueBytes is a var only so tests can make the queue overflow.
+var indexQueueBytes = 32 << 20
+
+const (
+	wantQueueBytes = 4 << 20
+	readQueueBytes = 4 << 20
+	opsQueueBytes  = 16 << 20
+	blobFrameQueue = 64
+)
+
+// frameQueue is one worker's backlog: FIFO, bounded by bytes, and never
+// blocking the producer.
+type frameQueue struct {
+	mu       sync.Mutex
+	items    []peerFrame
+	bytes    int
+	maxBytes int
+	// notify wakes the worker; capacity one, so a wake is never lost.
+	notify chan struct{}
+	// resync names peers whose frames were dropped for want of room.
+	resync map[string]bool
+}
+
+func newFrameQueue(maxBytes int) *frameQueue {
+	return &frameQueue{maxBytes: maxBytes, notify: make(chan struct{}, 1)}
+}
+
+// push queues a frame, reporting false (and remembering the peer) when the
+// queue is full. An empty queue takes any one frame, however large.
+func (q *frameQueue) push(pf peerFrame) bool {
+	q.mu.Lock()
+	if len(q.items) > 0 && q.bytes+pf.size > q.maxBytes {
+		if q.resync == nil {
+			q.resync = map[string]bool{}
+		}
+		q.resync[pf.peer] = true
+		q.mu.Unlock()
+		return false
+	}
+	q.items = append(q.items, pf)
+	q.bytes += pf.size
+	q.mu.Unlock()
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// pop waits for the next frame; false once closed is closed.
+func (q *frameQueue) pop(closed <-chan struct{}) (peerFrame, bool) {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			pf := q.items[0]
+			q.items[0] = peerFrame{}
+			q.items = q.items[1:]
+			if len(q.items) == 0 {
+				q.items = nil
+			}
+			q.bytes -= pf.size
+			q.mu.Unlock()
+			return pf, true
+		}
+		q.mu.Unlock()
+		select {
+		case <-closed:
+			return peerFrame{}, false
+		case <-q.notify:
+		}
+	}
+}
+
+// takeResync returns the peers that lost frames, once the backlog that made
+// the queue overflow has drained.
+func (q *frameQueue) takeResync() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) > 0 || len(q.resync) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(q.resync))
+	for p := range q.resync {
+		peers = append(peers, p)
+	}
+	q.resync = nil
+	return peers
+}
+
+// queued is the number of frames waiting.
+func (q *frameQueue) queued() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
 
 func (e *Engine) startFrameWorkers() {
 	e.frameStartOnce.Do(func() {
-		e.indexFrames = make(map[string]chan peerFrame, len(e.stores))
-		e.wantFrames = make(map[string]chan peerFrame, len(e.stores))
-		e.readFrames = make(map[string]chan peerFrame, len(e.stores))
+		e.indexFrames = make(map[string]*frameQueue, len(e.stores))
+		e.wantFrames = make(map[string]*frameQueue, len(e.stores))
+		e.opsFrames = make(map[string]*frameQueue, len(e.stores))
+		e.readFrames = make(map[string]*frameQueue, len(e.stores))
 		for i := range e.blobFrames {
-			e.blobFrames[i] = make(chan peerFrame, syncFrameQueue)
+			e.blobFrames[i] = make(chan peerFrame, blobFrameQueue)
 		}
-		e.frameWG.Add(blobShards + 3*len(e.stores))
+		e.frameWG.Add(1 + blobShards + 4*len(e.stores))
+		go func() {
+			defer e.frameWG.Done()
+			e.evaluateLoop()
+		}()
+		serve := func(q *frameQueue, handle func(pf peerFrame)) {
+			defer e.frameWG.Done()
+			for {
+				pf, ok := q.pop(e.closed)
+				if !ok {
+					return
+				}
+				handle(pf)
+			}
+		}
 		// One worker per store for each class: a slow store delays only
 		// itself, and serving a multi-gigabyte blob cannot hold another
 		// store's index frames hostage.
 		for _, fs := range e.stores {
-			index := make(chan peerFrame, syncFrameQueue)
+			index := newFrameQueue(indexQueueBytes)
 			e.indexFrames[fs.name] = index
-			go func(ch chan peerFrame) {
-				defer e.frameWG.Done()
-				for {
-					select {
-					case <-e.closed:
-						return
-					case pf := <-ch:
-						// Digests share the index worker: a pull reply
-						// must be judged after the index frames before it.
-						switch pf.fr.Type {
-						case "digest":
-							e.handleDigest(pf.peer, &pf.fr)
-						case "pull":
-							e.handlePull(pf.peer, &pf.fr)
-						default:
-							e.handleIndex(pf.peer, &pf.fr)
-						}
-					}
+			go serve(index, func(pf peerFrame) {
+				// Digests share the index worker: a pull reply must be
+				// judged after the index frames before it.
+				switch pf.fr.Type {
+				case "digest":
+					e.handleDigest(pf.peer, &pf.fr)
+				case "pull":
+					e.handlePull(pf.peer, &pf.fr)
+				default:
+					e.handleIndex(pf.peer, &pf.fr)
 				}
-			}(index)
-			want := make(chan peerFrame, syncFrameQueue)
-			e.wantFrames[fs.name] = want
-			go func(ch chan peerFrame) {
-				defer e.frameWG.Done()
-				for {
-					select {
-					case <-e.closed:
-						return
-					case pf := <-ch:
-						switch pf.fr.Type {
-						case "rename":
-							e.handleRename(pf.peer, &pf.fr)
-						case "verbs":
-							e.handleVerbs(pf.peer, &pf.fr)
-						default:
-							e.handleWant(pf.peer, &pf.fr)
-						}
-					}
+				for _, peer := range index.takeResync() {
+					e.resyncStore(peer, fs)
 				}
-			}(want)
+			})
 
-			reads := make(chan peerFrame, syncFrameQueue)
-			e.readFrames[fs.name] = reads
-			go func(ch chan peerFrame) {
-				defer e.frameWG.Done()
-				slots := make(chan struct{}, readWorkers)
-				for {
-					select {
-					case <-e.closed:
-						return
-					case pf := <-ch:
-						select {
-						case slots <- struct{}{}:
-						case <-e.closed:
-							return
-						}
-						e.readWG.Add(1)
-						go func() {
-							defer e.readWG.Done()
-							defer func() { <-slots }()
-							e.handleRead(pf.peer, &pf.fr)
-						}()
-					}
+			// Wants only queue a transfer, so they never wait on the scan
+			// lock; renames and verbs do, and have a worker of their own.
+			want := newFrameQueue(wantQueueBytes)
+			e.wantFrames[fs.name] = want
+			go serve(want, func(pf peerFrame) {
+				if pf.fr.Type == "wantErr" {
+					e.handleWantErr(pf.peer, &pf.fr)
+					return
 				}
-			}(reads)
+				e.handleWant(pf.peer, &pf.fr)
+			})
+			ops := newFrameQueue(opsQueueBytes)
+			e.opsFrames[fs.name] = ops
+			go serve(ops, func(pf peerFrame) {
+				switch pf.fr.Type {
+				case "rename":
+					e.handleRename(pf.peer, &pf.fr)
+				case "verbs":
+					e.handleVerbs(pf.peer, &pf.fr)
+				}
+			})
+
+			reads := newFrameQueue(readQueueBytes)
+			e.readFrames[fs.name] = reads
+			slots := make(chan struct{}, readWorkers)
+			go serve(reads, func(pf peerFrame) {
+				select {
+				case slots <- struct{}{}:
+				case <-e.closed:
+					return
+				}
+				e.readWG.Add(1)
+				go func() {
+					defer e.readWG.Done()
+					defer func() { <-slots }()
+					e.handleRead(pf.peer, &pf.fr)
+				}()
+			})
 		}
 		for _, ch := range e.blobFrames {
 			go func(ch chan peerFrame) {
@@ -371,7 +508,37 @@ func (e *Engine) startFrameWorkers() {
 	})
 }
 
-func (e *Engine) enqueueFrame(ch chan peerFrame, pf peerFrame) {
+// resyncStore recovers index-class frames a full queue dropped: a fresh
+// digest makes the peer resend whatever differs and pull whatever it lacks.
+func (e *Engine) resyncStore(peer string, fs *StoreState) {
+	if !e.storeSharedWith(fs, peer) {
+		return
+	}
+	e.logger.Info("index frames were dropped while the store was busy; resyncing", "peer", peer, "store", fs.name)
+	if err := e.offerIndex(peer, fs); err != nil {
+		e.logger.Debug("resync index", "peer", peer, "store", fs.name, "error", err)
+		return
+	}
+	e.markFullSent(peer, fs, fs.db.Gen())
+}
+
+// enqueueFrame queues a frame for a worker without ever waiting for it.
+func (e *Engine) enqueueFrame(q *frameQueue, pf peerFrame) {
+	if q.push(pf) {
+		return
+	}
+	switch pf.fr.Type {
+	case "index", "digest", "pull":
+		e.logger.Debug("store busy: index frame dropped, resync queued", "peer", pf.peer, "store", pf.fr.Store, "type", pf.fr.Type)
+	case "rename", "verbs":
+		e.logger.Warn("store busy: frame dropped", "peer", pf.peer, "store", pf.fr.Store, "type", pf.fr.Type)
+	default:
+		e.logger.Info("store busy: frame dropped", "peer", pf.peer, "store", pf.fr.Store, "type", pf.fr.Type)
+	}
+}
+
+// enqueueBlob queues a blob chunk, waiting for room: see the dispatch notes.
+func (e *Engine) enqueueBlob(ch chan peerFrame, pf peerFrame) {
 	select {
 	case ch <- pf:
 	case <-e.closed:
@@ -416,6 +583,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		sends:       map[string]transport.Sender{},
 		wants:       map[string]map[string]*pending{},
 		finishSem:   make(chan struct{}, finishSlots),
+		finishQueue: make(chan struct{}, finishBacklog),
+		evalCh:      make(chan struct{}, 1),
 		blobLocks:   map[string]*blobLock{},
 		sendq:       map[string]*peerSends{},
 		incoming:    map[string]*incomingBlob{},
@@ -847,11 +1016,21 @@ var _ transport.UrgentHandler = (*Engine)(nil)
 
 // OnPeerConnected opens a sync session: the peer gets this machine's full
 // index for every store the two share, and remote stores may now go live.
+//
+// A connect is also a reconnect, and nothing that was in flight on the old
+// link survives it: its transfers are cancelled (they would carry on over the
+// new link with the chunks lost in the old one missing, and the receiver
+// would drop everything after the gap), the half-received files from that
+// peer are discarded, and every want this side had pointed at the peer may be
+// asked again at once rather than after wantRefresh.
 func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
+	e.cancelPeerSends(peer)
 	e.mu.Lock()
 	e.sends[peer] = send
+	stale := e.forgetPeerLocked(peer)
 	e.mu.Unlock()
 	e.peerLinkChanged(peer) // reads sent over a replaced link will not be answered
+	closeIncoming(stale)
 
 	digest := peerHasDigest(send)
 	for _, fs := range e.stores {
@@ -870,60 +1049,104 @@ func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 		}
 		e.markFullSent(peer, fs, gen)
 	}
-	e.evaluatePeers()
+	e.requestEvaluate()
 }
 
-// OnPeerDisconnected drops the session and re-evaluates remote stores. In-
-// flight blobs are NOT dropped: during cross-dial churn a replacement link
-// registers almost immediately and a half-received file may still complete
-// over it. Stale scratch files are wiped at startup instead.
-func (e *Engine) OnPeerDisconnected(peer string) {
+// OnPeerDisconnected drops the session and re-evaluates remote stores. Only
+// the link that is going away is forgotten: a replacement that is already
+// installed stays. Transfers to the peer stop, and wants pointed at it may go
+// to the next peer that offers the version.
+func (e *Engine) OnPeerDisconnected(peer string, send transport.Sender) {
 	e.mu.Lock()
+	cur, ok := e.sends[peer]
+	if !ok || !sameSender(cur, send) {
+		e.mu.Unlock()
+		return
+	}
 	delete(e.sends, peer)
+	stale := e.forgetPeerLocked(peer)
 	e.mu.Unlock()
 	e.peerLinkChanged(peer)
-	e.evaluatePeers()
+	closeIncoming(stale)
+	e.cancelPeerSends(peer)
+	e.requestEvaluate()
 }
 
-// OnPeerFrame parses one wire frame and queues it by work class. The queues
-// keep blob chunks ordered while allowing blob receive/apply to proceed while
-// an index or a want handler is doing filesystem work.
+// sameSender compares two senders without panicking on a sender type that is
+// not comparable (a test fake holding a slice, say).
+func sameSender(a, b transport.Sender) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
+}
+
+// forgetPeerLocked undoes what a link to the peer had in flight on the
+// receiving side: wants it was asked for become due again, and its
+// half-received transfers are taken out (returned for closing outside the
+// lock). Callers hold e.mu.
+func (e *Engine) forgetPeerLocked(peer string) []*incomingBlob {
+	for _, set := range e.wants {
+		for _, p := range set {
+			if p.peer == peer {
+				p.asked = time.Time{}
+			}
+		}
+	}
+	var stale []*incomingBlob
+	prefix := peer + "\x00"
+	for key, inc := range e.incoming {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.incoming, key)
+			stale = append(stale, inc)
+		}
+	}
+	return stale
+}
+
+// closeIncoming discards abandoned transfers. A chunk worker may still be
+// writing one; its next write fails and it gives the transfer up too.
+func closeIncoming(incs []*incomingBlob) {
+	for _, inc := range incs {
+		_ = inc.f.Close()
+		_ = os.Remove(inc.f.Name())
+	}
+}
+
+// OnPeerFrame parses one wire frame and queues it by work class. It never
+// waits for a store (see the dispatch notes at frameQueue); only blob chunks
+// wait, for the disk.
 func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	e.startFrameWorkers()
 	var fr frame
 	if err := json.Unmarshal(line, &fr); err != nil {
 		return
 	}
-	pf := peerFrame{peer: peer, fr: fr}
+	pf := peerFrame{peer: peer, fr: fr, size: len(line)}
+	queue := func(qs map[string]*frameQueue) {
+		if q, ok := qs[fr.Store]; ok {
+			e.enqueueFrame(q, pf)
+		} // else a store this machine does not carry
+	}
 	switch fr.Type {
 	case "index", "digest", "pull":
-		ch, ok := e.indexFrames[fr.Store]
-		if !ok {
-			return // a store this machine does not carry
-		}
-		e.enqueueFrame(ch, pf)
+		queue(e.indexFrames)
 	case "read":
-		ch, ok := e.readFrames[fr.Store]
-		if !ok {
-			return
-		}
-		e.enqueueFrame(ch, pf)
-	case "want", "rename", "verbs":
-		ch, ok := e.wantFrames[fr.Store]
-		if !ok {
-			return // a store this machine does not carry
-		}
-		e.enqueueFrame(ch, pf)
+		queue(e.readFrames)
+	case "want", "wantErr":
+		queue(e.wantFrames)
+	case "rename", "verbs":
+		queue(e.opsFrames)
 	case "readData", "readErr", "verbsResult":
 		// Cheap and latency-sensitive: a reply goes straight to the read
 		// that is blocked on it, never behind a queue of store work.
 		e.deliverRead(&fr)
 	case "readCancel":
 		e.noteReadCancel(peer, fr.ID)
-	case "wantErr":
-		e.handleWantErr(peer, &fr)
 	case "blob", "blobEnd":
-		e.enqueueFrame(e.blobFrames[blobShard(peer, &fr)], pf)
+		e.enqueueBlob(e.blobFrames[blobShard(peer, &fr)], pf)
 	}
 }
 
@@ -953,6 +1176,28 @@ var urgentPrefixes = [][]byte{
 	[]byte(`{"type":"readData"`),
 	[]byte(`{"type":"readErr"`),
 	[]byte(`{"type":"verbsResult"`),
+}
+
+// requestEvaluate asks evaluateLoop for an evaluatePeers pass. Link callbacks
+// used to run it themselves: it takes every streamed store's scan lock and
+// may scan and flush a queue, all inside the transport's shutdown wait and
+// ahead of the link's frames.
+func (e *Engine) requestEvaluate() {
+	select {
+	case e.evalCh <- struct{}{}:
+	default: // one is already due, and will see this change too
+	}
+}
+
+func (e *Engine) evaluateLoop() {
+	for {
+		select {
+		case <-e.closed:
+			return
+		case <-e.evalCh:
+			e.evaluatePeers()
+		}
+	}
 }
 
 // evaluatePeers records whether each remote store has a holder reachable. It
