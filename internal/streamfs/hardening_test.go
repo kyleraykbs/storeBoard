@@ -3,6 +3,8 @@ package streamfs
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -96,3 +98,69 @@ func TestRenameHonoursFlags(t *testing.T) {
 		t.Fatalf("the mutator was asked to rename %d times", m.n)
 	}
 }
+
+// A file being written reports what has been written to anyone who stats it
+// by path - not the size the journal recorded when it was created. Nautilus
+// stats a copied file as soon as close(2) returns, and the kernel only sends
+// RELEASE (where the write is committed) after that: it showed every copy
+// into a streamed folder as 0 bytes until a refresh.
+func TestClosedButUncommittedFileShowsItsSize(t *testing.T) {
+	if !fuseAvailable() {
+		t.Skip("no /dev/fuse or fusermount on this host")
+	}
+	dir := t.TempDir()
+	tree := NewTree(nil)
+	pending := &slowCommit{fakePending: &fakePending{}, release: make(chan struct{}), closing: make(chan struct{})}
+	fsys, err := Mount(dir, tree, Options{
+		Fetcher: &memoryFetcher{bodies: map[string]string{}},
+		Mutator: &slowMutator{pending: pending},
+		UID:     uint32(os.Getuid()), GID: uint32(os.Getgid()),
+	})
+	if err != nil {
+		t.Skipf("mount: %v", err)
+	}
+	defer fsys.Unmount()
+	defer close(pending.release)
+
+	path := filepath.Join(dir, "clip.mp4")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree.Set(Entry{Path: "clip.mp4"}) // the journal says empty, as Create recorded it
+	if _, err := f.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-pending.closing // RELEASE has arrived; the commit is in progress
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 4096 {
+		t.Fatalf("stat after close, before the commit = %d bytes, want 4096", info.Size())
+	}
+}
+
+// slowCommit holds Close (the commit) until released.
+type slowCommit struct {
+	*fakePending
+	release chan struct{}
+	closing chan struct{}
+	once    sync.Once
+}
+
+func (s *slowCommit) Close() error {
+	s.once.Do(func() { close(s.closing) })
+	<-s.release
+	return s.fakePending.Close()
+}
+
+type slowMutator struct {
+	recordingMutator
+	pending *slowCommit
+}
+
+func (m *slowMutator) Create(string, uint32) (PendingFile, error) { return m.pending, nil }

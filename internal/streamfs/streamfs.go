@@ -408,6 +408,9 @@ func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 		case *fileNode:
 			if !entry.Dir {
 				n.update(child, entry)
+				if size, writing := n.writtenSize(); writing {
+					entry.Size = size
+				}
 				n.fill(&out.Attr, entry)
 				return in, 0
 			}
@@ -482,6 +485,11 @@ func (d *dirNode) Create(ctx context.Context, name string, flags, mode uint32, o
 	node.fill(&out.Attr, entry)
 	inode := d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFREG, Ino: stableIno(child, false)})
 	h := &fileHandle{fsys: d.fsys, entry: entry, write: pending}
+	// The inode number is stable per path, so NewInode may hand back the
+	// node already registered for it: the writer belongs on that one.
+	if live, ok := inode.Operations().(*fileNode); ok {
+		live.addWriter(h)
+	}
 	return inode, h, 0, 0
 }
 
@@ -575,6 +583,44 @@ type fileNode struct {
 	mu    sync.Mutex
 	path  string
 	entry Entry
+	// writers are the handles open for writing on this file. Until the
+	// last of them is released the journal still has the size from before
+	// the write - zero, for a new file - and a stat by path (a file
+	// manager reacting to close(2), which the kernel answers before it
+	// sends RELEASE, where the write is committed) must see what was
+	// written instead.
+	writers map[*fileHandle]struct{}
+}
+
+func (f *fileNode) addWriter(h *fileHandle) {
+	f.mu.Lock()
+	if f.writers == nil {
+		f.writers = map[*fileHandle]struct{}{}
+	}
+	f.writers[h] = struct{}{}
+	f.mu.Unlock()
+	h.node = f
+}
+
+func (f *fileNode) dropWriter(h *fileHandle) {
+	f.mu.Lock()
+	delete(f.writers, h)
+	f.mu.Unlock()
+}
+
+// writtenSize is the largest size an open writer has given the file.
+func (f *fileNode) writtenSize() (int64, bool) {
+	f.mu.Lock()
+	hs := make([]*fileHandle, 0, len(f.writers))
+	for h := range f.writers {
+		hs = append(hs, h)
+	}
+	f.mu.Unlock()
+	var size int64
+	for _, h := range hs {
+		size = max(size, h.getSize())
+	}
+	return size, len(hs) > 0
 }
 
 func (f *fileNode) snapshot() (string, Entry) {
@@ -638,6 +684,8 @@ func (f *fileNode) Setattr(ctx context.Context, h fs.FileHandle, in *fuse.SetAtt
 	if !ok {
 		if fh, isOurs := h.(*fileHandle); isOurs && fh.write != nil {
 			e.Size = fh.getSize()
+		} else if size, writing := f.writtenSize(); writing {
+			e.Size = size
 		}
 		f.fill(&out.Attr, e)
 		return 0
@@ -670,6 +718,8 @@ func (f *fileNode) Getattr(ctx context.Context, h fs.FileHandle, out *fuse.AttrO
 	_, e := f.current()
 	if fh, isOurs := h.(*fileHandle); isOurs && fh.write != nil {
 		e.Size = fh.getSize()
+	} else if size, writing := f.writtenSize(); writing {
+		e.Size = size
 	}
 	f.fill(&out.Attr, e)
 	return 0
@@ -696,6 +746,7 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		if flags&uint32(os.O_TRUNC) != 0 {
 			h.size = 0
 		}
+		f.addWriter(h)
 		return h, 0, 0
 	}
 	h.ra = newReadahead(f.fsys.fetcher, entry, f.fsys.cache)
@@ -704,6 +755,7 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 
 type fileHandle struct {
 	fsys  *FS
+	node  *fileNode // set for a writer (see fileNode.writers)
 	entry Entry
 	write PendingFile
 	ra    *readahead
@@ -817,7 +869,13 @@ func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 	if h.write == nil {
 		return 0
 	}
-	if err := h.write.Close(); err != nil {
+	// The commit happens before the writer is forgotten, so a stat never
+	// falls back to the old size between the two.
+	err := h.write.Close()
+	if h.node != nil {
+		h.node.dropWriter(h)
+	}
+	if err != nil {
 		return errnoFor(err)
 	}
 	return 0
