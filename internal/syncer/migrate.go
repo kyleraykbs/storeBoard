@@ -398,8 +398,10 @@ func (e *Engine) probe(ctx context.Context, fs *StoreState, it *migItem) (has, k
 		if err == nil {
 			return true, true
 		}
+		// Only a replica's "missing" is an answer: a streamed peer has no
+		// bytes of its own to have.
 		var refusal *holderRefusal
-		if errors.As(err, &refusal) {
+		if errors.As(err, &refusal) && e.peerIsReplica(peer, fs) {
 			known = true
 		}
 	}
