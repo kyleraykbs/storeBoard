@@ -14,3 +14,4 @@ android/local.properties
 
 # Pid files from local daemon runs.
 *.pid
+.claude/worktrees/

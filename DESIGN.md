@@ -89,19 +89,19 @@ one, it changes here first, deliberately, with a decision log entry.
     bytes are never indexed by its parent, there is no second journal, and
     the content store never takes a copy of the outer tree. A declared link
     path is config, not content, and is recreated from config on every start.
-14. **A remote store never dangles and never disappears.** Its canonical dir
-    is the same directory whether or not a holder answers; `attached` /
-    `detached` reports liveness only. Offline writes land in the store and
-    sync when a holder returns. There is no dummy dir and no root flip.
+14. **A streamed store never dangles and never disappears.** Its canonical
+    dir is the same mount whether or not a holder answers; `attached` /
+    `detached` reports liveness only. Offline writes queue and upload when a
+    holder returns. There is no dummy dir and no root flip.
 15. **Merges never replace.** Content that would land on a name already taken
     is parked under the deterministic conflict name (`<name>.conflict-<blob8>`)
     and indexed like any other file. The same rule applies to `send` and to
     takeover.
 16. **Deletions are asserted, never inferred.** A `local` store owns its
-    canonical dir, so absence there is a deletion. A `remote` store may
-    tombstone only while a holder is reachable and never an entry whose blob
-    this machine does not hold. Absence in a mirror means "not here yet" —
-    reading it as a deletion emptied 448 files into a holder's trash once.
+    canonical dir, so absence there is a deletion — of a file this machine
+    held, never of an entry it only heard about. (The retired `remote` mirror
+    mode read absence as deletion and once emptied 448 files into a holder's
+    trash; it is gone, and a config naming it gets `stream`.)
 17. **Mounts are usable by the human, not by the daemon.** Every directory
     the daemon creates — the root, the canonical dirs, the links' parents —
     is owned and permissioned to the store's resolved permissions: declared
@@ -116,7 +116,7 @@ one, it changes here first, deliberately, with a decision log entry.
   (`<dataDir>/history/<id>.ndjson`, append-only, checkpointed like the
   journals) referencing the blob that holds those bytes; retention thins it
   on the schedule above and `storeboard backup list|restore` reads it. A
-  store that is `remote` on this machine keeps no history.
+  store that is streamed on this machine keeps no history.
 - Content is content-addressed (`<dataDir>/store/<sha256>`), written temp →
   fsync → rename. It is a *cache*, not a second copy: once a file is
   materialised at its canonical path, the blob is released, and a peer is
@@ -141,9 +141,9 @@ one, it changes here first, deliberately, with a decision log entry.
   followed. The declared links are the daemon's to create and repair, from
   config.
 
-### Streamed stores (decided 2026-10-29, implementation in progress)
+### Streamed stores (decided 2026-10-29)
 
-A store declared `remote` is not a mirror: the canonical path is a FUSE mount
+A store declared `stream` is not a mirror: the canonical path is a FUSE mount
 owned by storeboard, and file bytes are not retained on this machine.
 
 - The journal stays local and is the whole truth about the tree. Directories
@@ -231,7 +231,7 @@ owned by storeboard, and file bytes are not retained on this machine.
   and reported; the scanner skips every symlink. Covered by
   `TestChildStoreIsALinkAndNeverIndexedByParent`,
   `TestExternalSymlinkLinkedAndBusy`, and the smoke.
-- 14: remote stores keep their canonical dir; attach/detach is a state flag.
+- 14: streamed stores keep their canonical dir; attach/detach is a state flag.
   Covered by `TestRemoteStoreStaysVisibleWithoutAHolder`.
 - 15: content-based conflict resolution and the send/takeover park rules.
 - 16: tombstone authority per store, both directions tested
@@ -251,7 +251,7 @@ owned by storeboard, and file bytes are not retained on this machine.
   newest version of each hour for a day, of each day for a week, of each week
   for a month, of each month for a year, of each year beyond — and nothing
   older than the keep window (`backup.keep`, default one year). The current
-  version of a file is never dropped. A store that is `remote` on a machine
+  version of a file is never dropped. A store that is streamed on a machine
   keeps no history there. The retention policy and the content collector are
   the only things the daemon ever deletes on its own: the collector frees a
   blob only when no journal, no kept version, no orphan journal and no recent

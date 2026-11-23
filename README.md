@@ -52,9 +52,10 @@ Strict JSON; unknown keys are an error. The model, in full in
   - `path` — its relpath inside the parent, and the name it appears under
     there. Absent means the id, at the parent's top level. Meaningless at the
     top level, where the canonical dir is the id.
-  - `sync` — `local` (a replica that works offline) or `remote` (streamed
-    from a holder). Absent inherits the parent's; the top-level default is
-    `local`.
+  - `sync` — `local` (a replica that works offline) or `stream` (only the
+    file list is kept here; contents are read from a holder through a mount
+    as they are opened). Absent inherits the parent's; the top-level default
+    is `local`. The old `remote` value is read as `stream`.
   - `symlinks` — absolute paths that become symlinks to the canonical dir.
     Never inherited: a path belongs to one machine. `/home/kyle/Documents`
     becomes a symlink to `~/Storeboard/documents`.
@@ -103,10 +104,17 @@ tree, the root and the symlinks are declared fresh.
   left alone and reported `busy` (`sync[].symlinks[]`).
 - **`local`** stores hold a replica and sync it with every other participant:
   creates, edits and deletes (deletes land in `<dataDir>/trash/<id>/`).
-- **`remote`** stores are streams from a holder. The canonical dir is always
-  present and visible; `attached`/`detached` only reports whether a holder is
-  reachable. Offline writes land in the store and sync when a holder returns
-  — there is no dummy dir and no root flip.
+- **`stream`** stores are read from a holder through a FUSE mount at the
+  canonical dir; `attached`/`detached` reports whether a holder is reachable.
+  Writes through the mount queue durably and upload when a holder returns.
+- **Changing a store's `sync` is safe.** Local → stream moves the files on
+  disk aside (into `<dataDir>/migrating/<id>/`, renames only) before
+  mounting, keeps them readable through the mount, and settles each with a
+  holder in the background: retired to the trash once a holder has the same
+  bytes, uploaded when none does, kept as a conflict copy if the path changed
+  concurrently. Stream → local writes queued uploads into the folder as
+  files, then fetches the rest like any replica — unless it would not fit on
+  the disk, in which case the store stays streamed and `doctor` says why.
 - Concurrent edits to one file resolve deterministically on every replica
   (newer wins; the loser is kept as `<name>.conflict-<blob8>`). Deletes and
   conflicts are visible in `status --json` (`.sync[]`).
@@ -139,7 +147,7 @@ there; the history is what makes them findable. Retention thins the record the
 standard way: the newest version of each hour for a day, each day for a week,
 each week for a month, each month for a year, each year beyond — and nothing
 older than the window. A file's current version is never dropped. A store this
-machine marks `remote` keeps no history: its versions belong to the machine
+machine streams keeps no history: its versions belong to the machine
 that holds the content, which is what lets one declaration be right everywhere.
 
 A startup collector frees content that nothing references — never a journal's,
@@ -208,7 +216,7 @@ or a deploy; `--json` is the `/v1/doctor` document.
       stores.pictures = {
         group = "family";
         symlinks = [ "/home/kyle/Pictures" ];
-        stores.bulk = { group = "media"; sync = "remote"; };
+        stores.bulk = { group = "media"; sync = "stream"; };
       };
     };
 
