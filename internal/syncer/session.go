@@ -242,12 +242,17 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			e.handleDirEntry(peer, fs, rem, loc)
 			continue
 		}
-		if loc != nil && !loc.Deleted && loc.Dir {
+		if loc != nil && !loc.Deleted && loc.Dir && !rem.Deleted {
 			// A directory and a file cannot share a path. The directory wins,
 			// deterministically, because entries may live beneath it that
 			// cannot exist if the path becomes a file; a file, by contrast,
 			// can be parked whole beside it. Both machines compute the same
 			// winner, so the clash converges instead of ping-ponging.
+			//
+			// A tombstone is not a file claiming the path: it is a deletion,
+			// ordered by its vector like any other (below). Answering one
+			// with the directory made a peer whose tombstone dominates it
+			// answer with the tombstone, forever.
 			_ = e.sendIndexTo(peer, fs, []*Entry{loc})
 			continue
 		}
@@ -418,7 +423,13 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 		// A file holds this path here. The directory wins, and the file is
 		// parked under its conflict name so its bytes survive; that is the
 		// same rule every peer applies, so the clash cannot ping-pong.
-		if copyEnt := e.saveLocalConflict(fs, loc); copyEnt != nil {
+		copyEnt, err := e.saveLocalConflict(fs, loc)
+		if err != nil {
+			// The file is still at the path: replacing it would lose it.
+			e.logger.Warn("file not parked; the directory waits", "store", fs.name, "path", rem.Path, "error", err)
+			return
+		}
+		if copyEnt != nil {
 			e.broadcastIndex(fs, []*Entry{copyEnt})
 		}
 		if err := e.applyEntry(fs, rem); err != nil {
@@ -486,8 +497,24 @@ func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 			"store", fs.name, "path", loc.Path, "peer", peer)
 		return
 	}
+	if !e.canFetch(fs, rem) {
+		// No room for the winner: leave both as they are. Parking ours now
+		// would leave the path empty until the bytes could arrive.
+		return
+	}
 	send := e.registerWant(peer, fs, rem, &pending{entry: winnerEntry})
-	if copyEnt := e.saveLocalConflict(fs, loc); copyEnt != nil {
+	copyEnt, perr := e.saveLocalConflict(fs, loc)
+	if perr != nil {
+		// Ours is still at the path and could not be moved aside: the winner
+		// must not land on it. Drop the want; the next exchange tries again.
+		e.mu.Lock()
+		e.takeWantLocked(fs.name, rem.Path, wantSlot(rem.Blob, false))
+		e.mu.Unlock()
+		e.logger.Warn("conflict: local version could not be parked; not applying the remote one yet",
+			"store", fs.name, "path", loc.Path, "peer", peer, "error", perr)
+		return
+	}
+	if copyEnt != nil {
 		e.broadcastIndex(fs, []*Entry{copyEnt})
 	}
 	if send {
@@ -498,8 +525,10 @@ func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 }
 
 // saveLocalConflict moves the current local content aside under a
-// deterministic conflict name and indexes it as a new file.
-func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
+// deterministic conflict name and indexes it as a new file. It reports
+// (nil, nil) when there was no file to move, and an error when there was one
+// and it could not be moved: the caller must then not write over the path.
+func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) (*Entry, error) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	return e.saveLocalConflictLocked(fs, loc)
@@ -507,48 +536,16 @@ func (e *Engine) saveLocalConflict(fs *StoreState, loc *Entry) *Entry {
 
 // saveLocalConflictLocked is saveLocalConflict for callers already holding
 // scanMu (applyEntry, which parks a file that a directory is about to replace).
-func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) *Entry {
+// Parking is a rename inside the tree (parkLocked): it used to copy the file
+// into the content store first, so a full data disk made it fail - and the
+// remote winner was then written over the local edit regardless.
+func (e *Engine) saveLocalConflictLocked(fs *StoreState, loc *Entry) (*Entry, error) {
 	if fs.stream {
 		// There is no local file to park: the bytes live on the holder, and
 		// the loser stays reachable through its entry.
-		return nil
+		return nil, nil
 	}
-	src := filepath.Join(fs.root, loc.Path)
-	sum, err := store.SumFile(src)
-	if err != nil {
-		return nil
-	}
-	if !e.store.Has(sum) {
-		stored, aerr := e.adoptFile(src, sum)
-		if aerr != nil {
-			return nil
-		}
-		sum = stored
-	}
-	name := conflictPath(loc.Path, sum)
-	dst := filepath.Join(fs.root, name)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return nil
-	}
-	info, serr := os.Stat(src)
-	if serr != nil {
-		return nil
-	}
-	if err := os.Rename(src, dst); err != nil {
-		return nil
-	}
-	e.chownPath(fs, dst)
-	ent := &Entry{
-		Path:  name,
-		Blob:  sum,
-		Size:  info.Size(),
-		MTime: info.ModTime().UnixNano(),
-		Mode:  uint32(info.Mode().Perm()),
-		VV:    map[string]uint64{e.me: fs.db.Next()},
-		Local: true,
-	}
-	_ = fs.db.Put(ent)
-	return ent
+	return e.parkLocked(fs, loc.Path)
 }
 
 // openEntryBlob opens the bytes of an entry, preferring the content store and
@@ -701,6 +698,11 @@ func (e *Engine) pathMissing(fs *StoreState, path string) bool {
 func (e *Engine) request(peer string, fs *StoreState, rem *Entry, p *pending) {
 	if fs.stream {
 		_ = e.applyEntry(fs, rem)
+		return
+	}
+	if !e.canFetch(fs, rem) {
+		// No room, or a recent attempt ran out of it: asking again would
+		// download the file only to fail writing it, on every exchange.
 		return
 	}
 	if e.registerWant(peer, fs, rem, p) {
@@ -872,12 +874,30 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 			e.mu.Unlock()
 			return
 		}
+		// Accepting a transfer that cannot fit only fills the disk and then
+		// fails; refuse it up front and back the want off (see canFetch).
+		size := int64(-1)
+		for _, conflict := range []bool{false, true} {
+			if p := e.wantLocked(fr.Store, fr.Path, wantSlot(fr.Blob, conflict)); p != nil && p.entry != nil && p.entry.Size > size {
+				size = p.entry.Size
+			}
+		}
+		if ok, why := e.roomFor(fs, size); !ok {
+			e.dropWantsLocked(fr.Store, fr.Path, fr.Blob)
+			e.mu.Unlock()
+			e.backOffFetch(fs, fr.Path, why)
+			return
+		}
 		f, err := e.store.Temp()
 		if err != nil {
 			e.mu.Unlock()
+			if isNoSpace(err) {
+				e.dropWants(fr.Store, fr.Path, fr.Blob)
+				e.backOffFetch(fs, fr.Path, err.Error())
+			}
 			return
 		}
-		inc = &incomingBlob{store: fr.Store, path: fr.Path, blob: fr.Blob, f: f, hash: sha256.New()}
+		inc = &incomingBlob{store: fr.Store, path: fr.Path, blob: fr.Blob, f: f, hash: sha256.New(), last: time.Now()}
 		e.incoming[key] = inc
 	}
 	e.mu.Unlock()
@@ -905,6 +925,12 @@ func (e *Engine) handleBlob(peer string, fr *frame) {
 	if len(fr.Data) > 0 {
 		if _, err := inc.f.Write(fr.Data); err != nil {
 			e.dropIncoming(key, inc)
+			if isNoSpace(err) {
+				// Out of space mid-file: asking again at the next exchange
+				// would download it all again and fail the same way.
+				e.dropWants(fr.Store, fr.Path, fr.Blob)
+				e.backOffFetch(fs, fr.Path, err.Error())
+			}
 			return
 		}
 		inc.hash.Write(fr.Data)
@@ -999,9 +1025,15 @@ func (e *Engine) finishBlob(peer string, fs *StoreState, fr *frame, blob string,
 	}
 	if err := inc.f.Sync(); err != nil {
 		inc.f.Close()
+		if isNoSpace(err) {
+			e.backOffFetch(fs, fr.Path, err.Error())
+		}
 		return
 	}
 	if err := inc.f.Close(); err != nil {
+		if isNoSpace(err) {
+			e.backOffFetch(fs, fr.Path, err.Error())
+		}
 		return
 	}
 	if err := e.store.Adopt(inc.f.Name(), sum); err != nil {
@@ -1031,6 +1063,9 @@ func (e *Engine) applyWants(fs *StoreState, wants []*pending) {
 		}
 		if err := e.applyEntry(fs, want.entry); err != nil {
 			e.logger.Warn("apply entry", "store", fs.name, "path", want.entry.Path, "error", err)
+			if isNoSpace(err) {
+				e.backOffFetch(fs, want.entry.Path, err.Error())
+			}
 			continue
 		}
 		// Fan the applied version out at once. The peer that sent the bytes
@@ -1070,8 +1105,27 @@ func (e *Engine) dropIncoming(key string, inc *incomingBlob) {
 	inc.f.Close()
 	os.Remove(inc.f.Name())
 	e.mu.Lock()
-	delete(e.incoming, key)
+	if e.incoming[key] == inc {
+		delete(e.incoming, key)
+	}
 	e.mu.Unlock()
+}
+
+// dropWants forgets both wants (update and conflict copy) for one version.
+func (e *Engine) dropWants(store, path, blob string) {
+	e.mu.Lock()
+	e.dropWantsLocked(store, path, blob)
+	e.mu.Unlock()
+}
+
+func (e *Engine) dropWantsLocked(store, path, blob string) {
+	if blob == "" {
+		delete(e.wants, wantKey(store, path))
+		return
+	}
+	for _, conflict := range []bool{false, true} {
+		e.takeWantLocked(store, path, wantSlot(blob, conflict))
+	}
 }
 
 // writeConflictCopy parks a fetched loser version under its conflict name.
@@ -1096,7 +1150,7 @@ func (e *Engine) writeConflictCopy(fs *StoreState, want *pending, ent *Entry) {
 	fs.scanMu.Lock()
 	defer fs.scanMu.Unlock()
 	dst := filepath.Join(fs.root, want.conflictName)
-	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime); err != nil {
+	if err := e.writeBlobTo(fs, dst, ent.Blob, ent.Mode, ent.MTime, nil); err != nil {
 		e.logger.Warn("write conflict copy", "store", fs.name, "path", want.conflictName, "error", err)
 		return
 	}
@@ -1166,40 +1220,37 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 		return err
 	}
 
-	if info, err := os.Stat(dst); err == nil {
+	// What is at the path now decides what may happen to it. A file the
+	// journal does not describe is an edit the mesh has not seen: it is parked
+	// first, and if it cannot even be read the apply is refused - hashing
+	// failed used to fall through and overwrite it. A file the journal does
+	// describe is the version being superseded; its bytes go into the content
+	// store rather than away (fileState.keep), because a peer that resolved a
+	// conflict against it may still be about to ask for them.
+	before := statFile(dst)
+	if before.exists {
 		loc := fs.db.Get(ent.Path)
-		if loc == nil || loc.Size != info.Size() || loc.MTime != info.ModTime().UnixNano() {
+		if loc == nil || loc.Deleted || loc.Size != before.size || loc.MTime != before.mtime {
 			sum, herr := store.SumFile(dst)
-			if herr == nil && sum != ent.Blob {
-				if !e.store.Has(sum) {
-					if stored, aerr := e.adoptFile(dst, sum); aerr == nil {
-						sum = stored
-					}
+			if herr != nil {
+				return fmt.Errorf("%s: cannot read the file this update would replace: %w", ent.Path, herr)
+			}
+			if sum != ent.Blob {
+				parkEnt, perr := e.parkLocked(fs, ent.Path)
+				if perr != nil {
+					// Overwriting now would destroy the only copy of an
+					// edit the mesh has not seen.
+					return fmt.Errorf("%s: cannot park an unsynced local change: %w", ent.Path, perr)
 				}
-				name := conflictPath(ent.Path, sum)
-				parked := filepath.Join(fs.root, name)
-				rerr := os.Rename(dst, parked)
-				if rerr != nil {
-					// Parking failed: overwriting now would destroy the only
-					// copy of an edit the mesh has not seen.
-					return fmt.Errorf("%s: cannot park an unsynced local change: %w", ent.Path, rerr)
-				}
-				{
-					e.chownPath(fs, parked)
-					parkEnt := &Entry{
-						Path:  name,
-						Blob:  sum,
-						Size:  info.Size(),
-						MTime: info.ModTime().UnixNano(),
-						Mode:  uint32(info.Mode().Perm()),
-						VV:    map[string]uint64{e.me: fs.db.Next()},
-					}
-					_ = fs.db.Put(parkEnt)
+				if parkEnt != nil {
 					e.broadcastIndex(fs, []*Entry{parkEnt})
 					e.logger.Warn("unsynced local change preserved as conflict copy",
-						"store", fs.name, "path", ent.Path, "copy", name)
+						"store", fs.name, "path", ent.Path, "copy", parkEnt.Path)
 				}
+				before = statFile(dst)
 			}
+		} else if loc.Local && !loc.Dir && loc.Blob != "" && loc.Blob != ent.Blob && store.ValidSum(loc.Blob) {
+			before.keep = loc.Blob
 		}
 	}
 
@@ -1208,7 +1259,7 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 	// same end state, without reading and writing a 20 GiB file under the
 	// scan lock.
 	consume := !e.wantsBlob(fs, ent.Path, ent.Blob)
-	if err := e.placeBlob(fs, dst, ent.Blob, ent.Mode, ent.MTime, consume); err != nil {
+	if err := e.placeBlob(fs, dst, ent.Blob, ent.Mode, ent.MTime, consume, &before); err != nil {
 		return err
 	}
 	// The file is now here: from now on its absence means a deletion rather
@@ -1236,13 +1287,14 @@ func (e *Engine) unblockParents(fs *StoreState, path string) error {
 			continue
 		}
 		var parked string
-		if copyEnt := e.saveLocalConflictLocked(fs, loc); copyEnt != nil {
+		copyEnt, perr := e.saveLocalConflictLocked(fs, loc)
+		if copyEnt != nil {
 			parked = copyEnt.Path
 			e.broadcastIndex(fs, []*Entry{copyEnt})
 		} else if info, err := os.Lstat(filepath.Join(fs.root, dir)); err == nil && info.Mode().IsRegular() {
-			// The file is still there and could not be parked (a full
-			// disk, say). Removing it would delete the user's bytes.
-			return fmt.Errorf("%s: cannot park the file a directory must replace", dir)
+			// The file is still there and could not be parked. Removing it
+			// would delete the user's bytes.
+			return fmt.Errorf("%s: cannot park the file a directory must replace: %v", dir, perr)
 		}
 		if tomb := e.tombstoneEntry(fs, loc); tomb != nil {
 			e.broadcastIndex(fs, []*Entry{tomb})
@@ -1259,15 +1311,26 @@ func (e *Engine) unblockParents(fs *StoreState, path string) error {
 // then mode, mtime and owner are set (DESIGN invariant 3). The mtime is the
 // entry's, not the write's: a materialised file must look exactly like the
 // one it mirrors, both for the tools that sort by it (photos, videos) and
-// for the scanner, whose fast path is "size and mtime unchanged".
-func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime int64) error {
-	return e.placeBlob(fs, dst, sum, mode, mtime, false)
+// for the scanner, whose fast path is "size and mtime unchanged". before, when
+// set, is what the caller saw at dst (see placeBlob).
+func (e *Engine) writeBlobTo(fs *StoreState, dst, sum string, mode uint32, mtime int64, before *fileState) error {
+	return e.placeBlob(fs, dst, sum, mode, mtime, false, before)
 }
+
+// beforePlace, when set (tests), runs after the new bytes are staged and
+// before the path is re-checked and replaced.
+var beforePlace func(dst string)
 
 // placeBlob is writeBlobTo, optionally taking the content-store copy instead
 // of copying it (consume). Taking it is a rename when the store and the tree
 // share a filesystem; otherwise it falls back to the copy.
-func (e *Engine) placeBlob(fs *StoreState, dst, sum string, mode uint32, mtime int64, consume bool) error {
+//
+// before is what the caller saw at dst when it decided to replace it. Copying
+// a large blob takes a while, and a file written at dst meanwhile is an edit
+// nobody has seen: dst is checked again just before the final rename, and a
+// change is parked as a conflict copy instead of being renamed over. When
+// before.keep is set the displaced version goes into the content store.
+func (e *Engine) placeBlob(fs *StoreState, dst, sum string, mode uint32, mtime int64, consume bool, before *fileState) error {
 	if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 		return err
 	}
@@ -1279,6 +1342,18 @@ func (e *Engine) placeBlob(fs *StoreState, dst, sum string, mode uint32, mtime i
 	}
 	tmp := f.Name()
 	moved := false
+	// abort undoes the scratch file; a content-store copy taken into it goes
+	// back rather than being lost.
+	abort := func(err error) error {
+		if moved {
+			if rerr := os.Rename(tmp, e.store.BlobPath(sum)); rerr != nil {
+				os.Remove(tmp)
+			}
+		} else {
+			os.Remove(tmp)
+		}
+		return err
+	}
 	if consume {
 		f.Close()
 		if err := os.Rename(e.store.BlobPath(sum), tmp); err == nil {
@@ -1328,17 +1403,41 @@ func (e *Engine) placeBlob(fs *StoreState, dst, sum string, mode uint32, mtime i
 			e.logger.Warn("set mtime", "store", fs.name, "path", dst, "error", err)
 		}
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		if moved {
-			// The content store's copy is in tmp: put it back rather than
-			// lose the only one.
-			if rerr := os.Rename(tmp, e.store.BlobPath(sum)); rerr != nil {
-				os.Remove(tmp)
-			}
-		} else {
-			os.Remove(tmp)
+	if beforePlace != nil {
+		beforePlace(dst)
+	}
+	displaced := false
+	if before != nil {
+		rel, rerr := filepath.Rel(fs.root, dst)
+		if rerr != nil {
+			return abort(rerr)
 		}
-		return err
+		switch {
+		case !before.same(dst):
+			// Written while the bytes were being copied: an edit. Park it.
+			parkEnt, perr := e.parkLocked(fs, rel)
+			if perr != nil {
+				return abort(fmt.Errorf("%s changed while the update was copied, and could not be parked: %w", rel, perr))
+			}
+			if parkEnt != nil {
+				e.broadcastIndex(fs, []*Entry{parkEnt})
+				e.logger.Warn("edit made during an update preserved as conflict copy",
+					"store", fs.name, "path", rel, "copy", parkEnt.Path)
+			}
+		case before.exists && before.keep != "" && !e.store.Has(before.keep):
+			if kerr := e.keepDisplacedLocked(fs, dst, *before); kerr != nil {
+				return abort(fmt.Errorf("%s: keeping the replaced version: %w", rel, kerr))
+			}
+			displaced = !statFile(dst).exists
+		}
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		if displaced {
+			// The path is empty and the old version sits in the store: put
+			// it back, or the next scan reads this failure as a deletion.
+			_ = os.Rename(e.store.BlobPath(before.keep), dst)
+		}
+		return abort(err)
 	}
 	return nil
 }
@@ -1386,7 +1485,13 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	// no size and no mtime describes nothing to compare against.
 	recorded := loc.Size != 0 || loc.MTime != 0
 	if recorded && (info.Size() != loc.Size || info.ModTime().UnixNano() != loc.MTime) {
-		if copyEnt := e.saveLocalConflictLocked(fs, loc); copyEnt != nil {
+		copyEnt, perr := e.saveLocalConflictLocked(fs, loc)
+		if perr != nil {
+			// An edit the mesh has not seen, and it cannot be moved aside:
+			// keep it, and keep the entry alive.
+			return fmt.Errorf("%s: cannot park an unsynced local change: %w", loc.Path, perr)
+		}
+		if copyEnt != nil {
 			e.broadcastIndex(fs, []*Entry{copyEnt})
 			// The rename moved the file; the path is free and the caller's
 			// tombstone stands. Nothing left to trash.
@@ -1398,8 +1503,16 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
+	dst = freeTrashName(dst)
 	if err := moveOrCopy(src, dst, info.Mode()); err != nil {
 		return err
+	}
+	if info.Mode().IsRegular() {
+		// Stamp the deletion time: setting the times moves the file's ctime
+		// to now, which is what pruneTrash expires by (trashTime). The mtime
+		// is kept as it was, so a file taken back out of the trash still
+		// sorts by when it was written.
+		_ = os.Chtimes(dst, time.Now(), info.ModTime())
 	}
 	// Record the version that is leaving: a restore undoes exactly this.
 	gone := loc.clone()

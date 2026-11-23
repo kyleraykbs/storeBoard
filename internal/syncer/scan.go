@@ -28,6 +28,17 @@ func underAny(p string, dirs []string) bool {
 // still be cleared by hand; a library cannot vanish because a disk did.
 const massDeleteFloor = 20
 
+// massDeleteLimit is how many held files one scan may tombstone before the
+// pass needs proof the root is the directory they were in: 30% of what this
+// machine held, and never fewer than 50.
+func massDeleteLimit(held int) int {
+	return max(50, held*30/100)
+}
+
+// scanHashed, when set (tests), runs between hashing a file and re-reading
+// its size and mtime.
+var scanHashed func(path string)
+
 // tmpPrefix marks scratch files the daemon writes inside store roots; the
 // scanner never indexes them.
 const tmpPrefix = ".storeboard-tmp"
@@ -99,6 +110,15 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 		}
 		name := d.Name()
 		if strings.HasPrefix(name, tmpPrefix) {
+			// Never indexed. One left behind by a crash is junk nobody will
+			// ever rename into place; anything the daemon is writing right
+			// now was touched far more recently than scratchMaxAge (and it
+			// writes them under the scan lock this pass holds anyway).
+			if info, ierr := d.Info(); ierr == nil && info.Mode().IsRegular() && staleScratch(info, time.Now()) {
+				if os.Remove(path) == nil {
+					e.logger.Info("removed a stale scratch file", "store", fs.name, "path", path)
+				}
+			}
 			return nil
 		}
 		rel, rerr := filepath.Rel(root, path)
@@ -121,20 +141,38 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 			return nil // untouched
 		}
 
+		// A file being written in place must not be recorded mid-write: its
+		// hash would describe bytes that never existed as a whole, and the
+		// half-written version would be sent to every peer (and adopted into
+		// a backup store's content store again on every pass while it grew).
+		// Size and mtime are taken before and after the hash; if they moved,
+		// the file is left for the next pass.
+		pre, perr := os.Lstat(path)
+		if perr != nil {
+			return nil
+		}
 		sum, herr := store.SumFile(path)
 		if herr != nil {
 			return nil
 		}
+		if scanHashed != nil {
+			scanHashed(path)
+		}
 		// The dirent snapshot WalkDir handed us can be stale — a file
 		// truncated and rewritten while the walk passed it reads as size 0
 		// with a fresh mtime — so size, mtime and mode are re-read AFTER
-		// the hash, and the hash itself comes from a copy of those same
-		// bytes. An entry whose size contradicts its blob poisons every
+		// the hash. An entry whose size contradicts its blob poisons every
 		// later apply (each one parks the "unsynced local change" as a
 		// false conflict).
-		if fi, serr := os.Stat(path); serr == nil {
-			info = fi
+		post, serr := os.Lstat(path)
+		if serr != nil {
+			return nil
 		}
+		if post.Size() != pre.Size() || !post.ModTime().Equal(pre.ModTime()) {
+			e.logger.Debug("file changing while scanned; left for the next pass", "store", fs.name, "path", rel)
+			return nil
+		}
+		info = post
 
 		if cur != nil && !cur.Deleted && cur.Blob == sum {
 			// Content identical, only the timestamp moved (or a stale size
@@ -156,7 +194,11 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 			if aerr != nil {
 				return aerr
 			}
-			sum = stored
+			if stored != sum {
+				// Changed while it was copied in: the next pass records it
+				// once it holds still. (The stray blob is the collector's.)
+				return nil
+			}
 		}
 		// A local change builds on what this replica already knew: the new
 		// version vector inherits the old one and bumps our own counter.
@@ -188,25 +230,50 @@ func (e *Engine) scan(fs *StoreState, tombstones bool) ([]*Entry, error) {
 	}
 	fs.setLocal(len(seen))
 
-	// An empty root against a journal full of files this machine held is
-	// what a pool that failed to mount looks like once the daemon has
-	// recreated the directory: refuse to read it as a mass deletion.
+	// A root that lost most of the files this machine held is what a pool
+	// that failed to mount looks like once the directory has been recreated
+	// - empty, or holding the first few files a peer sent into it. Only a
+	// root that is demonstrably the same directory (same device and inode as
+	// when its files were last all there) may lose that many in one pass;
+	// anything else is treated as unavailable, not as a mass deletion.
 	all := fs.db.All()
-	if tombstones && len(seen) == 0 {
-		held := 0
+	if tombstones {
+		held, vanishing := 0, 0
 		for _, ent := range all {
-			if ent.Local && !ent.Deleted && !ent.Dir {
-				held++
+			if !ent.Local || ent.Deleted || ent.Dir {
+				continue
+			}
+			held++
+			if !seen[ent.Path] && !underAny(ent.Path, unreadable) {
+				vanishing++
 			}
 		}
-		if held >= massDeleteFloor {
+		id, idOK := statRootID(root)
+		rec, recOK := e.recordedRootID(fs)
+		suspicious := (len(seen) == 0 && held >= massDeleteFloor) || vanishing > massDeleteLimit(held)
+		switch {
+		case !suspicious:
+			fs.rootEmpty.Store(false)
+			if idOK {
+				e.recordRootID(fs, id)
+			}
+		case idOK && recOK && id == rec:
+			// The same directory: these are real deletions.
+			fs.rootEmpty.Store(false)
+			e.logger.Warn("many files deleted from the store in one pass", "store", fs.name, "files", vanishing, "of", held)
+		default:
 			fs.rootEmpty.Store(true)
-			e.logger.Error("store root is empty but this machine held its files; not treating that as a deletion (is the filesystem mounted?)",
-				"store", fs.name, "root", root, "files", held)
+			e.logger.Error("store root lost most of the files this machine held and is not the directory they were in; not treating that as a deletion (is the filesystem mounted?)",
+				"store", fs.name, "root", root, "missing", vanishing, "held", held, "rootID", id.String(), "recorded", rec.String(), "recordedKnown", recOK,
+				"ifIntended", "remove "+e.rootIDPath(fs)+" and the next scans accept the deletion")
 			tombstones = false
+			if !recOK && idOK {
+				// Nothing to compare against (an upgrade, or the record was
+				// removed to accept the change): this pass refuses, and the
+				// identity recorded now is what the next pass is judged by.
+				e.recordRootID(fs, id)
+			}
 		}
-	} else {
-		fs.rootEmpty.Store(false)
 	}
 
 	for _, ent := range all {

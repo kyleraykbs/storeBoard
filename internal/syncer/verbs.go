@@ -39,19 +39,49 @@ func (e *Engine) verbRoundTrip(peer string, fs *StoreState, req verbsRequest) ([
 		e.mu.Unlock()
 	}()
 
+	e.mu.Lock()
+	link := e.sends[peer]
+	e.mu.Unlock()
 	if err := e.sendTo(peer, frame{Type: "verbs", ID: id, Store: fs.name, Action: req.Action, Data: payload}); err != nil {
 		return nil, err
 	}
-	select {
-	case <-e.closed:
-		return nil, fmt.Errorf("engine closed")
-	case r := <-ch:
-		if r.err != nil {
-			return nil, r.err
+	// The answer can take a while (a restore copies a whole file on the
+	// holder), but not forever: a holder that disconnected will never
+	// answer, and waiting on it hung the caller - and the CLI behind it - for
+	// good. A dead link is dropped by the transport's keepalives, which is
+	// what the connected check sees. Silence alone (readStalled) is not used:
+	// keepalives never reach the engine, and a verb's only traffic is its
+	// answer, so a long restore would look like a stall.
+	deadline := time.NewTimer(verbsTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(min(time.Second, max(readTimeout/4, time.Millisecond)))
+	defer tick.Stop()
+	for {
+		select {
+		case <-e.closed:
+			return nil, fmt.Errorf("engine closed")
+		case r := <-ch:
+			if r.err != nil {
+				return nil, r.err
+			}
+			return r.data, nil
+		case <-deadline.C:
+			return nil, fmt.Errorf("holder %s did not answer %q within %s", peer, req.Action, verbsTimeout)
+		case <-tick.C:
+			e.mu.Lock()
+			now := e.sends[peer]
+			e.mu.Unlock()
+			if now == nil || now != link {
+				// Gone, or reconnected: the request went down with the old
+				// link and its answer never comes.
+				return nil, fmt.Errorf("holder %s disconnected before answering %q", peer, req.Action)
+			}
 		}
-		return r.data, nil
 	}
 }
+
+// verbsTimeout bounds one forwarded verb end to end.
+var verbsTimeout = 10 * time.Minute
 
 // forwardVerbs asks the fastest reachable holder to answer a verb, failing
 // over to the next one. It never invents an answer when no holder responds.

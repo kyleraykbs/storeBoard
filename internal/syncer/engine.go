@@ -256,6 +256,10 @@ type Engine struct {
 	sendMu sync.Mutex
 	sendq  map[string]*peerSends
 	sendWG sync.WaitGroup
+
+	// safety is the replica data-safety bookkeeping (safety.go): fetches
+	// backed off for lack of space.
+	safety safetyState
 }
 
 func (e *Engine) registerPending(p *pendingFile) {

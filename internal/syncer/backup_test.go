@@ -184,7 +184,8 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	n := mkBackupNode(t, config.SyncLocal, "1h")
 	eng, fs := n.eng, n.store("docs")
 
-	// One version, aged past the window, with its content in the store.
+	// Two versions; the older one aged past the window, with its content in
+	// the store. (The current version is never dropped, however old.)
 	writeFile(t, filepath.Join(fs.root, "old.txt"), "ancient", time.Now().Add(-10*time.Hour))
 	if _, err := eng.scan(fs, true); err != nil {
 		t.Fatal(err)
@@ -193,10 +194,19 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Age the recorded version past the keep window.
+	writeFile(t, filepath.Join(fs.root, "old.txt"), "current", time.Now().Add(-9*time.Hour))
+	if _, err := eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	curBlob, err := store.SumFile(filepath.Join(fs.root, "old.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Age both recorded versions past the keep window.
 	fs.hist.mu.Lock()
 	vs := fs.hist.byPath["old.txt"]
-	vs[len(vs)-1].Time = time.Now().Add(-9 * time.Hour).UnixNano()
+	vs[0].Time = time.Now().Add(-9 * time.Hour).UnixNano()
+	vs[1].Time = time.Now().Add(-8 * time.Hour).UnixNano()
 	fs.hist.byPath["old.txt"] = vs
 	fs.hist.mu.Unlock()
 
@@ -216,11 +226,13 @@ func TestCollectFreesOnlyUnreferencedContent(t *testing.T) {
 	if !eng.store.Has(orphan) {
 		t.Fatal("collector freed a blob an orphan journal references")
 	}
-	// The live file is materialised, so its blob is a second copy: the
-	// collector is allowed to drop it. That is the whole point of not
-	// doubling a replica.
+	// The superseded version left the history, and nothing else holds it.
 	if eng.store.Has(oldBlob) {
-		t.Fatal("collector kept a blob the tree already holds")
+		t.Fatal("collector kept the blob of a version retention dropped")
+	}
+	// The current version stays in the history, so its bytes stay too.
+	if !eng.store.Has(curBlob) {
+		t.Fatal("collector freed the current version's blob")
 	}
 	// And a blob nobody references is gone.
 	stranded := strings.Repeat("ef", 32)
@@ -266,17 +278,18 @@ func TestTrashObeysTheDeadline(t *testing.T) {
 	n := mkBackupNode(t, config.SyncLocal, "1h")
 	eng, fs := n.eng, n.store("docs")
 
+	// The deadline counts from the deletion, not from the file's own mtime:
+	// a file written long ago and deleted just now has the whole window.
 	trash := filepath.Join(eng.dataDir, "trash", fs.name)
-	writeFile(t, filepath.Join(trash, "old.txt"), "long gone", time.Now().Add(-2*time.Hour))
-	writeFile(t, filepath.Join(trash, "recent.txt"), "just deleted", time.Now())
+	writeFile(t, filepath.Join(trash, "old.txt"), "written long ago", time.Now().Add(-2*time.Hour))
 
 	eng.pruneOnce(time.Now())
-
+	if !exists(filepath.Join(trash, "old.txt")) {
+		t.Fatal("a freshly trashed file was dropped by its old mtime")
+	}
+	eng.pruneOnce(time.Now().Add(2 * time.Hour))
 	if exists(filepath.Join(trash, "old.txt")) {
 		t.Fatal("a trashed file past the deadline survived")
-	}
-	if !exists(filepath.Join(trash, "recent.txt")) {
-		t.Fatal("a fresh trashed file was dropped")
 	}
 	eng.Close()
 }

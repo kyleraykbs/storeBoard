@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Entry is one file's journal record: where it is in a store, what bytes it
@@ -33,6 +35,11 @@ type Entry struct {
 	// arrived before its bytes. It is never trusted off the wire — a peer's
 	// entries are decoded with it cleared.
 	Local bool `json:"local,omitempty"`
+	// DeletedAt is when a tombstone was first recorded (unix nanoseconds),
+	// stamped by the journal itself and carried with the tombstone. It is
+	// what lets a tombstone ever be dropped (ExpireTombstones); it plays no
+	// part in ordering or in the digest.
+	DeletedAt int64 `json:"deletedAt,omitempty"`
 }
 
 func (e *Entry) clone() *Entry {
@@ -70,6 +77,14 @@ type FileDB struct {
 	observe func(*Entry)
 	// gen counts changes to the in-memory state.
 	gen uint64
+	// off is the log's length after the last whole record. A write that
+	// fails part-way (ENOSPC) is cut back to it, or the torn half would glue
+	// itself to the next record and both would be lost on replay. torn is set
+	// when even that failed: the next record then starts on a fresh line.
+	off  int64
+	torn bool
+	// corrupt counts unreadable lines found at open.
+	corrupt int
 }
 
 // Gen is a counter that moves whenever the journal's state changes.
@@ -93,9 +108,16 @@ func (d *FileDB) Observe(fn func(*Entry)) {
 
 // OpenFileDB replays the log at path (absent: a fresh journal) and rewrites
 // it compacted.
+//
+// Unreadable lines are counted and logged, and the original log is kept
+// beside the journal as <path>.corrupt before the checkpoint replaces it: a
+// torn final line after a crash is expected, anything else is evidence worth
+// keeping. A checkpoint that cannot be written (a full disk) is not fatal:
+// the journal opens uncompacted, appending to the log as it is.
 func OpenFileDB(path, me string) (*FileDB, error) {
 	d := &FileDB{me: me, logPath: path, entries: map[string]*Entry{}}
 
+	now := time.Now().UnixNano()
 	if f, err := os.Open(path); err == nil {
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
@@ -106,11 +128,15 @@ func OpenFileDB(path, me string) (*FileDB, error) {
 			}
 			var r record
 			if err := json.Unmarshal(line, &r); err != nil {
-				// A torn final line after a crash is expected; anything
-				// else would have been written whole (one append per entry).
+				d.corrupt++
 				continue
 			}
 			if r.Entry != nil {
+				if r.Entry.Deleted && r.Entry.DeletedAt == 0 {
+					// A tombstone from before deletion times were kept: its
+					// age is unknown, so it counts from now.
+					r.Entry.DeletedAt = now
+				}
 				d.entries[r.Entry.Path] = r.Entry
 			}
 		}
@@ -129,44 +155,142 @@ func OpenFileDB(path, me string) (*FileDB, error) {
 			d.counter = c
 		}
 	}
+	if d.corrupt > 0 {
+		keepCorrupt(path)
+		slog.Warn("journal had unreadable lines; they were skipped and the original kept",
+			"journal", path, "lines", d.corrupt, "copy", path+".corrupt")
+	}
 
-	// Checkpoint: the log becomes exactly the current state.
-	tmp := path + ".new"
+	if err := d.checkpointLocked(); err != nil {
+		// A journal that cannot be compacted can still be used: the log on
+		// disk is intact, and appending to it is what it is for. Refusing
+		// to start left a full data disk with no daemon to free it.
+		slog.Warn("journal checkpoint failed; continuing with the uncompacted log", "journal", path, "error", err)
+		f, oerr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if oerr != nil {
+			return nil, fmt.Errorf("journal: %w (checkpoint: %v)", oerr, err)
+		}
+		d.f = f
+		d.off, d.torn = logTail(f)
+	}
+	return d, nil
+}
+
+// keepCorrupt keeps a copy of a log that had unreadable lines, so the
+// checkpoint that drops them does not drop the evidence with them. A hard
+// link costs nothing; a filesystem without them gets a copy.
+func keepCorrupt(path string) {
+	dst := path + ".corrupt"
+	os.Remove(dst)
+	if os.Link(path, dst) == nil {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err == nil {
+		_ = os.WriteFile(dst, b, 0o600)
+	}
+}
+
+// logTail reports an append handle's length and whether the log ends part-way
+// through a line.
+func logTail(f *os.File) (int64, bool) {
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return 0, false
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], info.Size()-1); err != nil {
+		// Opened write-only: read it separately.
+		if r, oerr := os.Open(f.Name()); oerr == nil {
+			_, err = r.ReadAt(last[:], info.Size()-1)
+			r.Close()
+		}
+		if err != nil {
+			return info.Size(), true
+		}
+	}
+	return info.Size(), last[0] != '\n'
+}
+
+// checkpointLocked rewrites the log as exactly the current state and reopens
+// it for appending. On failure the old log and handle are left as they were
+// and the scratch file is removed.
+func (d *FileDB) checkpointLocked() error {
+	tmp := d.logPath + ".new"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("journal: %w", err)
+		return fmt.Errorf("journal: %w", err)
+	}
+	fail := func(err error) error {
+		f.Close()
+		os.Remove(tmp)
+		return err
 	}
 	w := bufio.NewWriter(f)
+	var size int64
 	for _, p := range d.pathsLocked() {
 		b, err := json.Marshal(record{Entry: d.entries[p]})
 		if err != nil {
-			f.Close()
-			return nil, err
+			return fail(err)
 		}
 		w.Write(b)
 		w.WriteByte('\n')
+		size += int64(len(b)) + 1
 	}
 	if err := w.Flush(); err != nil {
-		f.Close()
-		return nil, err
+		return fail(err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return nil, err
+		return fail(err)
 	}
 	if err := f.Close(); err != nil {
-		return nil, err
+		os.Remove(tmp)
+		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, err
+	if err := os.Rename(tmp, d.logPath); err != nil {
+		os.Remove(tmp)
+		return err
 	}
-
-	f, err = os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	nf, err := os.OpenFile(d.logPath, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("journal: %w", err)
+		return fmt.Errorf("journal: %w", err)
 	}
-	d.f = f
-	return d, nil
+	if d.f != nil {
+		d.f.Close()
+	}
+	d.f = nf
+	d.off, d.torn = size, false
+	return nil
+}
+
+// ExpireTombstones drops tombstones older than age whose path match accepts,
+// and compacts the log when it dropped any. It reports how many went.
+//
+// Only paths the caller can vouch for are dropped. A tombstone is what stops a
+// peer that never heard of a deletion from bringing the file back, and proving
+// every peer has heard would mean knowing every peer's version vector; for an
+// editor's scratch file the worst a late peer can do is bring back a temporary
+// file, while every one of those names otherwise stayed in the journal, the
+// index and the digest forever.
+func (d *FileDB) ExpireTombstones(now time.Time, age time.Duration, match func(string) bool) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return 0, nil
+	}
+	cutoff := now.Add(-age).UnixNano()
+	n := 0
+	for p, ent := range d.entries {
+		if ent.Deleted && ent.DeletedAt != 0 && ent.DeletedAt < cutoff && match(p) {
+			delete(d.entries, p)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	d.gen++
+	return n, d.checkpointLocked()
 }
 
 func (d *FileDB) pathsLocked() []string {
@@ -200,8 +324,22 @@ func (d *FileDB) putLocked(e *Entry) error {
 	// periodically, and each of those passes used to append a line per path:
 	// an idle mesh grew journals by megabytes a minute, and a store with a
 	// few thousand files collected gigabytes of identical lines.
-	if prev := d.entries[e.Path]; prev != nil && sameEntry(prev, e) {
+	prev := d.entries[e.Path]
+	if prev != nil && sameEntry(prev, e) {
 		return nil
+	}
+	e = e.clone()
+	if e.Deleted {
+		// The first time a path is known deleted is its deletion time; a
+		// re-record of the same tombstone (a merged vector) keeps it.
+		if prev != nil && prev.Deleted && prev.DeletedAt != 0 && (e.DeletedAt == 0 || prev.DeletedAt < e.DeletedAt) {
+			e.DeletedAt = prev.DeletedAt
+		}
+		if e.DeletedAt == 0 || e.DeletedAt > time.Now().UnixNano() {
+			e.DeletedAt = time.Now().UnixNano()
+		}
+	} else {
+		e.DeletedAt = 0
 	}
 	d.entries[e.Path] = e.clone()
 	d.gen++
@@ -227,10 +365,31 @@ func (d *FileDB) putLocked(e *Entry) error {
 		return err
 	}
 	b = append(b, '\n')
-	if _, err := d.f.Write(b); err != nil {
+	if d.torn {
+		b = append([]byte{'\n'}, b...)
+	}
+	n, err := d.f.Write(b)
+	if err != nil {
+		// Cut the torn half off, or it joins the next record into one
+		// unreadable line. The in-memory state stands; the next checkpoint
+		// writes it out whole.
+		d.cutTornLocked(n)
 		return err
 	}
+	d.off += int64(n)
+	d.torn = false
 	return nil
+}
+
+// cutTornLocked undoes the n bytes a failed append left behind.
+func (d *FileDB) cutTornLocked(n int) {
+	if n <= 0 {
+		return
+	}
+	if err := d.f.Truncate(d.off); err != nil {
+		d.torn = true
+		d.off += int64(n)
+	}
 }
 
 // sameEntry reports whether two entries record the same state: same content,
