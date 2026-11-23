@@ -8,11 +8,13 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
+	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 )
 
 // readTimeout is how long a ranged read waits on a holder that has gone
@@ -23,6 +25,123 @@ import (
 // used to fail reads on a busy slow link, half way through a photo. Tests
 // shorten it.
 var readTimeout = 20 * time.Second
+
+// streamExtra is the engine's streamed-store bookkeeping.
+type streamExtra struct {
+	// pending is every write handle open through a mount, by store and path
+	// (guarded by pendingMu). A path can be open more than once.
+	pendingMu sync.Mutex
+	pending   map[pendingKey]map[*pendingFile]struct{}
+
+	// readPeer is the peer each read in Engine.reads went to, so a link that
+	// drops can fail exactly its reads (guarded by Engine.mu).
+	readPeer map[int64]string
+	// linkGen counts each peer's link changes, so a flush knows a new link
+	// has seen none of what the old one was sent (guarded by Engine.mu).
+	linkGen map[string]uint64
+	// seedOnce starts read ids at the clock: ids restarting at 1 when the
+	// daemon restarted matched cancels the holder still kept from before,
+	// and the new reads were silently dropped.
+	seedOnce sync.Once
+
+	// cancelPruned is when old read cancels were last swept (guarded by
+	// Engine.cancelMu).
+	cancelPruned time.Time
+}
+
+// errLinkLost fails a read whose request went over a link that has since
+// dropped or been replaced: its answer is not coming, and the read is retried
+// at once rather than waiting out readCap.
+var errLinkLost = errors.New("link to the holder changed")
+
+// nextReadIDLocked is a read id unique across this process and its
+// predecessors. Callers hold e.mu.
+func (e *Engine) nextReadIDLocked() int64 {
+	e.sx.seedOnce.Do(func() { e.readSeq += time.Now().UnixNano() })
+	e.readSeq++
+	return e.readSeq
+}
+
+// peerLinkChanged is called when a peer's link comes up or goes down. Reads
+// sent over the previous link will not be answered over the new one: fail
+// them now with a retryable error.
+func (e *Engine) peerLinkChanged(peer string) {
+	e.mu.Lock()
+	if e.sx.linkGen == nil {
+		e.sx.linkGen = map[string]uint64{}
+	}
+	e.sx.linkGen[peer]++
+	var lost []chan readReply
+	for id, p := range e.sx.readPeer {
+		if p != peer {
+			continue
+		}
+		if ch := e.reads[id]; ch != nil {
+			lost = append(lost, ch)
+			delete(e.reads, id)
+		}
+		delete(e.sx.readPeer, id)
+	}
+	e.mu.Unlock()
+	for _, ch := range lost {
+		ch <- readReply{err: fmt.Errorf("%s: %w", peer, errLinkLost)}
+	}
+}
+
+// linkGenOf is the peer's current link generation.
+func (e *Engine) linkGenOf(peer string) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sx.linkGen[peer]
+}
+
+// Replica evidence. A streamed peer journals entries without their bytes, so
+// its entry covering a queued upload is no proof the upload landed anywhere,
+// and its "missing" answer to a read says nothing about the store. Peers that
+// advertise featureReplicaList name each store they hold bytes for; a peer
+// that does not (an older build) is taken to hold every store it shares, as
+// before.
+const (
+	featureReplicaList   = "replicas"
+	featureReplicaPrefix = "replica:"
+)
+
+// replicaFeatures names the stores this machine holds the bytes of.
+func (e *Engine) replicaFeatures() []string {
+	out := []string{featureReplicaList}
+	for _, fs := range e.stores {
+		if !fs.stream {
+			out = append(out, featureReplicaPrefix+fs.name)
+		}
+	}
+	return out
+}
+
+func senderIsReplica(send transport.Sender, store string) bool {
+	if send == nil || !peerHasFeature(send, featureReplicaList) {
+		return true
+	}
+	return peerHasFeature(send, featureReplicaPrefix+store)
+}
+
+// peerIsReplica reports whether a peer may hold the bytes of a store.
+func (e *Engine) peerIsReplica(peer string, fs *StoreState) bool {
+	e.mu.Lock()
+	send := e.sends[peer]
+	e.mu.Unlock()
+	return senderIsReplica(send, fs.name)
+}
+
+// replicaHoldersFor is holdersFor narrowed to peers that hold the bytes.
+func (e *Engine) replicaHoldersFor(fs *StoreState) []string {
+	var out []string
+	for _, peer := range e.holdersFor(fs) {
+		if e.peerIsReplica(peer, fs) {
+			out = append(out, peer)
+		}
+	}
+	return out
+}
 
 // maxReadChunk bounds one ranged read. A FUSE read is at most a few hundred
 // kilobytes, so this only stops a caller from asking one frame to carry a
@@ -126,8 +245,13 @@ func (f *streamFetcher) readRange(ctx context.Context, entry streamfs.Entry, off
 			if err == nil {
 				return data, nil
 			}
-			if errors.As(err, &refusal) {
+			// Only a peer that holds the store's bytes can answer for it: a
+			// streamed peer has none, and its "missing" while the real
+			// holder reconnects is no reason to stop waiting.
+			var r *holderRefusal
+			if errors.As(err, &r) && f.e.peerIsReplica(peer, f.fs) {
 				refused++
+				refusal = r
 			}
 			if firstErr == nil {
 				firstErr = err
@@ -185,17 +309,21 @@ func (e *Engine) readQueued(fs *StoreState, sum string, offset, length int64) ([
 	return buf[:n], true, nil
 }
 
-// holdersFor orders the peers that could serve this store: the declared
-// preference first, then measured throughput, then name. Connected peers in
-// the store's group are the candidate set - the wire is the only proof a peer
-// actually holds the bytes, and a failed read moves on to the next one.
+// holdersFor orders the peers that could serve this store: peers that hold
+// its bytes first, then the declared preference, then measured throughput,
+// then name. Connected peers in the store's group are the candidate set - the
+// wire is the only proof a peer actually holds the bytes, and a failed read
+// moves on to the next one. (A streamed peer stays a candidate: an upload it
+// has not handed over yet is only there.)
 func (e *Engine) holdersFor(fs *StoreState) []string {
 	members := e.cfg.Groups[fs.group].Peers
 	e.mu.Lock()
 	out := make([]string, 0, len(e.sends))
-	for peer := range e.sends {
+	replica := map[string]bool{}
+	for peer, send := range e.sends {
 		if peer != e.me && slices.Contains(members, peer) {
 			out = append(out, peer)
+			replica[peer] = senderIsReplica(send, fs.name)
 		}
 	}
 	rates := make(map[string]float64, len(out))
@@ -206,6 +334,9 @@ func (e *Engine) holdersFor(fs *StoreState) []string {
 
 	preferred := fs.preferred
 	sort.SliceStable(out, func(i, j int) bool {
+		if replica[out[i]] != replica[out[j]] {
+			return replica[out[i]]
+		}
 		if (out[i] == preferred) != (out[j] == preferred) {
 			return out[i] == preferred
 		}
@@ -241,13 +372,17 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 
 	ch := make(chan readReply, 1)
 	e.mu.Lock()
-	e.readSeq++
-	id := e.readSeq
+	id := e.nextReadIDLocked()
 	e.reads[id] = ch
+	if e.sx.readPeer == nil {
+		e.sx.readPeer = map[int64]string{}
+	}
+	e.sx.readPeer[id] = peer
 	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
 		delete(e.reads, id)
+		delete(e.sx.readPeer, id)
 		e.mu.Unlock()
 	}()
 
@@ -286,12 +421,17 @@ func (e *Engine) deliverRead(fr *frame) {
 	e.mu.Lock()
 	ch := e.reads[fr.ID]
 	delete(e.reads, fr.ID)
+	peer := e.sx.readPeer[fr.ID]
+	delete(e.sx.readPeer, fr.ID)
 	e.mu.Unlock()
 	if ch == nil {
 		return
 	}
 	if fr.Error != "" {
-		ch <- readReply{err: &holderRefusal{peer: fr.Path, code: fr.Code, msg: fr.Error}}
+		if peer == "" {
+			peer = "holder"
+		}
+		ch <- readReply{err: &holderRefusal{peer: peer, code: fr.Code, msg: fr.Error}}
 		return
 	}
 	ch <- readReply{data: fr.Data}

@@ -18,7 +18,7 @@ func (e *Engine) cleanupStaleAtomicFiles() {
 			if ent.Deleted || !strings.HasPrefix(filepath.Base(ent.Path), ".goutputstream-") || ent.MTime == 0 {
 				continue
 			}
-			if now.Sub(time.Unix(0, ent.MTime)) < staleAtomicAge || e.hasPending(ent.Path) {
+			if now.Sub(time.Unix(0, ent.MTime)) < staleAtomicAge || e.hasPending(fs, ent.Path) {
 				continue
 			}
 			e.cleanupStaleAtomic(fs, ent)
@@ -31,9 +31,15 @@ func (e *Engine) cleanupStaleAtomic(fs *StoreState, ent *Entry) {
 	tomb := &Entry{Path: ent.Path, Deleted: true, Dir: ent.Dir, VV: vv}
 	if fs.stream {
 		fs.queueMu.Lock()
-		for _, op := range append([]queueOp(nil), fs.queue...) {
-			if op.Path == ent.Path {
-				e.dropQueued(fs, op.ID)
+		// An upload of the file that no holder has taken yet holds its only
+		// bytes: tombstoning it would drop them (a delete supersedes a
+		// queued put). Leave it until a holder has it; the holder then keeps
+		// the removed copy in its trash.
+		for _, op := range fs.queue {
+			if op.Op == opPut && op.Path == ent.Path {
+				fs.queueMu.Unlock()
+				e.logger.Debug("stale atomic-save artifact still uploading; keeping it", "store", fs.name, "path", ent.Path)
+				return
 			}
 		}
 		if err := fs.db.Put(tomb); err != nil {

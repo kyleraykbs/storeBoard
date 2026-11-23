@@ -112,6 +112,7 @@ type StoreState struct {
 	// handlers call into the queue, and a handler waiting on scanMu while the
 	// engine waits on the mount is a deadlock.
 	queueMu sync.Mutex
+	qx      queueExtra // queue.go
 
 	db        *FileDB
 	hist      *History
@@ -225,8 +226,7 @@ type Engine struct {
 	readCancels    map[cancelKey]time.Time
 	verified       map[string]verifiedFile
 	fullSent       map[string]fullIndexMark
-	pendingMu      sync.Mutex
-	pending        map[string]*pendingFile
+	sx             streamExtra // stream.go: open write handles, read bookkeeping
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
@@ -256,54 +256,6 @@ type Engine struct {
 	sendMu sync.Mutex
 	sendq  map[string]*peerSends
 	sendWG sync.WaitGroup
-}
-
-func (e *Engine) registerPending(p *pendingFile) {
-	p.mu.Lock()
-	path := p.path
-	p.mu.Unlock()
-	e.pendingMu.Lock()
-	e.pending[path] = p
-	e.pendingMu.Unlock()
-}
-
-func (e *Engine) repathPending(from, to string) bool {
-	e.pendingMu.Lock()
-	p := e.pending[from]
-	e.pendingMu.Unlock()
-	if p == nil {
-		return false
-	}
-	p.mu.Lock()
-	p.path = to
-	p.mu.Unlock()
-	e.pendingMu.Lock()
-	if e.pending[from] == p {
-		delete(e.pending, from)
-		e.pending[to] = p
-		e.pendingMu.Unlock()
-		return true
-	}
-	e.pendingMu.Unlock()
-	return false
-}
-
-func (e *Engine) unregisterPending(p *pendingFile) {
-	p.mu.Lock()
-	path := p.path
-	p.mu.Unlock()
-	e.pendingMu.Lock()
-	if e.pending[path] == p {
-		delete(e.pending, path)
-	}
-	e.pendingMu.Unlock()
-}
-
-func (e *Engine) hasPending(path string) bool {
-	e.pendingMu.Lock()
-	_, ok := e.pending[path]
-	e.pendingMu.Unlock()
-	return ok
 }
 
 type peerFrame struct {
@@ -469,7 +421,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		readCancels: map[cancelKey]time.Time{},
 		verified:    map[string]verifiedFile{},
 		fullSent:    map[string]fullIndexMark{},
-		pending:     map[string]*pendingFile{},
 		closed:      make(chan struct{}),
 		scanEvery:   scanInterval,
 		linkEvery:   linkInterval,
@@ -896,6 +847,7 @@ func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 	e.mu.Lock()
 	e.sends[peer] = send
 	e.mu.Unlock()
+	e.peerLinkChanged(peer) // reads sent over a replaced link will not be answered
 
 	digest := peerHasDigest(send)
 	for _, fs := range e.stores {
@@ -925,6 +877,7 @@ func (e *Engine) OnPeerDisconnected(peer string) {
 	e.mu.Lock()
 	delete(e.sends, peer)
 	e.mu.Unlock()
+	e.peerLinkChanged(peer)
 	e.evaluatePeers()
 }
 

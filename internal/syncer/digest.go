@@ -27,7 +27,9 @@ import (
 const featureDigest = "digest"
 
 // Features is what this engine advertises to peers (transport.FeatureHandler).
-func (e *Engine) Features() []string { return []string{featureDigest, featureReadCancel} }
+func (e *Engine) Features() []string {
+	return append([]string{featureDigest, featureReadCancel}, e.replicaFeatures()...)
+}
 
 var _ transport.FeatureHandler = (*Engine)(nil)
 
