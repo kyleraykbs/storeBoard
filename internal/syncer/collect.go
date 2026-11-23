@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
@@ -306,7 +307,33 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	if err := e.ensureDir(fs, filepath.Dir(dst)); err != nil {
 		return api.RestoreResult{}, err
 	}
-	if err := e.writeBlobTo(fs, dst, pick.Blob, pick.Mode, pick.MTime); err != nil {
+	// The file at the path may hold an edit the scanner has not recorded yet:
+	// that is the user's newest work, and a restore must not be the thing
+	// that destroys it. Park it first, exactly as a remote update would.
+	before := statFile(dst)
+	if before.exists {
+		cur := fs.db.Get(path)
+		if cur == nil || cur.Deleted || cur.Size != before.size || cur.MTime != before.mtime {
+			sum, herr := store.SumFile(dst)
+			if herr != nil {
+				return api.RestoreResult{}, fmt.Errorf("cannot read the current %s to keep it: %w", path, herr)
+			}
+			if cur == nil || cur.Deleted || sum != cur.Blob {
+				parkEnt, perr := e.parkLocked(fs, path)
+				if perr != nil {
+					return api.RestoreResult{}, fmt.Errorf("cannot park the unrecorded change to %s: %w", path, perr)
+				}
+				if parkEnt != nil {
+					e.broadcastIndex(fs, []*Entry{parkEnt})
+					e.logger.Warn("unrecorded change preserved as conflict copy before restore", "store", name, "path", path, "copy", parkEnt.Path)
+				}
+				before = statFile(dst)
+			}
+		} else if cur.Blob != "" && store.ValidSum(cur.Blob) {
+			before.keep = cur.Blob
+		}
+	}
+	if err := e.writeBlobTo(fs, dst, pick.Blob, pick.Mode, pick.MTime, &before); err != nil {
 		return api.RestoreResult{}, err
 	}
 	// A restore is a local edit and builds on what this replica knew, exactly
@@ -481,12 +508,24 @@ func (e *Engine) pruneLoop(ctx context.Context, interval time.Duration) {
 	e.pruneOnce(time.Now())
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// Abandoned incoming transfers are reaped on a faster beat: each holds a
+	// descriptor and a partial file, and wantRefresh is when they count as
+	// abandoned.
+	reap := time.NewTicker(wantRefresh / 2)
+	defer reap.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
 			e.pruneOnce(now)
+			// Retention just let go of versions; their blobs, and versions
+			// displaced by updates, are only freed by the collector, which
+			// otherwise ran once per start - a long-running daemon piled
+			// dead blobs up until the disk was full.
+			e.Collect()
+		case now := <-reap.C:
+			e.reapIncoming(now)
 		}
 	}
 }
@@ -496,6 +535,18 @@ func (e *Engine) pruneLoop(ctx context.Context, interval time.Duration) {
 func (e *Engine) pruneOnce(now time.Time) {
 	for _, fs := range e.stores {
 		e.pruneTrash(fs, now)
+		expire := isScratchPath
+		if fs.stream {
+			// A queued op is retired by the holder's entry for its path;
+			// keep ours until the queue no longer mentions it.
+			queued := queuedPaths(fs)
+			expire = func(p string) bool { return isScratchPath(p) && !queued[p] }
+		}
+		if n, err := fs.db.ExpireTombstones(now, scratchTombstoneAge, expire); err != nil {
+			e.logger.Warn("expire tombstones", "store", fs.name, "error", err)
+		} else if n > 0 {
+			e.logger.Info("expired tombstones of scratch files", "store", fs.name, "count", n)
+		}
 		if fs.hist == nil {
 			continue
 		}
@@ -564,8 +615,9 @@ func (e *Engine) Versions(name, path string) (api.Versions, error) {
 
 // pruneTrash applies the same deadline to what deletes left behind: a file in
 // <dataDir>/trash/<store>/ is content the store once held, and it lives
-// exactly as long as the retention window allows — by its own age, which a
-// move out of the store preserves. History is the longer-lived safety net:
+// exactly as long as the retention window allows, counted from when it was
+// deleted (trashTime), not from its own mtime: an old photo deleted today
+// used to be purged at the next prune. History is the longer-lived safety net:
 // with backup on, the deletion record and its blob outlive the trash copy.
 func (e *Engine) pruneTrash(fs *StoreState, now time.Time) {
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
@@ -576,7 +628,7 @@ func (e *Engine) pruneTrash(fs *StoreState, now time.Time) {
 			return nil
 		}
 		fi, serr := d.Info()
-		if serr != nil || now.Sub(fi.ModTime()) <= keep {
+		if serr != nil || now.Sub(trashTime(fi)) <= keep {
 			return nil
 		}
 		if os.Remove(path) == nil {

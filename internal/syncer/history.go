@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,6 +41,10 @@ type History struct {
 	closed  bool
 	pruned  int
 	totalIn int
+	// off and torn are the append handle's last whole-record length and
+	// whether a failed write left a partial line (see FileDB).
+	off  int64
+	torn bool
 }
 
 // OpenHistory replays the log at path (absent: a fresh history) and rewrites
@@ -49,6 +54,7 @@ func OpenHistory(path string, keep time.Duration) (*History, error) {
 		keep = DefaultKeep
 	}
 	h := &History{path: path, byPath: map[string][]Version{}, keep: keep}
+	corrupt := 0
 
 	if f, err := os.Open(path); err == nil {
 		sc := bufio.NewScanner(f)
@@ -63,7 +69,8 @@ func OpenHistory(path string, keep time.Duration) (*History, error) {
 				Version Version `json:"version"`
 			}
 			if err := json.Unmarshal(line, &rec); err != nil {
-				continue // a torn final line after a crash, as with the journals
+				corrupt++ // a torn final line after a crash, as with the journals
+				continue
 			}
 			h.byPath[rec.Path] = append(h.byPath[rec.Path], rec.Version)
 		}
@@ -77,8 +84,15 @@ func OpenHistory(path string, keep time.Duration) (*History, error) {
 		return nil, fmt.Errorf("history: %w", err)
 	}
 
+	if corrupt > 0 {
+		keepCorrupt(path)
+		slog.Warn("history had unreadable lines; they were skipped and the original kept",
+			"history", path, "lines", corrupt, "copy", path+".corrupt")
+	}
 	if err := h.rewriteLocked(); err != nil {
-		return nil, err
+		// The log on disk is intact; appending to it uncompacted beats not
+		// starting at all on a full disk (see OpenFileDB).
+		slog.Warn("history checkpoint failed; continuing with the uncompacted log", "history", path, "error", err)
 	}
 	return h, nil
 }
@@ -174,11 +188,24 @@ func keepMask(versions []Version, now time.Time, keep time.Duration) []bool {
 	if len(versions) == 0 {
 		return out
 	}
-	out[len(versions)-1] = true // the current version, always
+	last := len(versions) - 1
 	seen := map[string]bool{}
 	// Walk newest to oldest: the first version of each bucket survives.
-	for i := len(versions) - 1; i >= 0; i-- {
+	for i := last; i >= 0; i-- {
 		v := versions[i]
+		if i == last && !v.Deleted {
+			// The current version of a file that still exists, always -
+			// however old: an unchanged photo is exactly the file a backup
+			// exists for. The loop below used to overwrite this with "past
+			// the deadline", so every file untouched for longer than the
+			// window lost its only version, and the collector its bytes.
+			// (A deletion record is not a current file: it expires.)
+			out[i] = true
+			if age := now.Sub(time.Unix(0, v.Time)); age >= 0 && age <= keep {
+				seen[bucketKey(age)] = true
+			}
+			continue
+		}
 		age := now.Sub(time.Unix(0, v.Time))
 		switch {
 		case age < 0:
@@ -283,6 +310,7 @@ func (h *History) appendLocked(path string, v Version) {
 			return
 		}
 		h.f = f
+		h.off, h.torn = logTail(f)
 	}
 	line, err := json.Marshal(struct {
 		Path    string  `json:"path"`
@@ -291,7 +319,26 @@ func (h *History) appendLocked(path string, v Version) {
 	if err != nil {
 		return
 	}
-	h.f.Write(append(line, '\n'))
+	line = append(line, '\n')
+	if h.torn {
+		line = append([]byte{'\n'}, line...)
+	}
+	n, err := h.f.Write(line)
+	if err != nil {
+		// A short write (ENOSPC) is cut back off, so the next record does
+		// not join it into one unreadable line; the version stays in memory
+		// and the next rewrite stores it.
+		if n > 0 {
+			if terr := h.f.Truncate(h.off); terr != nil {
+				h.torn = true
+				h.off += int64(n)
+			}
+		}
+		slog.Warn("history append failed", "history", h.path, "error", err)
+		return
+	}
+	h.off += int64(n)
+	h.torn = false
 }
 
 // Close flushes and releases the log.
