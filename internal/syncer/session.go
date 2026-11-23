@@ -236,7 +236,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 		rem = rem.clone()
 		rem.Local = false
 		loc := fs.db.Get(rem.Path)
-		e.ackQueue(fs, rem)
+		e.ackQueue(peer, fs, rem)
 
 		if rem.Dir {
 			e.handleDirEntry(peer, fs, rem, loc)

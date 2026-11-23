@@ -29,6 +29,8 @@ const (
 	opMkdir  = "mkdir"
 	opRmdir  = "rmdir"
 	opRename = "rename"
+	// opDrop is a queue-file record, not an op: the op of that id is done.
+	opDrop = "drop"
 )
 
 type renameMove struct {
@@ -52,6 +54,101 @@ type queueOp struct {
 	VV    map[string]uint64 `json:"vv,omitempty"`
 	Dir   bool              `json:"dir,omitempty"`
 	Moves []renameMove      `json:"moves,omitempty"`
+}
+
+// queueExtra is a streamed store's queue bookkeeping. Fields other than
+// pathMu are guarded by queueMu.
+type queueExtra struct {
+	// lines is how many records the queue file holds, live or not. The file
+	// is appended to; it is rewritten once dead records (acknowledged or
+	// superseded ops) outnumber live ones, so every op costs O(1) amortised
+	// instead of a rewrite and fsync of the whole queue.
+	lines int
+	// sent is the ops handed to sentTo over link generation sentGen since the
+	// last full flush: a flush after a write sends only what is new. The
+	// periodic retry and every new link send everything again.
+	sent    map[string]bool
+	sentTo  string
+	sentGen uint64
+	// ver counts changes to the queue; paths (built at pathsVer) is every
+	// path an acknowledgement could match, so the index exchange does not
+	// scan the queue for each of a store's entries.
+	ver      uint64
+	pathsVer uint64
+	paths    map[string]bool
+
+	// pathMu orders path changes made through the mount (rename, remove)
+	// against a write handle committing. A handle that committed under the
+	// path it was opened at after a rename moved that path found it
+	// tombstoned and threw the write away: GIO's atomic save renames the
+	// temporary file before the kernel delivers RELEASE. Lock order: scanMu,
+	// then pathMu, then queueMu.
+	pathMu sync.Mutex
+}
+
+// pendingKey names one open path in one store.
+type pendingKey struct{ store, path string }
+
+func (e *Engine) registerPending(p *pendingFile) {
+	p.mu.Lock()
+	k := pendingKey{p.fs.name, p.path}
+	p.mu.Unlock()
+	e.sx.pendingMu.Lock()
+	defer e.sx.pendingMu.Unlock()
+	if e.sx.pending == nil {
+		e.sx.pending = map[pendingKey]map[*pendingFile]struct{}{}
+	}
+	if e.sx.pending[k] == nil {
+		e.sx.pending[k] = map[*pendingFile]struct{}{}
+	}
+	e.sx.pending[k][p] = struct{}{}
+}
+
+func (e *Engine) unregisterPending(p *pendingFile) {
+	e.sx.pendingMu.Lock()
+	defer e.sx.pendingMu.Unlock()
+	p.mu.Lock()
+	k := pendingKey{p.fs.name, p.path}
+	p.mu.Unlock()
+	if set := e.sx.pending[k]; set != nil {
+		delete(set, p)
+		if len(set) == 0 {
+			delete(e.sx.pending, k)
+		}
+	}
+}
+
+// hasPending reports whether a write handle is open on a path.
+func (e *Engine) hasPending(fs *StoreState, path string) bool {
+	e.sx.pendingMu.Lock()
+	defer e.sx.pendingMu.Unlock()
+	return len(e.sx.pending[pendingKey{fs.name, path}]) > 0
+}
+
+// repathPending moves every handle open on from to to, and reports whether
+// one of them created the file (its bytes exist only in that handle).
+func (e *Engine) repathPending(fs *StoreState, from, to string) (open, created bool) {
+	e.sx.pendingMu.Lock()
+	defer e.sx.pendingMu.Unlock()
+	fk, tk := pendingKey{fs.name, from}, pendingKey{fs.name, to}
+	set := e.sx.pending[fk]
+	if len(set) == 0 {
+		return false, false
+	}
+	delete(e.sx.pending, fk)
+	if e.sx.pending[tk] == nil {
+		e.sx.pending[tk] = map[*pendingFile]struct{}{}
+	}
+	for p := range set {
+		p.mu.Lock()
+		p.path = to
+		if p.created {
+			created = true
+		}
+		p.mu.Unlock()
+		e.sx.pending[tk][p] = struct{}{}
+	}
+	return true, created
 }
 
 func queueIndexPath(dataDir, storeName string) string {
@@ -80,19 +177,35 @@ func (e *Engine) loadQueue(fs *StoreState) error {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	live := map[string]bool{}
+	lines, torn := 0, false
+	var read []queueOp
+	last := map[string]int{}
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
+		lines++
 		var op queueOp
-		if err := json.Unmarshal(line, &op); err != nil {
-			continue // a torn final line is expected after a crash
+		if err := json.Unmarshal(line, &op); err != nil || op.ID == "" {
+			// A torn final line is expected after a crash. It must not stay:
+			// the next append would land on the end of it and be torn too.
+			torn = true
+			continue
 		}
-		fs.queue = append(fs.queue, op)
+		last[op.ID] = len(read)
+		read = append(read, op)
 	}
 	if err := sc.Err(); err != nil {
 		return err
+	}
+	// The file is appended to: a later record of the same id is that op
+	// changed (an upload moved by a rename), and it now sits there; a drop
+	// record retires it.
+	for i, op := range read {
+		if last[op.ID] == i && op.Op != opDrop {
+			fs.queue = append(fs.queue, op)
+		}
 	}
 	loaded := len(fs.queue)
 	fs.queue = e.dropUnservablePuts(fs, fs.queue)
@@ -101,7 +214,9 @@ func (e *Engine) loadQueue(fs *StoreState) error {
 		live[op.ID] = true
 		fs.queuedBytes += op.Size
 	}
-	if len(fs.queue) != loaded {
+	fs.qx.lines = lines
+	fs.qx.ver++
+	if len(fs.queue) != loaded || torn || lines != len(fs.queue) {
 		// A queue written before these rules, or one holding uploads whose
 		// bytes are gone: rewrite it so the ops that can never complete stop
 		// being re-sent and counted.
@@ -178,7 +293,7 @@ func compactQueue(ops []queueOp) (kept, dropped []queueOp) {
 }
 
 // compactLocked applies compactQueue to a store's live queue and removes the
-// bytes of what it dropped. Callers hold queueMu and rewrite the queue file.
+// bytes of what it dropped. Callers hold queueMu.
 func (e *Engine) compactLocked(fs *StoreState) {
 	kept, dropped := compactQueue(fs.queue)
 	if len(dropped) == 0 {
@@ -188,23 +303,87 @@ func (e *Engine) compactLocked(fs *StoreState) {
 	for _, op := range kept {
 		ids[op.ID] = true
 	}
+	var records []queueOp
 	for _, op := range dropped {
 		fs.queuedBytes -= op.Size
 		if !ids[op.ID] {
 			_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), op.ID))
+			records = append(records, queueOp{ID: op.ID, Op: opDrop})
 		}
 	}
 	fs.queue = kept
+	fs.qx.ver++
+	// Replaying the file would compact it the same way; the records only
+	// spare a restart from mistaking the removed bytes for a lost upload.
+	_ = e.appendQueue(fs, records, false)
+	e.tidyQueueFileLocked(fs)
 }
 
-// writeQueue persists the whole index: queues hold a handful of offline
-// writes, and a rewrite is the only shape that cannot be torn by a crash.
+// appendQueue adds records to the end of the queue file. sync makes them
+// durable before it returns: an op must be, a drop record need not be (a
+// lost one only re-sends an op the holder has). A failed append is cut back
+// off, so a half-written record never swallows the next one.
+func (e *Engine) appendQueue(fs *StoreState, ops []queueOp, sync bool) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	index := queueIndexPath(e.dataDir, fs.name)
+	if err := os.MkdirAll(filepath.Dir(index), 0o700); err != nil {
+		return err
+	}
+	var buf []byte
+	for _, op := range ops {
+		b, err := json.Marshal(op)
+		if err != nil {
+			return err
+		}
+		buf = append(append(buf, b...), '\n')
+	}
+	f, err := os.OpenFile(index, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	_, err = f.Write(buf)
+	if err == nil && sync {
+		err = f.Sync()
+	}
+	if err != nil {
+		_ = f.Truncate(info.Size())
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fs.qx.lines += len(ops)
+	return nil
+}
+
+// tidyQueueFileLocked rewrites the queue file once it is mostly dead
+// records, or removes it once nothing is queued. Callers hold queueMu.
+func (e *Engine) tidyQueueFileLocked(fs *StoreState) {
+	if len(fs.queue) > 0 && fs.qx.lines <= 2*len(fs.queue)+64 {
+		return
+	}
+	if err := e.writeQueue(fs); err != nil {
+		e.logger.Warn("rewrite the write queue", "store", fs.name, "error", err)
+	}
+}
+
+// writeQueue persists the whole index in one atomic rewrite. Ops are
+// appended as they come (appendQueue); this compacts the file.
 func (e *Engine) writeQueue(fs *StoreState) error {
 	index := queueIndexPath(e.dataDir, fs.name)
 	if len(fs.queue) == 0 {
 		if err := os.Remove(index); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		fs.qx.lines = 0
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(index), 0o700); err != nil {
@@ -236,7 +415,11 @@ func (e *Engine) writeQueue(fs *StoreState) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, index)
+	if err := os.Rename(tmp, index); err != nil {
+		return err
+	}
+	fs.qx.lines = len(fs.queue)
+	return nil
 }
 
 // enqueue records one op. Callers hold queueMu - the one lock that guards the
@@ -247,13 +430,19 @@ func (e *Engine) writeQueue(fs *StoreState) error {
 // has acknowledged (compactQueue): those bytes are a version nobody will ever
 // ask for again, and keeping them grew the queue - and a capped queue's count
 // - forever. An upload a later rename still needs is kept.
+//
+// The op is durable in the queue file before it is in memory: an op only in
+// memory is lost at the next restart, and with it - since loadQueue removes
+// bytes no op names - the only copy of an upload. A failed append leaves the
+// queue as it was.
 func (e *Engine) enqueue(fs *StoreState, op queueOp) error {
-	fs.queue = append(fs.queue, op)
-	fs.queuedBytes += op.Size
-	e.compactLocked(fs)
-	if err := e.writeQueue(fs); err != nil {
+	if err := e.appendQueue(fs, []queueOp{op}, true); err != nil {
 		return err
 	}
+	fs.queue = append(fs.queue, op)
+	fs.queuedBytes += op.Size
+	fs.qx.ver++
+	e.compactLocked(fs)
 	return nil
 }
 
@@ -266,35 +455,82 @@ func (e *Engine) enqueueOp(fs *StoreState, op queueOp) error {
 
 // dropQueued forgets an op and its bytes. Callers hold queueMu.
 func (e *Engine) dropQueued(fs *StoreState, id string) {
+	e.dropQueuedSet(fs, map[string]bool{id: true})
+}
+
+// dropQueuedSet forgets several ops and their bytes in one pass and one
+// write. Callers hold queueMu.
+func (e *Engine) dropQueuedSet(fs *StoreState, ids map[string]bool) {
+	if len(ids) == 0 {
+		return
+	}
 	kept := fs.queue[:0]
+	var records []queueOp
 	for _, op := range fs.queue {
-		if op.ID == id {
+		if ids[op.ID] {
 			fs.queuedBytes -= op.Size
 			if op.Blob != "" {
 				_ = os.Remove(filepath.Join(queueBytesDir(e.dataDir, fs.name), op.ID))
 			}
+			records = append(records, queueOp{ID: op.ID, Op: opDrop})
+			delete(fs.qx.sent, op.ID)
 			continue
 		}
 		kept = append(kept, op)
 	}
+	clear(fs.queue[len(kept):])
 	fs.queue = kept
-	_ = e.writeQueue(fs)
+	fs.qx.ver++
+	if len(records) > 0 && len(fs.queue) > 0 {
+		_ = e.appendQueue(fs, records, false)
+	}
+	e.tidyQueueFileLocked(fs)
+}
+
+// ackPathsLocked is every path a remote entry must have to acknowledge
+// something queued. Callers hold queueMu.
+func (fs *StoreState) ackPathsLocked() map[string]bool {
+	if fs.qx.paths != nil && fs.qx.pathsVer == fs.qx.ver {
+		return fs.qx.paths
+	}
+	paths := make(map[string]bool, len(fs.queue))
+	for _, op := range fs.queue {
+		paths[op.Path] = true
+		if op.Op == opPut {
+			paths[conflictPath(op.Path, op.Blob)] = true
+		}
+		for _, move := range op.Moves {
+			if move.New != nil {
+				paths[move.New.Path] = true
+			}
+		}
+	}
+	fs.qx.paths, fs.qx.pathsVer = paths, fs.qx.ver
+	return paths
 }
 
 // ackQueue drops the ops a peer has now seen. A remote entry that carries this
 // machine's counter for the path is proof the change landed. Every kind of op
 // must be acknowledged somehow: an op that never is stays queued forever, is
 // re-sent on every flush, and (for a put) keeps its bytes on disk.
-func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
+//
+// Only a peer that holds the store's bytes can acknowledge: another streamed
+// peer records the entry without them, and dropping the upload on its word
+// deleted the only copy.
+func (e *Engine) ackQueue(peer string, fs *StoreState, rem *Entry) {
 	if !fs.stream {
+		return
+	}
+	if !e.peerIsReplica(peer, fs) {
 		return
 	}
 	fs.queueMu.Lock()
 	defer fs.queueMu.Unlock()
-	if len(fs.queue) == 0 {
+	if len(fs.queue) == 0 || !fs.ackPathsLocked()[rem.Path] {
 		return
 	}
-	for _, op := range append([]queueOp(nil), fs.queue...) {
+	drop := map[string]bool{}
+	for _, op := range fs.queue {
 		switch op.Op {
 		case opPut:
 			// Landed as written; or seen and then deleted; or parked whole
@@ -304,13 +540,13 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 			landed := rem.Path == op.Path && vvCovers(rem.VV, op.VV) && (rem.Blob == op.Blob || rem.Deleted)
 			parked := rem.Path == conflictPath(op.Path, op.Blob) && rem.Blob == op.Blob && !rem.Deleted
 			if landed || parked {
-				e.dropQueued(fs, op.ID)
+				drop[op.ID] = true
 			}
 		case opDelete, opRmdir, opMkdir:
 			// No bytes ride on these: once the holder's entry covers ours,
 			// it has seen the change, whatever it did next.
 			if rem.Path == op.Path && vvCovers(rem.VV, op.VV) {
-				e.dropQueued(fs, op.ID)
+				drop[op.ID] = true
 			}
 		case opRename:
 			// Landed, or landed and since deleted: a tombstone that covers
@@ -319,12 +555,13 @@ func (e *Engine) ackQueue(fs *StoreState, rem *Entry) {
 			// was later removed queued forever.)
 			for _, move := range op.Moves {
 				if move.New != nil && rem.Path == move.New.Path && vvCovers(rem.VV, move.New.VV) {
-					e.dropQueued(fs, op.ID)
+					drop[op.ID] = true
 					break
 				}
 			}
 		}
 	}
+	e.dropQueuedSet(fs, drop)
 }
 
 // vvCovers reports whether remote has seen every counter this side recorded.
@@ -364,30 +601,62 @@ func (e *Engine) flushQueue(fs *StoreState) {
 // flushBatch bounds the entries one flushed index frame carries.
 const flushBatch = 512
 
+// flushQueueOnce sends the queue to the best holder of the store's bytes (a
+// streamed peer would only journal it). A flush asked for by a write sends
+// only the ops that holder has not been sent over its current link; the
+// periodic retry (queueRetry since the last full flush), a different holder
+// or a new link sends everything again, which is what recovers an op the
+// holder lost.
 func (e *Engine) flushQueueOnce(fs *StoreState) {
-	fs.queueMu.Lock()
-	ops := append([]queueOp(nil), fs.queue...)
-	fs.queueMu.Unlock()
-	if len(ops) == 0 {
-		return
-	}
-	peers := e.holdersFor(fs)
+	peers := e.replicaHoldersFor(fs)
 	if len(peers) == 0 {
 		return
 	}
 	peer := peers[0]
-	fs.lastFlush.Store(time.Now().UnixNano())
+	gen := e.linkGenOf(peer)
+	now := time.Now()
+	fs.queueMu.Lock()
+	full := fs.qx.sentTo != peer || fs.qx.sentGen != gen ||
+		now.Sub(time.Unix(0, fs.lastFlush.Load())) >= queueRetry
+	if full || fs.qx.sent == nil {
+		fs.qx.sent, fs.qx.sentTo, fs.qx.sentGen = map[string]bool{}, peer, gen
+	}
+	ops := make([]queueOp, 0, len(fs.queue))
+	for _, op := range fs.queue {
+		if !fs.qx.sent[op.ID] {
+			ops = append(ops, op)
+		}
+	}
+	fs.queueMu.Unlock()
+	if len(ops) == 0 {
+		return
+	}
+	if full {
+		fs.lastFlush.Store(now.UnixNano())
+	}
+	markSent := func(ids []string) {
+		fs.queueMu.Lock()
+		if fs.qx.sentTo == peer && fs.qx.sentGen == gen && fs.qx.sent != nil {
+			for _, id := range ids {
+				fs.qx.sent[id] = true
+			}
+		}
+		fs.queueMu.Unlock()
+	}
 	var batch []*Entry
+	var batchIDs []string
 	send := func() bool {
 		if len(batch) == 0 {
 			return true
 		}
 		err := e.sendIndexTo(peer, fs, batch)
-		batch = nil
+		ids := batchIDs
+		batch, batchIDs = nil, nil
 		if err != nil {
 			e.logger.Debug("flush queue", "store", fs.name, "error", err)
 			return false
 		}
+		markSent(ids)
 		return true
 	}
 	for _, op := range ops {
@@ -401,6 +670,7 @@ func (e *Engine) flushQueueOnce(fs *StoreState) {
 				e.logger.Debug("flush rename", "store", fs.name, "path", op.Path, "error", err)
 				return
 			}
+			markSent([]string{op.ID})
 			continue
 		}
 		ent := &Entry{Path: op.Path, Blob: op.Blob, Size: op.Size, MTime: op.MTime, Mode: op.Mode, VV: op.VV}
@@ -411,6 +681,7 @@ func (e *Engine) flushQueueOnce(fs *StoreState) {
 			ent = &Entry{Path: op.Path, Dir: true, Mode: op.Mode, VV: op.VV}
 		}
 		batch = append(batch, ent)
+		batchIDs = append(batchIDs, op.ID)
 		if len(batch) >= flushBatch && !send() {
 			return
 		}
@@ -507,6 +778,13 @@ func (m *storeMutator) Open(path string, truncate bool) (streamfs.PendingFile, e
 	if truncate {
 		base = 0
 	} else {
+		// Editing in place commits the whole file, so the bytes not
+		// written must come from somewhere at release. With no holder and
+		// no copy here that fetch fails and the edit is thrown away after
+		// the application was told it succeeded: refuse it now instead.
+		if ent.Size > 0 && !m.e.bytesHere(m.fs, ent.Blob) && len(m.e.replicaHoldersFor(m.fs)) == 0 {
+			return nil, fmt.Errorf("%s: no holder reachable to edit it in place: %w", path, syscall.EROFS)
+		}
 		fetch = m.fetcher(ent)
 	}
 	pf, err := m.pending(path, ent.Mode, base, fetch)
@@ -520,6 +798,16 @@ func (m *storeMutator) Open(path string, truncate bool) (streamfs.PendingFile, e
 		markTouched(pf)
 	}
 	return pf, nil
+}
+
+// bytesHere reports whether this machine has a blob's bytes without a holder:
+// queued, or staged by a switch from local.
+func (e *Engine) bytesHere(fs *StoreState, sum string) bool {
+	if _, ok := e.queuedBlob(fs, sum); ok {
+		return true
+	}
+	_, ok, _ := e.readStaged(fs, sum, 0, 0)
+	return ok
 }
 
 // fetcher reads an entry's bytes from a holder on demand. Opening a file for
@@ -621,6 +909,11 @@ func (m *storeMutator) Remove(path string) error {
 	}
 	m.fs.scanMu.Lock()
 	defer m.fs.scanMu.Unlock()
+	m.fs.qx.pathMu.Lock()
+	defer m.fs.qx.pathMu.Unlock()
+	if ent = m.fs.db.Get(path); ent == nil || ent.Deleted {
+		return os.ErrNotExist
+	}
 	vv := m.e.nextVV(m.fs, ent)
 	tomb := &Entry{Path: path, Deleted: true, Dir: ent.Dir, VV: vv}
 	_ = m.fs.db.Put(tomb)
@@ -689,12 +982,20 @@ func (e *Engine) moveQueuedPut(fs *StoreState, from, to string, vv map[string]ui
 	op := fs.queue[idx]
 	op.Path = to
 	op.VV = vv
+	// Appended, the changed record replaces the old one when the queue is
+	// read back. If it cannot be written the move is not made: the caller
+	// queues a rename instead.
+	if err := e.appendQueue(fs, []queueOp{op}, true); err != nil {
+		e.logger.Warn("move a queued upload", "store", fs.name, "from", from, "to", to, "error", err)
+		return false
+	}
 	// The upload now happens after everything already queued - including
 	// the delete of the file it replaces, which must not reach the holder
 	// after it - and an older upload of the destination is superseded.
 	fs.queue = append(slices.Delete(fs.queue, idx, idx+1), op)
+	delete(fs.qx.sent, op.ID)
+	fs.qx.ver++
 	e.compactLocked(fs)
-	_ = e.writeQueue(fs)
 	return true
 }
 
@@ -707,6 +1008,8 @@ func (m *storeMutator) Rename(from, to string) error {
 	}
 	m.fs.scanMu.Lock()
 	defer m.fs.scanMu.Unlock()
+	m.fs.qx.pathMu.Lock()
+	defer m.fs.qx.pathMu.Unlock()
 	var entries []*Entry
 	for _, ent := range m.fs.db.Under(from) {
 		if !ent.Deleted {
@@ -748,7 +1051,12 @@ func (m *storeMutator) Rename(from, to string) error {
 		moved.VV = vv
 		_ = m.fs.db.Put(old)
 		_ = m.fs.db.Put(moved)
-		if m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) {
+		// A handle still open on the path follows it: it commits under the
+		// new name when it is released. One that created the file holds its
+		// only bytes, so there is nothing at the old name for a holder to
+		// move - only the empty placeholder to delete.
+		_, created := m.e.repathPending(m.fs, ent.Path, newPath)
+		if m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) || created {
 			if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
 				return err
 			}
@@ -867,8 +1175,7 @@ func (p *pendingFile) writtenWithin(off, n int64) int64 {
 // newOpID makes a queue id that sorts by creation time and never collides.
 func newOpID(e *Engine) string {
 	e.mu.Lock()
-	e.readSeq++
-	n := e.readSeq
+	n := e.nextReadIDLocked()
 	e.mu.Unlock()
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), n)
 }
@@ -1049,28 +1356,58 @@ func (p *pendingFile) close() error {
 		p.mu.Unlock()
 		return nil
 	}
-	if !p.dirty && !p.touched {
-		// Nothing changed through this handle: closing it must not add a
-		// version.
-		p.mu.Unlock()
-		return nil
-	}
+	// Close is the release: nothing writes through the handle after it.
+	// Every path that does not commit the scratch file removes it, or each
+	// read-write open left a descriptor and a file in the queue directory.
 	p.done = true
+	changed := p.dirty || p.touched
 	failed := p.failed
 	p.mu.Unlock()
 
+	if !changed {
+		// Nothing changed through this handle: closing it must not add a
+		// version.
+		p.discard()
+		return nil
+	}
 	if failed {
-		os.Remove(p.f.Name())
+		p.discard()
 		p.dropCreatedEntry()
 		return nil
 	}
 
 	// A delete that arrived while the file was open (touch; rm in one shell)
-	// must not be undone by the commit that follows it.
-	if cur := p.fs.db.Get(p.path); cur != nil && cur.Deleted {
+	// must not be undone by the commit that follows it. (Checked again at
+	// the commit; this spares fetching the bytes of a file already gone.)
+	if p.deletedWhileOpen() {
+		p.discard()
 		return nil
 	}
 	return p.recordCurrent()
+}
+
+// deletedWhileOpen reports whether the handle's path was removed after it
+// was opened. A rename tombstones the old path and moves the handle in one
+// step under pathMu, so a renamed handle never looks deleted.
+func (p *pendingFile) deletedWhileOpen() bool {
+	p.fs.qx.pathMu.Lock()
+	defer p.fs.qx.pathMu.Unlock()
+	return p.deletedLocked()
+}
+
+// deletedLocked is deletedWhileOpen for callers holding pathMu.
+func (p *pendingFile) deletedLocked() bool {
+	p.mu.Lock()
+	path := p.path
+	p.mu.Unlock()
+	cur := p.fs.db.Get(path)
+	return cur != nil && cur.Deleted
+}
+
+// discard closes the scratch file and removes it.
+func (p *pendingFile) discard() {
+	_ = p.f.Close()
+	_ = os.Remove(p.f.Name())
 }
 
 // fillGaps writes the bytes from the holder into every range this handle did
@@ -1136,11 +1473,16 @@ func (p *pendingFile) dropCreatedEntry() {
 	if !p.created {
 		return
 	}
+	p.fs.qx.pathMu.Lock()
+	defer p.fs.qx.pathMu.Unlock()
+	p.mu.Lock()
+	path := p.path
+	p.mu.Unlock()
 	p.fs.queueMu.Lock()
 	tomb := &Entry{
-		Path:    p.path,
+		Path:    path,
 		Deleted: true,
-		VV:      p.e.nextVV(p.fs, p.fs.db.Get(p.path)),
+		VV:      p.e.nextVV(p.fs, p.fs.db.Get(path)),
 	}
 	_ = p.fs.db.Put(tomb)
 	p.fs.queueMu.Unlock()
@@ -1194,40 +1536,60 @@ func (p *pendingFile) recordCurrent() error {
 		os.Remove(f.Name())
 		return err
 	}
-	mtime := time.Now().UnixNano()
-	prev := p.fs.db.Get(p.path)
-	vv := p.e.nextVV(p.fs, prev)
-	ent := &Entry{
-		Path:  p.path,
-		Blob:  sum,
-		Size:  info.Size(),
-		MTime: mtime,
-		Mode:  p.mode,
-		VV:    vv,
-	}
 
 	// The scratch file becomes the queued copy, so the holder can pull
 	// exactly these bytes.
-	if err := os.Rename(f.Name(), filepath.Join(queueBytesDir(p.e.dataDir, p.fs.name), p.id)); err != nil {
+	queued := filepath.Join(queueBytesDir(p.e.dataDir, p.fs.name), p.id)
+	if err := os.Rename(f.Name(), queued); err != nil {
+		os.Remove(f.Name())
 		return err
 	}
 
+	// Commit under the path the handle has now: a rename while it was open
+	// moved it. pathMu keeps a rename from slipping between reading the path
+	// and journalling it.
+	p.fs.qx.pathMu.Lock()
+	defer p.fs.qx.pathMu.Unlock()
+	defer p.e.unregisterPending(p)
+	if p.deletedLocked() {
+		os.Remove(queued)
+		return nil
+	}
+	p.mu.Lock()
+	path := p.path
+	p.mu.Unlock()
+	mtime := time.Now().UnixNano()
 	p.fs.queueMu.Lock()
-	_ = p.fs.db.Put(ent)
-	op := queueOp{
-		ID:    p.id,
-		Op:    opPut,
-		Path:  p.path,
+	vv := p.e.nextVV(p.fs, p.fs.db.Get(path))
+	ent := &Entry{
+		Path:  path,
 		Blob:  sum,
 		Size:  info.Size(),
 		MTime: mtime,
 		Mode:  p.mode,
 		VV:    vv,
 	}
+	op := queueOp{
+		ID:    p.id,
+		Op:    opPut,
+		Path:  path,
+		Blob:  sum,
+		Size:  info.Size(),
+		MTime: mtime,
+		Mode:  p.mode,
+		VV:    vv,
+	}
+	// The queue first: a journal entry whose op never reached the queue
+	// file named bytes the next start would delete.
 	if err := p.e.enqueue(p.fs, op); err != nil {
 		p.fs.queueMu.Unlock()
-		os.Remove(f.Name())
+		os.Remove(queued)
 		return err
+	}
+	if err := p.fs.db.Put(ent); err != nil {
+		// Queued all the same: the holder takes it and the journal learns
+		// it back from the holder's index.
+		p.e.logger.Warn("journal a queued write", "store", p.fs.name, "path", path, "error", err)
 	}
 	p.fs.queueMu.Unlock()
 

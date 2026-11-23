@@ -533,12 +533,23 @@ func (d *dirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 	if d.fsys.mutator == nil {
 		return syscall.EROFS
 	}
+	// An exchange swaps two paths; treating it as a move deleted the
+	// destination. The journal has no atomic swap, so refuse it, and any flag
+	// this does not know (RENAME_WHITEOUT) with it.
+	if flags&^renameNoReplace != 0 {
+		return syscall.EINVAL
+	}
 	parent, ok := newParent.(*dirNode)
 	if !ok {
 		return syscall.EXDEV
 	}
 	oldPath := joinPath(d.getPath(), name)
 	newPath := joinPath(parent.getPath(), newName)
+	if flags&renameNoReplace != 0 {
+		if _, exists := d.fsys.tree.Get(newPath); exists {
+			return syscall.EEXIST
+		}
+	}
 	child := d.GetChild(name)
 	if err := d.fsys.mutator.Rename(oldPath, newPath); err != nil {
 		return errnoFor(err)
@@ -550,6 +561,12 @@ func (d *dirNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 	d.fsys.repath(child, oldPath, newPath)
 	return 0
 }
+
+// renameat2(2) flags (linux/fs.h).
+const (
+	renameNoReplace = 1 << 0
+	renameExchange  = 1 << 1
+)
 
 // fileNode is a file whose bytes come from a holder.
 type fileNode struct {
@@ -898,12 +915,18 @@ func (r *readahead) read(ctx context.Context, dest []byte, off int64) (fuse.Read
 		r.ahead = 0
 	}
 	needed := make([]*raBlock, 0, last-first+1)
+	// inherited marks blocks this read found already started: speculative
+	// readahead, whose failure may be long past (a link that has since come
+	// back) and so is not this read's answer.
+	inherited := make([]bool, 0, last-first+1)
 	for k := first; k <= last; k++ {
+		_, had := r.blocks[k]
 		b := r.startLocked(k)
 		if b != nil {
 			b.urgent.Store(true)
 		}
 		needed = append(needed, b)
+		inherited = append(inherited, had)
 	}
 	for k := last + 1; k <= last+int64(r.ahead); k++ {
 		r.startLocked(k)
@@ -935,8 +958,34 @@ func (r *readahead) read(ctx context.Context, dest []byte, off int64) (fuse.Read
 			if r.blocks[k] == b {
 				delete(r.blocks, k)
 			}
+			var again *raBlock
+			if inherited[i] && r.ctx.Err() == nil {
+				// A readahead block failed before anyone needed it, or
+				// while nobody did: ask once more on this read's behalf
+				// before failing it.
+				again = r.startLocked(k)
+				if again != nil {
+					again.urgent.Store(true)
+				}
+			}
 			r.mu.Unlock()
-			return nil, errnoFor(b.err)
+			if again == nil {
+				return nil, errnoFor(b.err)
+			}
+			select {
+			case <-again.done:
+			case <-ctx.Done():
+				return nil, syscall.EINTR
+			}
+			if again.err != nil {
+				r.mu.Lock()
+				if r.blocks[k] == again {
+					delete(r.blocks, k)
+				}
+				r.mu.Unlock()
+				return nil, errnoFor(again.err)
+			}
+			b = again
 		}
 		start := k * raBlockSize
 		lo := max(off, start)

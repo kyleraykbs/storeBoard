@@ -417,7 +417,9 @@ func TestWriteHandleCommitsOnlyWhenDirty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Close(); err != nil {
+	// The mount's FLUSH (every close(2) of a descriptor) is Sync; Close is
+	// RELEASE, after which the handle is gone.
+	if err := h.Sync(); err != nil {
 		t.Fatalf("flush with nothing written: %v", err)
 	}
 	if got := queued(); got != 1 {
@@ -538,8 +540,13 @@ func TestReadWriteOpenDoesNotFetchUntilWritten(t *testing.T) {
 	fs := n.store("docs")
 	m := &storeMutator{e: n.eng, fs: fs}
 
-	// No holder is reachable, so any fetch would fail. Opening must succeed,
-	// and so must a read of the untouched prefix when nothing was written.
+	// The holder never answers, so any fetch would fail. Opening must
+	// succeed, and so must closing when nothing was written. (With no holder
+	// connected at all an in-place open is refused: see
+	// TestReadWriteOpenRefusedWithNoHolder.)
+	n.eng.mu.Lock()
+	n.eng.sends["b"] = silentSender{}
+	n.eng.mu.Unlock()
 	if err := fs.db.Put(&Entry{Path: "big.bin", Blob: "blob", Size: 1 << 20, VV: map[string]uint64{"a": 1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +696,7 @@ func TestQueueRetiresDeletesAndDirectories(t *testing.T) {
 	}
 	for _, op := range ops {
 		rem := &Entry{Path: op.Path, Dir: op.Op == opMkdir, Deleted: op.Op == opDelete, VV: MergeVV(op.VV, map[string]uint64{"b": 7})}
-		n.eng.ackQueue(fs, rem)
+		n.eng.ackQueue("b", fs, rem)
 	}
 	fs.queueMu.Lock()
 	left := len(fs.queue)

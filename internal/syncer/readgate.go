@@ -169,13 +169,20 @@ type cancelKey struct {
 	id   int64
 }
 
+// cancelTTL is how long a cancel is kept. A cancel either arrives while its
+// read is still queued here - within seconds - or after it was served, when
+// it matters to nobody. Keeping one longer let it match an unrelated read: a
+// reader that restarted used the same ids again.
+const cancelTTL = time.Minute
+
 func (e *Engine) noteReadCancel(peer string, id int64) {
 	e.cancelMu.Lock()
 	defer e.cancelMu.Unlock()
 	now := time.Now()
-	if len(e.readCancels) > 1024 {
+	if len(e.readCancels) > 1024 || now.Sub(e.sx.cancelPruned) > cancelTTL {
+		e.sx.cancelPruned = now
 		for k, at := range e.readCancels {
-			if now.Sub(at) > time.Minute {
+			if now.Sub(at) > cancelTTL {
 				delete(e.readCancels, k)
 			}
 		}
@@ -189,9 +196,9 @@ func (e *Engine) readCancelled(peer string, id int64) bool {
 	e.cancelMu.Lock()
 	defer e.cancelMu.Unlock()
 	k := cancelKey{peer, id}
-	if _, ok := e.readCancels[k]; ok {
+	if at, ok := e.readCancels[k]; ok {
 		delete(e.readCancels, k)
-		return true
+		return time.Since(at) <= cancelTTL
 	}
 	return false
 }
