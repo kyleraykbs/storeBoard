@@ -640,6 +640,7 @@ func TestBackupRestoreBringsFileBackToEveryPeer(t *testing.T) {
 // A file edited on a machine that mounts the store as a remote stream still
 // reaches the holder: remote means "the bytes live elsewhere", not "read-only".
 func TestRemoteStoreEditReachesHolder(t *testing.T) {
+	needFUSE(t)
 	n := startNetwork(t, map[string]map[string]storeDecl{
 		"alpha": {"media": {Group: "g", Sync: "local"}},
 		"bravo": {"media": {Group: "g", Sync: "stream"}},

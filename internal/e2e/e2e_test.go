@@ -509,6 +509,7 @@ func TestSyncDeliversFileBetweenMachines(t *testing.T) {
 // one machine holds the bytes locally, the other mounts the same store as a
 // remote stream and still sees new files.
 func TestRemoteStoreStreamsFromHolder(t *testing.T) {
+	needFUSE(t)
 	a, b := startMesh(t, mesh{
 		storesA: map[string]storeDecl{"media": {Group: "g", Sync: "local"}},
 		storesB: map[string]storeDecl{"media": {Group: "g", Sync: "stream"}},
@@ -536,6 +537,7 @@ func TestRemoteStoreStreamsFromHolder(t *testing.T) {
 // inside its parent at a relative path, and content written through that path
 // syncs as the child's content.
 func TestNestedStoreAppearsInsideParent(t *testing.T) {
+	needFUSE(t)
 	// links maps a child store id to the relative path it appears at inside
 	// the parent. BulkPictures is local on alpha and remote on bravo, so the
 	// parent holds a real directory while the child is only attached.
@@ -987,5 +989,21 @@ func TestLockedRootStillHeals(t *testing.T) {
 	}
 	if info.Mode().Perm()&0o700 != 0o700 {
 		t.Fatalf("root is %v, not owner-traversable", info.Mode())
+	}
+}
+
+// needFUSE skips a test that mounts a streamed store where mounting is
+// impossible (the Nix build sandbox has no /dev/fuse).
+func needFUSE(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		t.Skip("no /dev/fuse on this host")
+	}
+	if os.Geteuid() != 0 {
+		if _, err := exec.LookPath("fusermount3"); err != nil {
+			if _, err := exec.LookPath("fusermount"); err != nil {
+				t.Skip("no fusermount on this host")
+			}
+		}
 	}
 }
