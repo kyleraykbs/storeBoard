@@ -642,7 +642,7 @@ func TestBackupRestoreBringsFileBackToEveryPeer(t *testing.T) {
 func TestRemoteStoreEditReachesHolder(t *testing.T) {
 	n := startNetwork(t, map[string]map[string]storeDecl{
 		"alpha": {"media": {Group: "g", Sync: "local"}},
-		"bravo": {"media": {Group: "g", Sync: "remote"}},
+		"bravo": {"media": {Group: "g", Sync: "stream"}},
 	})
 	a, b := n.peer("alpha"), n.peer("bravo")
 

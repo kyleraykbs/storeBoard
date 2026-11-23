@@ -38,13 +38,31 @@ const ConfigEnvVar = "STOREBOARD_CONFIG"
 // appName is the directory storeboard keeps its files in under each XDG base.
 const appName = "storeboard"
 
-// Sync types. Local holds a full replica that works offline; remote is the
-// existing attached mirror; stream is the journal-only FUSE view being staged.
+// Sync types. Local holds a full replica that works offline; stream keeps
+// only the journal here and serves file contents from a holder through a
+// mount, fetched as they are read.
+//
+// Remote was an older mode: a local copy that synced only while a holder was
+// reachable. It is the worst of both - the disk cost of a replica without
+// working offline - and stream replaced it. A config that still says remote
+// gets stream; the engine migrates the files already on disk (see the
+// syncer's migrate.go).
 const (
 	SyncLocal  = "local"
-	SyncRemote = "remote"
+	SyncRemote = "remote" // accepted, read as SyncStream
 	SyncStream = "stream"
 )
+
+// normalSync is the mode a declared sync value means.
+func normalSync(s string) string {
+	switch s {
+	case "":
+		return SyncLocal
+	case SyncRemote:
+		return SyncStream
+	}
+	return s
+}
 
 // Peer is a declared device: name lives in its map key, endpoints are the
 // host:port addresses other peers dial.
@@ -560,7 +578,7 @@ func (c *Config) Validate() error {
 		switch v.Sync {
 		case SyncLocal, SyncRemote, SyncStream:
 		default:
-			return fmt.Errorf("store %q: sync %q must be %q, %q or %q", v.ID, v.Sync, SyncLocal, SyncRemote, SyncStream)
+			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncStream)
 		}
 		if v.Preferred != "" {
 			if _, ok := c.Peers[v.Preferred]; !ok {
@@ -719,7 +737,7 @@ func (c *Config) StoreViews() []StoreView {
 		out = append(out, StoreView{
 			ID:          id,
 			Group:       s.Group,
-			Sync:        firstNonEmpty(s.Sync, SyncLocal),
+			Sync:        normalSync(s.Sync),
 			Preferred:   s.Preferred,
 			Offline:     s.Offline,
 			Symlinks:    append([]string(nil), s.Symlinks...),

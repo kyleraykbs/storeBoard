@@ -477,86 +477,9 @@ func TestTakeoverMovesContentIntoTheStore(t *testing.T) {
 	}
 }
 
-// A remote store keeps its canonical dir visible with no holder: there is no
-// path to swap, only a liveness state.
-func TestRemoteStoreStaysVisibleWithoutAHolder(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncRemote},
-	})
-	n.prepareAll()
-
-	writeFile(t, filepath.Join(n.root("docs"), "offline.txt"), "kept", time.Now())
-	n.eng.scanOnce(n.store("docs"))
-
-	s := n.eng.Snapshot()[0]
-	if s.State != stateDetached {
-		t.Fatalf("state = %q, want detached", s.State)
-	}
-	if got := readFile(t, filepath.Join(n.root("docs"), "offline.txt")); got != "kept" {
-		t.Fatalf("content = %q", got)
-	}
-	if ent := n.store("docs").db.Get("offline.txt"); ent == nil || ent.Deleted {
-		t.Fatalf("offline write not indexed: %+v", ent)
-	}
-}
-
-// The incident's exact shape: a remote store whose mirror is empty while the
-// journal and the content store still remember the files (they were
-// materialised earlier). Not live, that absence must never be read as a
-// deletion — it cost 448 files on amanita once. Live, the same absence IS a
-// deletion and has to propagate.
-func TestRemoteStoreTombstonesOnlyWhileLive(t *testing.T) {
-	n := newNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncRemote},
-	})
-	n.prepareAll()
-	fs := n.store("docs")
-
-	// Materialised once: the blob is in the store, the file is gone.
-	f, err := n.eng.store.Temp()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write([]byte("gone")); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	sum, err := store.SumFile(f.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := n.eng.store.Adopt(f.Name(), sum); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.db.Put(&Entry{Path: "gone.txt", Blob: sum, Size: 4, MTime: time.Now().UnixNano(), VV: map[string]uint64{"b": 1}}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Detached (not live): report what is here, never what is missing.
-	n.eng.scanOnce(fs)
-	if got := fs.db.Get("gone.txt"); got == nil || got.Deleted {
-		t.Fatalf("a detached scan tombstoned a materialised entry: %+v", got)
-	}
-
-	// Live: the same absence is a deletion.
-	fs.scanMu.Lock()
-	fs.state = stateAttached
-	fs.scanMu.Unlock()
-	n.eng.mu.Lock()
-	n.eng.sends["a"] = nopSender{}
-	n.eng.mu.Unlock()
-
-	n.eng.scanOnce(fs)
-	if got := fs.db.Get("gone.txt"); got == nil || !got.Deleted {
-		t.Fatalf("a live scan did not propagate a real deletion: %+v", got)
-	}
-}
-
 func TestScanNeverTombstonesUnmaterialisedEntries(t *testing.T) {
 	n := newNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncRemote},
+		"docs": {Group: "g"},
 	})
 	n.prepareAll()
 	fs := n.store("docs")
@@ -636,7 +559,7 @@ func TestSnapshotNeverWaitsOnTheScanLock(t *testing.T) {
 // and how many blobs are arriving — all readable without the scan lock.
 func TestProgressIsVisibleWhileWorking(t *testing.T) {
 	n := newNode(t, "b", "a", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncRemote},
+		"docs": {Group: "g"},
 	})
 	n.prepareAll()
 	fs := n.store("docs")
@@ -1436,50 +1359,6 @@ func TestReplicaReleasesBlobAfterMaterialising(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(fs.root, "once.txt")); got != body {
 		t.Fatalf("the tree copy is wrong: %q", got)
-	}
-}
-
-// A streamed store is no different for storage: once the file is materialised
-// the tree holds the bytes, so the content store does not keep a second copy.
-// Only an entry with no file on disk needs its blob.
-func TestStreamedStoreReleasesMaterialisedBlob(t *testing.T) {
-	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
-		"docs": {Group: "g", Sync: config.SyncRemote},
-	})
-	n.prepareAll()
-	fs := n.store("docs")
-
-	const body = "streamed"
-	writeFile(t, filepath.Join(fs.root, "remote.txt"), body, time.Now())
-	if _, err := n.eng.scan(fs, true); err != nil {
-		t.Fatal(err)
-	}
-	sum, err := store.Sum(strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n.eng.store.Has(sum) {
-		t.Fatal("a streamed store kept a second copy of a materialised file")
-	}
-
-	// Without a file on disk the blob is the only copy and must stay.
-	absent := "bytes the mirror has not materialised"
-	absentSum, err := store.Sum(strings.NewReader(absent))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := n.eng.store.Adopt(mkTempFile(t, n.eng, absent), absentSum); err != nil {
-		t.Fatal(err)
-	}
-	if err := fs.db.Put(&Entry{Path: "not-here.txt", Blob: absentSum, Size: int64(len(absent))}); err != nil {
-		t.Fatal(err)
-	}
-	old := recentBlob
-	recentBlob = 0
-	n.eng.Collect()
-	recentBlob = old
-	if !n.eng.store.Has(absentSum) {
-		t.Fatal("the collector dropped the only copy of a file with no tree entry")
 	}
 }
 

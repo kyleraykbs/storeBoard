@@ -143,8 +143,26 @@ func (e *Engine) doctorStore(fs *StoreState, add addCheck) {
 		raise(api.CheckFail, fmt.Sprintf("the folder %s is empty but this machine held its files", fs.root),
 			"if a disk is not mounted, mount it; deletions are held back until the folder is back")
 	}
+	if fs.modeNote != "" {
+		raise(api.CheckFail, "configured local but still streamed: "+fs.modeNote,
+			"free space (or keep the store streamed in the config), then restart the daemon")
+	}
+	if fs.migrationBlocked() {
+		fs.migr.mu.Lock()
+		why := fs.migr.blocked
+		fs.migr.mu.Unlock()
+		raise(api.CheckFail, "not mounted: "+why, "the local files are untouched; resolve it and restart the daemon")
+	} else if n, bytes := fs.migr.pending(); n > 0 {
+		h := "they stay readable meanwhile; each moves to the trash once a holder has it"
+		if snap.State != stateAttached {
+			h = "waiting for a holder to connect; the files stay readable meanwhile"
+		}
+		raise(api.CheckWarn, fmt.Sprintf("switching to stream: %d local files (%s) still to hand to a holder", n, humanSize(bytes)), h)
+	} else if left := e.stagingLeftovers(fs); left != "" {
+		raise(api.CheckWarn, "switched to stream; items the migration did not recognise were left in "+left, "look through them and move or delete what you want")
+	}
 	if fs.stream {
-		if !fs.mounted() {
+		if !fs.mounted() && !fs.migrationBlocked() {
 			raise(api.CheckFail, "the streamed mount is not up", "the folder shows nothing; check the daemon log for the mount error (is /dev/fuse available?)")
 		} else if fs.scanMu.TryLock() {
 			// Never wait on the scan lock: a doctor that hangs behind the
@@ -167,7 +185,7 @@ func (e *Engine) doctorStore(fs *StoreState, add addCheck) {
 			raise(s, fmt.Sprintf("%d writes (%s) queued for a holder", ops, humanSize(bytes)), h)
 		}
 	}
-	if fs.streamed && snap.State != stateAttached {
+	if fs.stream && snap.State != stateAttached {
 		raise(api.CheckWarn, "no holder is connected", "reads fail until a peer holding the store's content connects")
 	}
 	if !fs.stream && !snap.LastScan.IsZero() && time.Since(snap.LastScan) > 3*e.scanEvery+time.Minute && !snap.Scanning {

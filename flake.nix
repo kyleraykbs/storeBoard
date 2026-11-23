@@ -203,7 +203,7 @@
                           # Stream one store instead of replicating it.
                           archive = {
                             group = "family";
-                            sync = "remote";
+                            sync = "stream";
                           };
                         };
                       };

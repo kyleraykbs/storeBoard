@@ -511,7 +511,7 @@ func TestSyncDeliversFileBetweenMachines(t *testing.T) {
 func TestRemoteStoreStreamsFromHolder(t *testing.T) {
 	a, b := startMesh(t, mesh{
 		storesA: map[string]storeDecl{"media": {Group: "g", Sync: "local"}},
-		storesB: map[string]storeDecl{"media": {Group: "g", Sync: "remote"}},
+		storesB: map[string]storeDecl{"media": {Group: "g", Sync: "stream"}},
 	})
 
 	// A remote store goes live once its holder's link is up, which is after
@@ -546,7 +546,7 @@ func TestNestedStoreAppearsInsideParent(t *testing.T) {
 		},
 		storesB: map[string]storeDecl{
 			"Pictures":     {Group: "g", Links: map[string]string{"BulkPictures": "Bulk"}},
-			"BulkPictures": {Group: "g", Sync: "remote"},
+			"BulkPictures": {Group: "g", Sync: "stream"},
 		},
 	})
 

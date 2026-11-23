@@ -166,7 +166,8 @@ func TestLoadFullModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	bulk, ok := cfg.StoreView("bulk")
-	if !ok || bulk.Sync != SyncRemote || bulk.Dir != filepath.Join("/srv/board", "bulk") {
+	// "remote" is the retired mode; it reads as stream.
+	if !ok || bulk.Sync != SyncStream || bulk.Dir != filepath.Join("/srv/board", "bulk") {
 		t.Fatalf("bulk = %+v", bulk)
 	}
 	docs, _ := cfg.StoreView("documents")
@@ -307,7 +308,7 @@ func TestFlatStorePolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	bulk, _ := cfg.StoreView("bulk")
-	if bulk.Group != "media" || bulk.Sync != SyncRemote || bulk.Permissions.User != "kyle" {
+	if bulk.Group != "media" || bulk.Sync != SyncStream || bulk.Permissions.User != "kyle" {
 		t.Errorf("bulk = %+v", bulk)
 	}
 }

@@ -281,13 +281,13 @@ func TestTrashObeysTheDeadline(t *testing.T) {
 	eng.Close()
 }
 
-// A machine that keeps a remote store keeps no versions of it: the history
+// A machine that streams a store keeps no versions of it: the history
 // belongs to whoever holds the content. This is what makes one group-level
 // backup declaration correct on every machine.
 func TestRemoteStoreIgnoresBackup(t *testing.T) {
-	remote := mkBackupNode(t, config.SyncRemote, "")
+	remote := mkBackupNode(t, config.SyncStream, "")
 	if fs := remote.store("docs"); fs.hist != nil {
-		t.Fatal("a remote store kept a history")
+		t.Fatal("a streamed store kept a history")
 	}
 	remote.eng.Close()
 

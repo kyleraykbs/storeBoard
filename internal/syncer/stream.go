@@ -94,6 +94,11 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 	if data, ok, err := f.e.readQueued(f.fs, entry.Blob, offset, length); ok {
 		return data, err
 	}
+	// Likewise a file moved aside when the store switched from local, until
+	// a holder has it.
+	if data, ok, err := f.e.readStaged(f.fs, entry.Blob, offset, length); ok {
+		return data, err
+	}
 	data, err := f.readRange(ctx, entry, offset, length)
 	if err != nil && ctx.Err() == nil {
 		// Said once per failed range: a read that fails is a photo drawn

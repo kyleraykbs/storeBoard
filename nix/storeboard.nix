@@ -14,7 +14,7 @@
 #     };
 #     stores.bulk = {
 #       group = "family";
-#       sync = "remote";
+#       sync = "stream";
 #     };
 #   };
 #

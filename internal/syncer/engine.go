@@ -70,7 +70,6 @@ const (
 type StoreState struct {
 	name      string
 	group     string
-	streamed  bool   // no local replica role: no history, no tombstone on absence
 	stream    bool   // the canonical path is storeboard's FUSE mount
 	preferred string // declared holder preference, empty means none
 	root      string // canonical directory: <root>/<id>
@@ -102,6 +101,13 @@ type StoreState struct {
 	// rootEmpty records that the last scan found the root empty while this
 	// machine held many of its files (see massDeleteFloor).
 	rootEmpty atomic.Bool
+	// migr is a local->stream move in progress, or why a mode change could
+	// not be made (migrate.go). unstream marks a store configured local that
+	// last ran streamed, converted on its first prepare.
+	migr     *migration
+	unstream bool
+	// modeNote is why a store configured local still runs streamed.
+	modeNote string
 	// queueMu guards the queue. It is deliberately not scanMu: the mount's
 	// handlers call into the queue, and a handler waiting on scanMu while the
 	// engine waits on the mount is a deadlock.
@@ -477,14 +483,24 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			return nil, err
 		}
 		streamMode := v.Sync == config.SyncStream
-		streamed := v.Sync == config.SyncRemote || streamMode
+		unstream, blocked := false, ""
+		if !streamMode && e.wasStreamed(v.ID, db, v.Dir) {
+			if blocked = e.localModeFits(db, v.Dir); blocked != "" {
+				// Filling the disk is worse than not switching: stay
+				// streamed until there is room, and say why.
+				logger.Error("store is configured local but its contents do not fit; it stays streamed", "store", v.ID, "why", blocked)
+				streamMode = true
+			} else {
+				unstream = true
+			}
+		}
 		var hist *History
 		on, keep, herr := cfg.BackupFor(v.ID)
 		if herr != nil {
 			return nil, herr
 		}
 		if on {
-			if !streamed {
+			if !streamMode {
 				hist, err = OpenHistory(filepath.Join(cfg.DataDir, "history", v.ID+".ndjson"), keep)
 				if err != nil {
 					return nil, err
@@ -497,13 +513,12 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			}
 		}
 		state := stateReplica
-		if streamed {
+		if streamMode {
 			state = stateDetached
 		}
 		fs := &StoreState{
 			name:      v.ID,
 			group:     v.Group,
-			streamed:  streamed,
 			stream:    streamMode,
 			preferred: v.Preferred,
 			root:      v.Dir,
@@ -522,11 +537,20 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 				Symlinks:    []api.StoreSymlink{},
 			},
 		}
+		fs.unstream = unstream
+		fs.modeNote = blocked
 		e.stores = append(e.stores, fs)
 		e.byName[fs.name] = fs
 		if streamMode {
 			if err := e.loadQueue(fs); err != nil {
 				return nil, err
+			}
+			items, err := loadManifest(e.dataDir, fs.name)
+			if err != nil {
+				return nil, err
+			}
+			if len(items) > 0 {
+				fs.migr = &migration{items: items}
 			}
 			fs.observeTree()
 		}
@@ -563,6 +587,13 @@ func (e *Engine) Run(ctx context.Context) {
 			defer wg.Done()
 			e.scanLoop(ctx, fs)
 		}(fs)
+		if fs.stream && fs.migr != nil {
+			wg.Add(1)
+			go func(fs *StoreState) {
+				defer wg.Done()
+				e.migrateLoop(ctx, fs)
+			}(fs)
+		}
 	}
 	<-ctx.Done()
 	// Scanners and link reconciliation must be down before the caller tears
@@ -713,14 +744,38 @@ func (e *Engine) prepareRoot(fs *StoreState) {
 	}
 	if fs.stream {
 		// The canonical path is this daemon's mount, not a directory the
-		// user owns: there is nothing to adopt, heal or chown here.
+		// user owns: there is nothing to adopt, heal or chown here. Files
+		// left from when it was local are moved aside first, or the mount
+		// would hide them.
+		if fs.migrationBlocked() {
+			fs.refreshLocked()
+			return
+		}
+		if !e.stageForStream(fs) {
+			fs.refreshLocked()
+			return
+		}
 		e.mountStream(fs)
 		fs.refreshLocked()
+		if first {
+			if err := writeMode(e.dataDir, fs.name, config.SyncStream); err != nil {
+				e.logger.Warn("record store mode", "store", fs.name, "error", err)
+			}
+		}
 		ready("store", fs.name, "root", fs.root, "state", fs.state, "mount", fs.mounted())
 		return
 	}
+	if fs.unstream {
+		e.unstream(fs)
+		fs.unstream = false
+	}
 	if err := os.MkdirAll(fs.root, 0o755); err != nil {
 		e.logger.Error("create store root", "store", fs.name, "path", fs.root, "error", err)
+	}
+	if first {
+		if err := writeMode(e.dataDir, fs.name, config.SyncLocal); err != nil {
+			e.logger.Warn("record store mode", "store", fs.name, "error", err)
+		}
 	}
 	e.healRoot(fs)
 	e.applyDir(fs, fs.root)
@@ -783,17 +838,12 @@ func (e *Engine) scanOnce(fs *StoreState) {
 		return
 	}
 	e.applyDir(fs, fs.root)
-	state := fs.state
 	fs.refreshLocked()
 	fs.scanMu.Unlock()
 
-	// A replica owns its canonical dir, so absence there is a deletion. A
-	// remote store is a mirror: without a holder answering, absence means
-	// "not here yet", and reading it as a deletion emptied 448 files into a
-	// holder's trash on 2026-10-09.
-	tombstones := !fs.streamed || (state == stateAttached && e.participantConnected(fs))
-
-	changed, err := e.scan(fs, tombstones)
+	// A replica owns its canonical dir, so absence there is a deletion (of a
+	// file this machine held: see Entry.Local).
+	changed, err := e.scan(fs, true)
 	if err != nil {
 		e.logger.Warn("scan", "store", fs.name, "error", err)
 	}
@@ -953,7 +1003,7 @@ var urgentPrefixes = [][]byte{
 // not a holder answers, so there is no root to flip.
 func (e *Engine) evaluatePeers() {
 	for _, fs := range e.stores {
-		if !fs.streamed {
+		if !fs.stream {
 			continue
 		}
 		connected := e.participantConnected(fs)

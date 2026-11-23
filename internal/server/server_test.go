@@ -478,7 +478,7 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(busy, "mine.txt"), []byte("local"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.StoreTree["docs"] = config.Store{Group: "family", Sync: config.SyncRemote, Symlinks: []string{busy}}
+	cfg.StoreTree["docs"] = config.Store{Group: "family", Symlinks: []string{busy}}
 
 	srv, err := New(cfg, nil)
 	if err != nil {
@@ -540,8 +540,8 @@ func TestTakeoverOverUnixSocket(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		t.Fatal(err)
 	}
-	if res.Moved != 1 || res.State != "detached" {
-		t.Fatalf("takeover = %+v, want one entry moved and a remote store detached", res)
+	if res.Moved != 1 || res.State != "replica" {
+		t.Fatalf("takeover = %+v, want one entry moved into the replica", res)
 	}
 	if fi, err := os.Lstat(busy); err != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("declared path is not a symlink after takeover: %v %v", fi, err)

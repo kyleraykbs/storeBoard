@@ -313,7 +313,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 			// file or content-store blob is absent/stale.
 			if loc.Blob == rem.Blob {
 				if e.needsMaterialization(fs, rem) {
-					if !fs.streamed {
+					if !fs.stream {
 						// A replica owns its tree. Judge the entry by what is on
 						// disk, not by whether the content store still holds a
 						// copy: a replica releases that copy once the file is
