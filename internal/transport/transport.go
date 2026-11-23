@@ -75,6 +75,13 @@ type FeatureHandler interface {
 	Features() []string
 }
 
+// InteractiveSender is implemented by the Sender handed to OnPeerConnected:
+// SendInteractive writes a large frame someone is waiting on - a streamed
+// read's reply - ahead of bulk sync traffic but behind Send.
+type InteractiveSender interface {
+	SendInteractive(b []byte) error
+}
+
 // FeatureSender is implemented by the Sender handed to OnPeerConnected: it
 // reports what the peer's hello advertised.
 type FeatureSender interface {
@@ -264,10 +271,11 @@ type Sender interface {
 // transfer that owns the socket for minutes still lets control frames through
 // between chunks.
 type linkWriter struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	busy    bool
-	waiting int
+	mu   sync.Mutex
+	cond *sync.Cond
+	busy bool
+	// waiting counts writers queued at each level (see the lane constants).
+	waiting [lanes]int
 	c       net.Conn
 	// features is what the peer's hello advertised.
 	features []string
@@ -276,27 +284,47 @@ type linkWriter struct {
 	alive func() bool
 }
 
+// Lanes, most urgent first. A writer waits while the socket is busy or while
+// anyone is queued at a more urgent lane, so it only ever waits behind the
+// frame currently on the wire plus more urgent traffic.
+//
+// Interactive sits between the two others for a reason: a streamed read is
+// what someone is looking at right now (a photo half drawn on screen), and
+// used to take turns with background sync chunks on the bulk lane - on a slow
+// link, one turn per chunk of a whole-file transfer. It is big frames, so it
+// still yields to control traffic and keepalives.
+const (
+	lanePriority = iota
+	laneInteractive
+	laneBulk
+	lanes
+)
+
 func newLinkWriter(c net.Conn) *linkWriter {
 	w := &linkWriter{c: c}
 	w.cond = sync.NewCond(&w.mu)
 	return w
 }
 
-// acquire takes the socket. A bulk writer waits while any priority writer is
-// queued; priority writers only wait for the chunk currently being written.
-func (w *linkWriter) acquire(priority bool) {
+// acquire takes the socket for a writer at the given lane.
+func (w *linkWriter) acquire(lane int) {
 	w.mu.Lock()
-	if priority {
-		w.waiting++
-	}
-	for w.busy || (!priority && w.waiting > 0) {
+	w.waiting[lane]++
+	for w.busy || w.moreUrgentWaiting(lane) {
 		w.cond.Wait()
 	}
-	if priority {
-		w.waiting--
-	}
+	w.waiting[lane]--
 	w.busy = true
 	w.mu.Unlock()
+}
+
+func (w *linkWriter) moreUrgentWaiting(lane int) bool {
+	for l := 0; l < lane; l++ {
+		if w.waiting[l] > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *linkWriter) release() {
@@ -309,8 +337,8 @@ func (w *linkWriter) release() {
 // writeTimeout bounds one attempt at a write. It is a var only for tests.
 var writeTimeout = 30 * time.Second
 
-func (w *linkWriter) writeWith(b []byte, priority bool) error {
-	w.acquire(priority)
+func (w *linkWriter) writeWith(b []byte, lane int) error {
+	w.acquire(lane)
 	defer w.release()
 	for {
 		if err := w.c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
@@ -344,8 +372,9 @@ func (w *linkWriter) writeWith(b []byte, priority bool) error {
 // HasFeature reports whether the peer advertised a feature.
 func (w *linkWriter) HasFeature(name string) bool { return slices.Contains(w.features, name) }
 
-func (w *linkWriter) Send(b []byte) error     { return w.writeWith(b, true) }
-func (w *linkWriter) SendBulk(b []byte) error { return w.writeWith(b, false) }
+func (w *linkWriter) Send(b []byte) error            { return w.writeWith(b, lanePriority) }
+func (w *linkWriter) SendInteractive(b []byte) error { return w.writeWith(b, laneInteractive) }
+func (w *linkWriter) SendBulk(b []byte) error        { return w.writeWith(b, laneBulk) }
 
 // New prepares the manager. No sockets are opened until Run.
 func New(cfg *config.Config, logger *slog.Logger) *Manager {

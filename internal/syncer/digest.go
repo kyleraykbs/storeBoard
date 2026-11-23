@@ -27,13 +27,15 @@ import (
 const featureDigest = "digest"
 
 // Features is what this engine advertises to peers (transport.FeatureHandler).
-func (e *Engine) Features() []string { return []string{featureDigest} }
+func (e *Engine) Features() []string { return []string{featureDigest, featureReadCancel} }
 
 var _ transport.FeatureHandler = (*Engine)(nil)
 
-func peerHasDigest(send transport.Sender) bool {
+func peerHasDigest(send transport.Sender) bool { return peerHasFeature(send, featureDigest) }
+
+func peerHasFeature(send transport.Sender, name string) bool {
 	fs, ok := send.(transport.FeatureSender)
-	return ok && fs.HasFeature(featureDigest)
+	return ok && fs.HasFeature(name)
 }
 
 func (e *Engine) peerSupportsDigest(peer string) bool {

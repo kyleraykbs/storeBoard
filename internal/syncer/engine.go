@@ -201,15 +201,22 @@ type Engine struct {
 	me      string
 	store   *store.Store
 
-	mu             sync.Mutex
-	stores         []*StoreState
-	byName         map[string]*StoreState
-	sends          map[string]transport.Sender
-	wants          map[string]map[string]*pending // wantKey -> slot -> want
-	incoming       map[string]*incomingBlob
-	reads          map[int64]chan readReply
-	readSeq        int64
-	holderRates    map[string]holderRate
+	mu          sync.Mutex
+	stores      []*StoreState
+	byName      map[string]*StoreState
+	sends       map[string]transport.Sender
+	wants       map[string]map[string]*pending // wantKey -> slot -> want
+	incoming    map[string]*incomingBlob
+	reads       map[int64]chan readReply
+	readSeq     int64
+	holderRates map[string]holderRate
+	// readGates bounds streamed reads in flight per holder (readgate.go).
+	readGates map[string]*readGate
+	// lastHeard is when each peer last sent a frame (*atomic.Int64 nanos).
+	lastHeard sync.Map
+	// readCancels are reads a reader gave up on, not to be served.
+	cancelMu       sync.Mutex
+	readCancels    map[cancelKey]time.Time
 	verified       map[string]verifiedFile
 	fullSent       map[string]fullIndexMark
 	pendingMu      sync.Mutex
@@ -452,6 +459,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		incoming:    map[string]*incomingBlob{},
 		reads:       map[int64]chan readReply{},
 		holderRates: map[string]holderRate{},
+		readGates:   map[string]*readGate{},
+		readCancels: map[cancelKey]time.Time{},
 		verified:    map[string]verifiedFile{},
 		fullSent:    map[string]fullIndexMark{},
 		pending:     map[string]*pendingFile{},
@@ -902,6 +911,8 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 		// Cheap and latency-sensitive: a reply goes straight to the read
 		// that is blocked on it, never behind a queue of store work.
 		e.deliverRead(&fr)
+	case "readCancel":
+		e.noteReadCancel(peer, fr.ID)
 	case "wantErr":
 		e.handleWantErr(peer, &fr)
 	case "blob", "blobEnd":
@@ -915,6 +926,9 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 // file manager. Frames are marshalled type-first, so a prefix check is enough
 // to leave every other frame alone without decoding it twice.
 func (e *Engine) OnPeerUrgent(peer string, line []byte) bool {
+	// Every frame off the link passes here first: it is the evidence a
+	// streamed read waits on that the holder is still sending (readStalled).
+	e.heard(peer)
 	for _, prefix := range urgentPrefixes {
 		if bytes.HasPrefix(line, prefix) {
 			var fr frame

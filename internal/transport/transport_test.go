@@ -339,3 +339,42 @@ func TestSlowReaderIsNotADeadLink(t *testing.T) {
 		})
 	}
 }
+
+// A streamed read's reply goes ahead of bulk sync chunks already waiting for
+// the socket, and control frames go ahead of both.
+func TestInteractiveLaneGoesBeforeBulk(t *testing.T) {
+	w := newLinkWriter(nil)
+	w.acquire(lanePriority) // the frame on the wire now
+	var mu sync.Mutex
+	var order []int
+	var wg sync.WaitGroup
+	queue := func(lane int) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.acquire(lane)
+			mu.Lock()
+			order = append(order, lane)
+			mu.Unlock()
+			w.release()
+		}()
+		deadline := time.Now().Add(time.Second)
+		for {
+			w.mu.Lock()
+			n := w.waiting[lane]
+			w.mu.Unlock()
+			if n > 0 || time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	queue(laneBulk)
+	queue(laneInteractive)
+	queue(lanePriority)
+	w.release()
+	wg.Wait()
+	if len(order) != 3 || order[0] != lanePriority || order[1] != laneInteractive || order[2] != laneBulk {
+		t.Fatalf("lanes served in order %v, want priority, interactive, bulk", order)
+	}
+}

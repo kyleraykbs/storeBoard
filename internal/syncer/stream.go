@@ -15,10 +15,13 @@ import (
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
 )
 
-// readTimeout bounds one ranged read. Without it a peer that stops answering
-// - a link replaced by the cross-dial tie-break, a holder that hung - leaves
-// the caller's read blocked forever: the image viewer shows a half-decoded
-// picture and the application gives up. Tests shorten it.
+// readTimeout is how long a ranged read waits on a holder that has gone
+// quiet - sent nothing at all - before giving up, and how long a read waits
+// for any holder to be connected. Without it a peer that stops answering (a
+// link replaced by the cross-dial tie-break, a holder that hung) leaves the
+// caller's read blocked forever. It is not a bound on a slow transfer: that
+// used to fail reads on a busy slow link, half way through a photo. Tests
+// shorten it.
 var readTimeout = 20 * time.Second
 
 // maxReadChunk bounds one ranged read. A FUSE read is at most a few hundred
@@ -91,6 +94,19 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 	if data, ok, err := f.e.readQueued(f.fs, entry.Blob, offset, length); ok {
 		return data, err
 	}
+	data, err := f.readRange(ctx, entry, offset, length)
+	if err != nil && ctx.Err() == nil {
+		// Said once per failed range: a read that fails is a photo drawn
+		// half way in someone's viewer, and it used to leave no trace.
+		f.e.logger.Warn("streamed read failed", "store", f.fs.name, "path", entry.Path, "offset", offset, "length", length, "error", err)
+	}
+	return data, err
+}
+
+func (f *streamFetcher) readRange(ctx context.Context, entry streamfs.Entry, offset, length int64) ([]byte, error) {
+	// The deadline bounds waiting for a holder to be there at all. A read
+	// that reached one is bounded by the holder going quiet instead
+	// (readStalled): a slow link is not a dead one.
 	deadline := time.Now().Add(readTimeout)
 	var firstErr error
 	for {
@@ -98,13 +114,7 @@ func (f *streamFetcher) ReadRange(ctx context.Context, entry streamfs.Entry, off
 		refused := 0
 		var refusal *holderRefusal
 		for _, peer := range peers {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				break
-			}
-			attemptCtx, cancel := context.WithTimeout(ctx, min(remaining, readTimeout/2))
-			data, err := f.e.readRangeFrom(attemptCtx, peer, f.fs, entry, offset, length)
-			cancel()
+			data, err := f.e.readRangeFrom(ctx, peer, f.fs, entry, offset, length)
 			if err == nil && int64(len(data)) != length {
 				err = fmt.Errorf("%s: holder %s returned %d of %d requested bytes", entry.Path, peer, len(data), length)
 			}
@@ -218,6 +228,12 @@ func (e *Engine) noteRead(peer string, n int, took time.Duration) {
 // readRangeFrom asks one peer for a window of one version and waits for its
 // answer.
 func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState, entry streamfs.Entry, offset, length int64) ([]byte, error) {
+	gate := e.readGateFor(peer)
+	if err := gate.acquire(ctx, func() bool { return streamfs.Urgent(ctx) }); err != nil {
+		return nil, err
+	}
+	defer gate.release()
+
 	ch := make(chan readReply, 1)
 	e.mu.Lock()
 	e.readSeq++
@@ -235,33 +251,27 @@ func (e *Engine) readRangeFrom(ctx context.Context, peer string, fs *StoreState,
 	if err := e.sendTo(peer, fr); err != nil {
 		return nil, err
 	}
-	var timer <-chan time.Time
-	if deadline, ok := ctx.Deadline(); ok {
-		d := time.Until(deadline)
-		if d <= 0 {
-			return nil, context.DeadlineExceeded
+	tick := time.NewTicker(min(time.Second, max(readTimeout/4, time.Millisecond)))
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			e.cancelRead(peer, fs.name, id)
+			return nil, ctx.Err()
+		case <-e.closed:
+			return nil, errors.New("engine closed")
+		case <-tick.C:
+			if e.readStalled(peer, start) {
+				e.cancelRead(peer, fs.name, id)
+				return nil, fmt.Errorf("%s: holder %s stopped answering", entry.Path, peer)
+			}
+		case r := <-ch:
+			if r.err != nil {
+				return nil, r.err
+			}
+			e.noteRead(peer, len(r.data), time.Since(start))
+			return r.data, nil
 		}
-		t := time.NewTimer(d)
-		defer t.Stop()
-		timer = t.C
-	} else {
-		t := time.NewTimer(readTimeout)
-		defer t.Stop()
-		timer = t.C
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-e.closed:
-		return nil, errors.New("engine closed")
-	case <-timer:
-		return nil, fmt.Errorf("%s: holder %s did not answer within read deadline", entry.Path, peer)
-	case r := <-ch:
-		if r.err != nil {
-			return nil, r.err
-		}
-		e.noteRead(peer, len(r.data), time.Since(start))
-		return r.data, nil
 	}
 }
 
@@ -290,6 +300,9 @@ const readWorkers = 8
 // handleRead serves one ranged read from this machine's copy: the content
 // store when it holds the blob, else the canonical file.
 func (e *Engine) handleRead(peer string, fr *frame) {
+	if e.readCancelled(peer, fr.ID) {
+		return // the reader gave up while this waited its turn
+	}
 	fs := e.byName[fr.Store]
 	if fs == nil || !validRel(fr.Path) || !e.storeSharedWith(fs, peer) {
 		e.replyReadErr(peer, fr, "", "unknown store or unsafe path")
@@ -343,7 +356,7 @@ func (e *Engine) handleRead(peer string, fr *frame) {
 		e.replyReadErr(peer, fr, "", fmt.Sprintf("short holder file: read %d of %d bytes (%v)", n, length, err))
 		return
 	}
-	if err := e.sendBulkTo(peer, frame{Type: "readData", ID: fr.ID, Store: fs.name, Path: fr.Path, Offset: fr.Offset, Data: buf}); err != nil {
+	if err := e.sendInteractiveTo(peer, frame{Type: "readData", ID: fr.ID, Store: fs.name, Path: fr.Path, Offset: fr.Offset, Data: buf}); err != nil {
 		e.logger.Debug("read reply", "peer", peer, "store", fs.name, "path", fr.Path, "error", err)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
+	"codeberg.org/kyleraykbs/storeboard/internal/transport"
 )
 
 type frame struct {
@@ -134,6 +135,26 @@ func (e *Engine) sendBulkTo(peer string, fr frame) error {
 	e.mu.Unlock()
 	if send == nil {
 		return fmt.Errorf("peer %q not connected", peer)
+	}
+	return send.SendBulk(b)
+}
+
+// sendInteractiveTo sends a frame someone is waiting on - a streamed read's
+// reply - ahead of bulk sync traffic where the link supports it.
+func (e *Engine) sendInteractiveTo(peer string, fr frame) error {
+	b, err := json.Marshal(fr)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	e.mu.Lock()
+	send := e.sends[peer]
+	e.mu.Unlock()
+	if send == nil {
+		return fmt.Errorf("peer %q not connected", peer)
+	}
+	if is, ok := send.(transport.InteractiveSender); ok {
+		return is.SendInteractive(b)
 	}
 	return send.SendBulk(b)
 }

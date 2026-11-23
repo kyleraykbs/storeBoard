@@ -7,7 +7,9 @@
 // there is no disk cache, because the point of a streamed store is that this
 // machine stores metadata and not photographs. An open handle keeps a small,
 // bounded in-memory readahead window so a sequential reader is not paced by
-// one network round trip per kernel request.
+// one network round trip per kernel request, and the mount keeps a bounded
+// in-memory cache of recent blocks so reopening a file does not fetch it
+// again.
 package streamfs
 
 import (
@@ -20,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -678,7 +681,7 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		}
 		return h, 0, 0
 	}
-	h.ra = newReadahead(f.fsys.fetcher, entry)
+	h.ra = newReadahead(f.fsys.fetcher, entry, f.fsys.cache)
 	return h, 0, 0
 }
 
@@ -819,11 +822,14 @@ type raBlock struct {
 	done chan struct{}
 	data []byte
 	err  error
+	// urgent is set once a reader waits on the block (see Urgent).
+	urgent atomic.Bool
 }
 
 type readahead struct {
 	fetcher Fetcher
 	entry   Entry
+	cache   *blockCache
 	ctx     context.Context
 	cancel  context.CancelFunc
 
@@ -833,9 +839,9 @@ type readahead struct {
 	ahead  int   // windows to fetch beyond the current read
 }
 
-func newReadahead(f Fetcher, entry Entry) *readahead {
+func newReadahead(f Fetcher, entry Entry, cache *blockCache) *readahead {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &readahead{fetcher: f, entry: entry, ctx: ctx, cancel: cancel, blocks: map[int64]*raBlock{}}
+	return &readahead{fetcher: f, entry: entry, cache: cache, ctx: ctx, cancel: cancel, blocks: map[int64]*raBlock{}}
 }
 
 func (r *readahead) close() { r.cancel() }
@@ -853,10 +859,18 @@ func (r *readahead) startLocked(k int64) *raBlock {
 	n := min(int64(raBlockSize), r.entry.Size-off)
 	b := &raBlock{done: make(chan struct{})}
 	r.blocks[k] = b
+	if data, ok := r.cache.get(r.entry.Blob, k); ok && int64(len(data)) == n {
+		b.data = data
+		close(b.done)
+		return b
+	}
 	go func() {
-		data, err := r.fetcher.ReadRange(r.ctx, r.entry, off, n)
+		data, err := r.fetcher.ReadRange(withUrgency(r.ctx, &b.urgent), r.entry, off, n)
 		if err == nil && int64(len(data)) != n {
 			err = io.ErrUnexpectedEOF
+		}
+		if err == nil {
+			r.cache.put(r.entry.Blob, k, data)
 		}
 		b.data, b.err = data, err
 		close(b.done)
@@ -885,7 +899,11 @@ func (r *readahead) read(ctx context.Context, dest []byte, off int64) (fuse.Read
 	}
 	needed := make([]*raBlock, 0, last-first+1)
 	for k := first; k <= last; k++ {
-		needed = append(needed, r.startLocked(k))
+		b := r.startLocked(k)
+		if b != nil {
+			b.urgent.Store(true)
+		}
+		needed = append(needed, b)
 	}
 	for k := last + 1; k <= last+int64(r.ahead); k++ {
 		r.startLocked(k)
@@ -973,12 +991,22 @@ type Options struct {
 	UID     uint32
 	GID     uint32
 	Space   func() (total, free uint64)
+	// CacheBytes bounds the in-memory block cache shared by every open
+	// file (0: the default; negative: none).
+	CacheBytes int64
 }
 
 // maxPendingInvalidations bounds the kernel invalidations waiting to be sent.
 // Past it, changes are left to expire on their own: entries are cached for a
 // second and attributes not at all, so an invalidation only speeds things up.
 const maxPendingInvalidations = 8192
+
+func cacheBytes(n int64) int64 {
+	if n == 0 {
+		return defaultCacheBytes
+	}
+	return n
+}
 
 // FS is one mounted streamed store.
 type FS struct {
@@ -988,6 +1016,7 @@ type FS struct {
 	uid        uint32
 	gid        uint32
 	space      func() (total, free uint64)
+	cache      *blockCache
 	server     *fuse.Server
 	mountpoint string
 
@@ -1013,6 +1042,7 @@ func Mount(mountpoint string, tree *Tree, opts Options) (*FS, error) {
 		uid:        opts.UID,
 		gid:        opts.GID,
 		space:      opts.Space,
+		cache:      newBlockCache(cacheBytes(opts.CacheBytes)),
 		mountpoint: mountpoint,
 		dirs:       map[string]*fs.Inode{},
 		inval:      map[string]struct{}{},
