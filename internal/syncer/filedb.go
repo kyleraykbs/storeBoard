@@ -1,9 +1,9 @@
 package syncer
 
 import (
-	"errors"
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"

@@ -3,6 +3,7 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,6 +63,43 @@ func TestCreditStallFallsBackToUnmetered(t *testing.T) {
 // play on - waited behind the upload for minutes. With a window, the read
 // gets through while the upload waits.
 func TestReadGetsThroughWhileReceiverIsBusy(t *testing.T) {
+	bigFile := func(t *testing.T, m *storeMutator) {
+		pf, err := m.Create("big.bin", 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunk := bytes.Repeat([]byte("v"), 1<<20)
+		for i := 0; i < 96; i++ {
+			if _, err := pf.WriteAt(chunk, int64(i)<<20); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := pf.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A node_modules tree: thousands of frames that are each far smaller
+	// than a chunk. The window is bytes; these must not fill the
+	// receiver's queue by count.
+	smallFiles := func(t *testing.T, m *storeMutator) {
+		for i := 0; i < 1500; i++ {
+			pf, err := m.Create(fmt.Sprintf("tiny-%04d.js", i), 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pf.WriteAt([]byte(fmt.Sprintf("module.exports = %d", i)), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := pf.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("one big file", func(t *testing.T) { readWhileReceiverBusy(t, bigFile) })
+	t.Run("many small files", func(t *testing.T) { readWhileReceiverBusy(t, smallFiles) })
+}
+
+func readWhileReceiverBusy(t *testing.T, upload func(*testing.T, *storeMutator)) {
 	epA, epB := twoEndpoints(t)
 	a := newNode(t, "a", "b", epA, epB, "", map[string]config.Store{"docs": {Group: "g"}})
 	b := newNode(t, "b", "a", epB, epA, "", map[string]config.Store{"docs": {Group: "g", Sync: config.SyncStream}})
@@ -90,20 +128,7 @@ func TestReadGetsThroughWhileReceiverIsBusy(t *testing.T) {
 	})
 
 	// An upload far larger than every buffer between the two.
-	m := &storeMutator{e: b.eng, fs: b.store("docs")}
-	pf, err := m.Create("big.bin", 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunk := bytes.Repeat([]byte("v"), 1<<20)
-	for i := 0; i < 96; i++ {
-		if _, err := pf.WriteAt(chunk, int64(i)<<20); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := pf.Close(); err != nil {
-		t.Fatal(err)
-	}
+	upload(t, &storeMutator{e: b.eng, fs: b.store("docs")})
 	waitFor(t, testWait, "the upload to reach the busy holder", func() bool { return stuck.Load() > 0 })
 	time.Sleep(time.Second) // let everything that will queue, queue
 
@@ -121,6 +146,7 @@ func TestReadGetsThroughWhileReceiverIsBusy(t *testing.T) {
 		done <- result{data, err}
 	}()
 	var data []byte
+	var err error
 	select {
 	case r := <-done:
 		data, err = r.data, r.err

@@ -309,7 +309,7 @@ type linkWriter struct {
 	// lastShared is the lane that had the last turn when interactive and
 	// bulk writers were both waiting.
 	lastShared int
-	c       net.Conn
+	c          net.Conn
 	// features is what the peer's hello advertised.
 	features []string
 	// alive reports that the peer has been heard from recently. A write

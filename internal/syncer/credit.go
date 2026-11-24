@@ -32,6 +32,21 @@ const featureBlobCredit = "blobcredit"
 // can always take them without making its read loop wait.
 const blobWindow = 8 << 20
 
+// creditMinFrame is what one frame costs at least. The window is bytes, and
+// a copy of a node_modules tree is tens of thousands of files of a few
+// hundred bytes: 8 MiB of those was thousands of frames, more than the
+// receiver's queue held, and its read loop waited again. Charging small
+// frames as this much bounds the frames in flight too (blobWindow /
+// creditMinFrame).
+const creditMinFrame = 4 << 10
+
+func frameCost(n int) int64 {
+	if n < creditMinFrame {
+		return creditMinFrame
+	}
+	return int64(n)
+}
+
 // creditBatch is how much a receiver acknowledges at once, unless its queue
 // just ran dry (then it says so at once: the sender may be waiting).
 const creditBatch = 1 << 20
@@ -126,7 +141,7 @@ func (e *Engine) sendBlobFrame(ctx context.Context, send transport.Sender, fr fr
 		return err
 	}
 	if peerHasFeature(send, featureBlobCredit) {
-		if err := e.creditFor(send).take(ctx, int64(len(b))); err != nil {
+		if err := e.creditFor(send).take(ctx, frameCost(len(b))); err != nil {
 			return err
 		}
 	}
@@ -157,7 +172,7 @@ func (e *Engine) gotCredit(peer string, n int64) {
 // bytes, and acknowledges once enough has built up or the queue is empty.
 func (e *Engine) returnCredit(peer string, size int, queueEmpty bool) {
 	e.creditMu.Lock()
-	e.owed[peer] += int64(size)
+	e.owed[peer] += frameCost(size)
 	owed := e.owed[peer]
 	if owed < creditBatch && !queueEmpty {
 		e.creditMu.Unlock()
@@ -172,4 +187,79 @@ func (e *Engine) returnCredit(peer string, size int, queueEmpty bool) {
 		return
 	}
 	_ = e.sendTo(peer, frame{Type: "blobCredit", Length: owed})
+}
+
+// peerMetered reports whether a peer's current link keeps a blob window.
+func (e *Engine) peerMetered(peer string) bool {
+	e.mu.Lock()
+	send := e.sends[peer]
+	e.mu.Unlock()
+	return send != nil && peerHasFeature(send, featureBlobCredit)
+}
+
+// blobQueue is one blob worker's backlog. Its length is bounded by the
+// senders' windows for peers that keep one, and by blobFrameQueue (waiting
+// for room) for those that do not.
+type blobQueue struct {
+	mu     sync.Mutex
+	items  []peerFrame
+	notify chan struct{} // a frame arrived
+	space  chan struct{} // a frame left
+}
+
+func newBlobQueue() *blobQueue {
+	return &blobQueue{notify: make(chan struct{}, 1), space: make(chan struct{}, 1)}
+}
+
+func (q *blobQueue) push(pf peerFrame, bounded bool, closed <-chan struct{}) {
+	for {
+		q.mu.Lock()
+		if !bounded || len(q.items) < blobFrameQueue {
+			q.items = append(q.items, pf)
+			q.mu.Unlock()
+			select {
+			case q.notify <- struct{}{}:
+			default:
+			}
+			return
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.space:
+		case <-closed:
+			return
+		}
+	}
+}
+
+func (q *blobQueue) pop(closed <-chan struct{}) (peerFrame, bool) {
+	for {
+		q.mu.Lock()
+		if len(q.items) > 0 {
+			pf := q.items[0]
+			q.items[0] = peerFrame{}
+			q.items = q.items[1:]
+			if len(q.items) == 0 {
+				q.items = nil
+			}
+			q.mu.Unlock()
+			select {
+			case q.space <- struct{}{}:
+			default:
+			}
+			return pf, true
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.notify:
+		case <-closed:
+			return peerFrame{}, false
+		}
+	}
+}
+
+func (q *blobQueue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
 }

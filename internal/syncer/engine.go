@@ -251,7 +251,7 @@ type Engine struct {
 	// raced every test that turned one.
 	scanEvery, linkEvery, indexEvery, pruneEvery time.Duration
 
-	blobFrames [blobShards]chan peerFrame
+	blobFrames [blobShards]*blobQueue
 	// Blob flow control (credit.go): what this side may still send per
 	// link, and what it owes each peer in acknowledgements.
 	creditMu sync.Mutex
@@ -424,7 +424,7 @@ func (e *Engine) startFrameWorkers() {
 		e.opsFrames = make(map[string]*frameQueue, len(e.stores))
 		e.readFrames = make(map[string]*frameQueue, len(e.stores))
 		for i := range e.blobFrames {
-			e.blobFrames[i] = make(chan peerFrame, blobFrameQueue)
+			e.blobFrames[i] = newBlobQueue()
 		}
 		e.frameWG.Add(1 + blobShards + 4*len(e.stores))
 		go func() {
@@ -502,27 +502,26 @@ func (e *Engine) startFrameWorkers() {
 				}()
 			})
 		}
-		for _, ch := range e.blobFrames {
-			go func(ch chan peerFrame) {
+		for _, q := range e.blobFrames {
+			go func(q *blobQueue) {
 				defer e.frameWG.Done()
 				for {
-					select {
-					case <-e.closed:
+					pf, ok := q.pop(e.closed)
+					if !ok {
 						return
-					case pf := <-ch:
-						if hook := blobWorkHook.Load(); hook != nil {
-							(*hook)(e, pf)
-						}
-						switch pf.fr.Type {
-						case "blob":
-							e.handleBlob(pf.peer, &pf.fr)
-						case "blobEnd":
-							e.handleBlobEnd(pf.peer, &pf.fr)
-						}
-						e.returnCredit(pf.peer, pf.size, len(ch) == 0)
 					}
+					if hook := blobWorkHook.Load(); hook != nil {
+						(*hook)(e, pf)
+					}
+					switch pf.fr.Type {
+					case "blob":
+						e.handleBlob(pf.peer, &pf.fr)
+					case "blobEnd":
+						e.handleBlobEnd(pf.peer, &pf.fr)
+					}
+					e.returnCredit(pf.peer, pf.size, q.len() == 0)
 				}
-			}(ch)
+			}(q)
 		}
 	})
 }
@@ -556,12 +555,12 @@ func (e *Engine) enqueueFrame(q *frameQueue, pf peerFrame) {
 	}
 }
 
-// enqueueBlob queues a blob chunk, waiting for room: see the dispatch notes.
-func (e *Engine) enqueueBlob(ch chan peerFrame, pf peerFrame) {
-	select {
-	case ch <- pf:
-	case <-e.closed:
-	}
+// enqueueBlob queues a blob chunk. A peer that keeps a blob window is never
+// waited on - the window bounds what it can have queued - so the link's read
+// loop goes on reading; an older peer waits for room (see the dispatch
+// notes).
+func (e *Engine) enqueueBlob(q *blobQueue, pf peerFrame, metered bool) {
+	q.push(pf, !metered, e.closed)
 }
 
 // StopFrames makes frame callbacks return immediately and stops queued sync
@@ -1182,7 +1181,7 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	case "readCancel":
 		e.noteReadCancel(peer, fr.ID)
 	case "blob", "blobEnd":
-		e.enqueueBlob(e.blobFrames[blobShard(peer, &fr)], pf)
+		e.enqueueBlob(e.blobFrames[blobShard(peer, &fr)], pf, e.peerMetered(peer))
 	case "blobCredit":
 		e.gotCredit(peer, fr.Length)
 	}
