@@ -193,6 +193,34 @@ func (c *Config) BackupFor(store string) (bool, time.Duration, error) {
 	return true, keep, nil
 }
 
+// Trash is how long deleted and replaced files stay in <dataDir>/trash
+// before they are expired, counted from when they arrived there.
+type Trash struct {
+	// Keep is a duration with h/d/w/y units ("1w", "30d"). Empty follows
+	// the backup window, or one year without backup.
+	Keep string `json:"keep,omitempty"`
+}
+
+// TrashKeep is the trash window: trash.keep when set, else the backup
+// window, else the default year.
+func (c *Config) TrashKeep() (time.Duration, error) {
+	if c.Trash != nil && c.Trash.Keep != "" {
+		d, err := ParseKeep(c.Trash.Keep)
+		if err != nil {
+			return 0, fmt.Errorf("trash keep: %w", err)
+		}
+		return d, nil
+	}
+	if c.Backup != nil && c.Backup.Enable {
+		d, err := ParseKeep(c.Backup.Keep)
+		if err != nil {
+			return 0, fmt.Errorf("backup keep: %w", err)
+		}
+		return d, nil
+	}
+	return DefaultKeep, nil
+}
+
 // StreamPolicy is how a `remote` store behaves when no holder answers.
 type StreamPolicy string
 
@@ -260,6 +288,10 @@ type Config struct {
 	// Backup, per machine, keeps a thinned history of every file's versions.
 	// A store that is streamed on this machine keeps none.
 	Backup *Backup `json:"backup,omitempty"`
+
+	// Trash, per machine, sets how long the trash keeps what deletes and
+	// overwrites left behind.
+	Trash *Trash `json:"trash,omitempty"`
 
 	// Permissions overrides, per store on THIS machine, the ownership and
 	// mode the daemon gives the store's entries.
@@ -675,6 +707,10 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("backup stores: unknown store %q", store)
 			}
 		}
+	}
+
+	if _, err := c.TrashKeep(); err != nil {
+		return err
 	}
 
 	for store, p := range c.Permissions {

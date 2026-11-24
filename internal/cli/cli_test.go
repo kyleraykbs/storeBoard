@@ -577,3 +577,45 @@ func TestDoctor(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// The explicit cleanups send what was asked, and without --yes or a terminal
+// to ask on they stop after showing the plan.
+func TestCleanupKinds(t *testing.T) {
+	path, bodies := fakeDaemon(t)
+	run := func(args ...string) error {
+		var o, e bytes.Buffer
+		return Run(context.Background(), args, path, &o, &e)
+	}
+	// The fake daemon answers like an old one, which knows no kinds: the
+	// CLI must not take its routine cleanup for what it asked.
+	if err := run("cleanup", "trash", "Videos", "--older-than", "1w", "--yes"); err == nil {
+		t.Fatal("an old daemon's routine cleanup was reported as a trash cleanup")
+	}
+	b, _ := bodies("/v1/cleanup")
+	var req api.CleanupRequest
+	if err := json.Unmarshal(b, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.What != "trash" || len(req.Stores) != 1 || req.Stores[0] != "Videos" || req.OlderThan != "1w" || req.DryRun {
+		t.Fatalf("body = %s", b)
+	}
+
+	_ = run("cleanup", "history", "Projects", "--current", "--dry-run")
+	b, _ = bodies("/v1/cleanup")
+	req = api.CleanupRequest{}
+	_ = json.Unmarshal(b, &req)
+	if req.What != "history" || !req.Current || !req.DryRun {
+		t.Fatalf("body = %s", b)
+	}
+
+	for _, args := range [][]string{
+		{"cleanup", "everything"},
+		{"cleanup", "--dry-run"},
+		{"cleanup", "Videos"},
+		{"cleanup", "orphans", "--bogus"},
+	} {
+		if err := run(args...); !errors.Is(err, ErrHandled) {
+			t.Errorf("%v: err = %v, want a usage error", args, err)
+		}
+	}
+}

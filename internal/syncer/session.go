@@ -1543,11 +1543,15 @@ func (e *Engine) applyDelete(fs *StoreState, loc *Entry) error {
 	}
 	trash := filepath.Join(e.dataDir, "trash", fs.name)
 	dst := filepath.Join(trash, loc.Path)
+	e.trashMu.RLock()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		e.trashMu.RUnlock()
 		return err
 	}
 	dst = freeTrashName(dst)
-	if err := moveOrCopy(src, dst, info.Mode()); err != nil {
+	err = moveOrCopy(src, dst, info.Mode())
+	e.trashMu.RUnlock()
+	if err != nil {
 		return err
 	}
 	if info.Mode().IsRegular() {

@@ -31,6 +31,7 @@ func (e *Engine) Space() api.Space {
 		add(filepath.Join(e.dataDir, "journal", id+".ndjson"), "journal/"+id, false)
 		add(filepath.Join(e.dataDir, "history", id+".ndjson"), "history/"+id, false)
 		add(filepath.Join(e.dataDir, "trash", id), "trash/"+id, false)
+		add(queueBytesDir(e.dataDir, id), "queue/"+id, false)
 	}
 	var total int64
 	for _, ent := range entries {
@@ -89,24 +90,37 @@ func max64(a, b int64) int64 {
 
 func (e *Engine) orphanStoreIDs() []string {
 	seen := map[string]bool{}
-	for _, dir := range []string{filepath.Join(e.dataDir, "journal"), e.cfg.Root} {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
+	note := func(id string) {
+		if !validStoreName(id) {
+			return
 		}
+		if _, ok := e.byName[id]; !ok {
+			seen[id] = true
+		}
+	}
+	// Logs name a store by <id>.ndjson; trash and queue by a directory.
+	for _, sub := range []string{"journal", "history", "queue"} {
+		entries, _ := os.ReadDir(filepath.Join(e.dataDir, sub))
 		for _, ent := range entries {
-			id := ent.Name()
-			if dir == filepath.Join(e.dataDir, "journal") {
-				if !strings.HasSuffix(id, ".ndjson") {
-					continue
-				}
-				id = strings.TrimSuffix(id, ".ndjson")
-			} else if !ent.IsDir() || strings.HasPrefix(id, ".") {
-				continue
+			if id, ok := strings.CutSuffix(ent.Name(), ".ndjson"); ok && !ent.IsDir() {
+				note(id)
 			}
-			if _, ok := e.byName[id]; !ok {
-				seen[id] = true
+		}
+	}
+	for _, sub := range []string{"trash", "queue"} {
+		entries, _ := os.ReadDir(filepath.Join(e.dataDir, sub))
+		for _, ent := range entries {
+			if ent.IsDir() {
+				note(ent.Name())
 			}
+		}
+	}
+	// A folder under the root the config does not name: a leftover store,
+	// or something the user put there.
+	entries, _ := os.ReadDir(e.cfg.Root)
+	for _, ent := range entries {
+		if ent.IsDir() && !strings.HasPrefix(ent.Name(), ".") {
+			note(ent.Name())
 		}
 	}
 	ids := make([]string, 0, len(seen))

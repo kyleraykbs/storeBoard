@@ -220,15 +220,55 @@ type Space struct {
 	Entries    []SpaceEntry `json:"entries"`
 }
 
+// CleanupRequest selects what an explicit cleanup removes. An empty What is
+// routine cleanup: retention expiry and collection, what the daemon's timers
+// do anyway.
+type CleanupRequest struct {
+	// What is "", "trash", "history" or "orphans".
+	What string `json:"what,omitempty"`
+	// Stores limits trash and history to these stores (none: every store
+	// the caller owns) and names the orphans to forget (none: all of them).
+	Stores []string `json:"stores,omitempty"`
+	// OlderThan, a duration with h/d/w/y units, limits trash and history to
+	// what is older than that.
+	OlderThan string `json:"olderThan,omitempty"`
+	// Current, for history, also drops each file's current version - the
+	// backup copy of the file as it is now.
+	Current bool `json:"current,omitempty"`
+	// Force, for orphans, forgets a store whose queue still holds unsent
+	// writes.
+	Force bool `json:"force,omitempty"`
+	// DryRun reports what would go and changes nothing.
+	DryRun bool `json:"dryRun,omitempty"`
+	// RemoveOrphans is the old flag; it is refused (use What "orphans").
+	RemoveOrphans bool `json:"removeOrphans,omitempty"`
+}
+
+// CleanupItem is what a cleanup did, or would do, to one store.
+type CleanupItem struct {
+	Store string `json:"store"`
+	What  string `json:"what"`
+	// Files is trash files, history versions, or orphan data files.
+	Files int `json:"files"`
+	// Bytes is what goes directly (trash files, orphan logs); blobs freed
+	// as a result are counted in the result's Blobs.
+	Bytes int64  `json:"bytes"`
+	Note  string `json:"note,omitempty"`
+}
+
 // CleanupResult reports what an explicit cleanup removed.
 type CleanupResult struct {
-	APIVersion   int      `json:"apiVersion"`
-	TrashFiles   int      `json:"trashFiles"`
-	TrashBytes   int64    `json:"trashBytes"`
-	OrphanStores []string `json:"orphanStores"`
-	OrphanBytes  int64    `json:"orphanBytes"`
-	Blobs        int      `json:"blobs"`
-	BlobBytes    int64    `json:"blobBytes"`
+	APIVersion   int           `json:"apiVersion"`
+	What         string        `json:"what,omitempty"`
+	DryRun       bool          `json:"dryRun,omitempty"`
+	Items        []CleanupItem `json:"items,omitempty"`
+	TrashFiles   int           `json:"trashFiles"`
+	TrashBytes   int64         `json:"trashBytes"`
+	Versions     int           `json:"versions,omitempty"`
+	OrphanStores []string      `json:"orphanStores"`
+	OrphanBytes  int64         `json:"orphanBytes"`
+	Blobs        int           `json:"blobs"`
+	BlobBytes    int64         `json:"blobBytes"`
 }
 
 // BrowseEntry is one child of a directory in a store, as the journal knows

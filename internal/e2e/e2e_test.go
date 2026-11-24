@@ -944,15 +944,23 @@ func TestSpaceAndCleanupAgainstLivePair(t *testing.T) {
 	if _, err := os.Stat(orpRoot); err != nil {
 		t.Fatalf("cleanup removed an orphan by default: %v", err)
 	}
-	// --remove-orphans is not implemented, and says so instead of quietly
-	// running an ordinary cleanup: the flag fails and nothing is touched.
+	// The old --remove-orphans flag fails and points at the new verb, and a
+	// dry run of that verb lists the orphan without touching it.
 	cli, _ := binaries(t)
 	out, err := exec.Command(cli, "-config", a.cfgPath, "cleanup", "--remove-orphans", "--json").CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "not implemented") {
-		t.Fatalf("cleanup --remove-orphans = %v:\n%s\nwant an explicit not-implemented failure", err, out)
+	if err == nil || !strings.Contains(string(out), "cleanup orphans") {
+		t.Fatalf("cleanup --remove-orphans = %v:\n%s\nwant a pointer to `cleanup orphans`", err, out)
+	}
+	out, err = exec.Command(cli, "-config", a.cfgPath, "cleanup", "orphans", "--dry-run").CombinedOutput()
+	if os.Getuid() != 0 {
+		if err == nil || !strings.Contains(string(out), "needs root") {
+			t.Fatalf("cleanup orphans as a user = %v:\n%s\nwant a root-only refusal", err, out)
+		}
+	} else if err != nil || !strings.Contains(string(out), "old-store") {
+		t.Fatalf("cleanup orphans --dry-run = %v:\n%s", err, out)
 	}
 	if _, err := os.Stat(orpRoot); err != nil {
-		t.Fatalf("cleanup deleted orphan data even though deletion is unimplemented: %v", err)
+		t.Fatalf("cleanup deleted orphan data: %v", err)
 	}
 }
 

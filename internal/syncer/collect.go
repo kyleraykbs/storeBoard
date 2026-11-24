@@ -35,7 +35,12 @@ var recentBlob = 10 * time.Minute
 // the single judgement both the startup collector and the on-demand cleanup
 // command share, so `storeboard cleanup` can never free something the engine
 // would have kept.
-func (e *Engine) keepSet() (map[string]bool, error) {
+func (e *Engine) keepSet() (map[string]bool, error) { return e.keepSetFor(nil) }
+
+// keepSetFor is keepSet as it will be once an explicit cleanup's plan is
+// applied: the versions it drops and the orphan logs it removes no longer
+// count. A nil plan is the store as it is.
+func (e *Engine) keepSetFor(plan *cleanupPlan) (map[string]bool, error) {
 	keep := map[string]bool{}
 
 	// Every retained version needs its bytes: that is the whole point of the
@@ -44,8 +49,21 @@ func (e *Engine) keepSet() (map[string]bool, error) {
 		if fs.hist == nil {
 			continue
 		}
+		drops := plan.dropsHistory(fs.name)
 		for _, path := range fs.hist.Paths() {
-			for _, v := range fs.hist.Versions(path) {
+			versions := fs.hist.Versions(path) // newest first
+			var mask []bool
+			if drops {
+				chrono := make([]Version, len(versions))
+				for i, v := range versions {
+					chrono[len(versions)-1-i] = v
+				}
+				mask = dropMask(chrono, plan.cutoff, plan.current)
+			}
+			for i, v := range versions {
+				if mask != nil && mask[len(versions)-1-i] {
+					continue
+				}
 				if v.Blob != "" {
 					keep[v.Blob] = true
 				}
@@ -79,6 +97,9 @@ func (e *Engine) keepSet() (map[string]bool, error) {
 			if _, loaded := e.byName[store]; loaded {
 				continue
 			}
+			if plan != nil && plan.orphans[store] {
+				continue
+			}
 			if err := refsFromJournal(filepath.Join(journalDir, name), keep); err != nil {
 				return nil, fmt.Errorf("collector: cannot read a journal; keeping everything: %w", err)
 			}
@@ -95,7 +116,17 @@ func (e *Engine) keepSet() (map[string]bool, error) {
 			if filepath.Ext(name) != ".ndjson" {
 				continue
 			}
-			if err := refsFromHistory(filepath.Join(historyDir, name), keep); err != nil {
+			store := name[:len(name)-len(".ndjson")]
+			if plan != nil && plan.orphans[store] {
+				continue
+			}
+			var err error
+			if plan.dropsHistory(store) {
+				err = refsFromHistoryPlanned(filepath.Join(historyDir, name), keep, plan)
+			} else {
+				err = refsFromHistory(filepath.Join(historyDir, name), keep)
+			}
+			if err != nil {
 				return nil, fmt.Errorf("collector: cannot read a history; keeping everything: %w", err)
 			}
 		}
@@ -613,37 +644,24 @@ func (e *Engine) Versions(name, path string) (api.Versions, error) {
 	return out, nil
 }
 
-// pruneTrash applies the same deadline to what deletes left behind: a file in
-// <dataDir>/trash/<store>/ is content the store once held, and it lives
-// exactly as long as the retention window allows, counted from when it was
-// deleted (trashTime), not from its own mtime: an old photo deleted today
-// used to be purged at the next prune. History is the longer-lived safety net:
-// with backup on, the deletion record and its blob outlive the trash copy.
+// pruneTrash expires what deletes left behind: a file in
+// <dataDir>/trash/<store>/ lives for the trash window (trash.keep), counted
+// from when it was deleted (trashTime), not from its own mtime: an old photo
+// deleted today used to be purged at the next prune. History is the
+// longer-lived safety net: with backup on, the deletion record and its blob
+// outlive the trash copy.
 func (e *Engine) pruneTrash(fs *StoreState, now time.Time) {
-	trash := filepath.Join(e.dataDir, "trash", fs.name)
-	keep := fs.keepWindow()
-	var dropped int
-	err := filepath.WalkDir(trash, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		fi, serr := d.Info()
-		if serr != nil || now.Sub(trashTime(fi)) <= keep {
-			return nil
-		}
-		if os.Remove(path) == nil {
-			dropped++
-		}
-		return nil
-	})
-	if err != nil || dropped == 0 {
-		return
+	files, _ := e.emptyTrash(fs.name, now.Add(-fs.trashWindow()), false)
+	if files > 0 {
+		e.logger.Info("pruned the trash", "store", fs.name, "files", files)
 	}
-	e.logger.Info("pruned the trash", "store", fs.name, "files", dropped)
 }
 
-// keepWindow is the retention window this store runs under.
-func (fs *StoreState) keepWindow() time.Duration {
+// trashWindow is how long this store's trash keeps a file.
+func (fs *StoreState) trashWindow() time.Duration {
+	if fs.trashKeep > 0 {
+		return fs.trashKeep
+	}
 	if fs.hist != nil && fs.hist.keep > 0 {
 		return fs.hist.keep
 	}

@@ -152,8 +152,24 @@ that holds the content, which is what lets one declaration be right everywhere.
 
 A startup collector frees content that nothing references — never a journal's,
 a kept version's, an orphan journal's, or a recent write's — and refuses to run
-at all when a reference source cannot be read. The trash ages out under the
-same window.
+at all when a reference source cannot be read. The trash ages out after
+`trash.keep` ("1w", "30d"; unset follows `backup.keep`), counted from when a
+file got there.
+
+Freeing space by hand is `storeboard cleanup`. Plain, it does what the timers
+do (expiry by the windows, then collection). The explicit kinds show what they
+would remove, and how much content that leaves unreferenced, then ask:
+
+    storeboard cleanup trash Videos                # empty a store's trash now
+    storeboard cleanup trash --older-than 2w       # every store you own
+    storeboard cleanup history Projects            # old versions only
+    storeboard cleanup history Projects --current  # and the backup copy of each file as it is now
+    sudo storeboard cleanup orphans                # forget stores no longer in the config
+
+`--dry-run` only shows; `--yes` skips the question. Forgetting a store removes
+what storeboard keeps for it (journal, history, trash, queue) and leaves its
+folder under the root to you; it refuses while the store still has unsent
+writes queued, unless `--force`.
 
     storeboard backup list photos "Screenshots/old.png"
     storeboard backup restore photos "Screenshots/old.png" --at 2026-09-01T10:00:00Z

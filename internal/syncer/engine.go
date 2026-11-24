@@ -115,8 +115,10 @@ type StoreState struct {
 	queueMu sync.Mutex
 	qx      queueExtra // queue.go
 
-	db        *FileDB
-	hist      *History
+	db   *FileDB
+	hist *History
+	// trashKeep is how long the trash keeps a file (config trash.keep).
+	trashKeep time.Duration
 	conflicts int
 	lastScan  time.Time
 
@@ -223,7 +225,11 @@ type Engine struct {
 	// lastHeard is when each peer last sent a frame (*atomic.Int64 nanos).
 	lastHeard sync.Map
 	// readCancels are reads a reader gave up on, not to be served.
-	cancelMu       sync.Mutex
+	cancelMu sync.Mutex
+	// trashMu: moving a file into the trash holds it shared (make the
+	// directory, move in); an explicit cleanup removing emptied
+	// directories holds it exclusively.
+	trashMu        sync.RWMutex
 	readCancels    map[cancelKey]time.Time
 	verified       map[string]verifiedFile
 	fullSent       map[string]fullIndexMark
@@ -618,6 +624,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 				unstream = true
 			}
 		}
+		trashKeep, terr := cfg.TrashKeep()
+		if terr != nil {
+			return nil, terr
+		}
 		var hist *History
 		on, keep, herr := cfg.BackupFor(v.ID)
 		if herr != nil {
@@ -652,6 +662,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			state:     state,
 			db:        db,
 			hist:      hist,
+			trashKeep: trashKeep,
 			perm:      noPerms(),
 			published: api.StoreSync{
 				Store:       v.ID,

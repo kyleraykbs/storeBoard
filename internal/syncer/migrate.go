@@ -536,14 +536,21 @@ func (e *Engine) settle(ctx context.Context, fs *StoreState, it *migItem) bool {
 
 func (e *Engine) retireStaged(fs *StoreState, it *migItem, src, why string) bool {
 	dst := filepath.Join(e.dataDir, "trash", fs.name, filepath.FromSlash(it.Path))
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return false
-	}
 	info, err := os.Lstat(src)
 	if err != nil {
 		return os.IsNotExist(err)
 	}
-	if err := moveOrCopy(src, dst, info.Mode()); err != nil {
+	e.trashMu.RLock()
+	err = os.MkdirAll(filepath.Dir(dst), 0o700)
+	if err == nil {
+		err = moveOrCopy(src, dst, info.Mode())
+	}
+	e.trashMu.RUnlock()
+	if err == nil && info.Mode().IsRegular() {
+		// Its time in the trash starts now (trashTime), as for a delete.
+		_ = os.Chtimes(dst, time.Now(), info.ModTime())
+	}
+	if err != nil {
 		e.logger.Warn("retire a staged file", "store", fs.name, "path", it.Path, "error", err)
 		return false
 	}

@@ -244,28 +244,34 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.engine.Doctor(s.transport.Snapshot()))
 }
 
-// handleCleanup runs expiry and content collection, then unconfigured store
-// data only with remove-orphans. POST-only: nothing in GET may mutate state.
+// handleCleanup runs a cleanup. POST-only: nothing in GET may mutate state.
+// Routine cleanup (an empty "what") repeats what the daemon's timers do and
+// is anyone's to ask for; the engine authorizes the rest per store.
 func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	// Any local caller may ask: cleanup repeats exactly what the daemon already
-	// does on its own schedule (hourly trash expiry, collection at startup), so
-	// it grants nothing a timer would not. Orphan store data is never removed.
-	if _, ok := requestUID(r); !ok {
+	uid, ok := requestUID(r)
+	if !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
 		return
 	}
-	var req struct {
-		RemoveOrphans bool `json:"removeOrphans"`
-	}
+	var req api.CleanupRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.engine.Cleanup(req.RemoveOrphans))
+	if req.RemoveOrphans {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": `removeOrphans is gone: ask for what "orphans"`})
+		return
+	}
+	res, err := s.engine.RunCleanup(req, uid)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleStore serves the store verbs:

@@ -136,6 +136,7 @@ in
       stores
       permissions
       backup
+      trash
       ;
   };
 

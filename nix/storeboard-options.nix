@@ -178,6 +178,25 @@ rec {
     '';
   };
 
+  trash = lib.mkOption {
+    type = lib.types.nullOr (
+      lib.types.submodule {
+        options.keep = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "1w";
+          description = ''
+            How long a deleted or replaced file stays in the trash, counted
+            from when it got there: a duration with h/d/w/y units. Null
+            follows backup.keep, or one year without backup.
+          '';
+        };
+      }
+    );
+    default = null;
+    description = "Trash retention for this machine's stores.";
+  };
+
   # One Permissions block, shared by the group default, the store
   # declaration and the per-machine override, so they cannot drift apart.
   permSubmodule = lib.types.submodule {
@@ -273,6 +292,9 @@ rec {
         { enable = cfg.backup.enable; }
         // lib.optionalAttrs (cfg.backup.keep != null) { keep = cfg.backup.keep; }
         // lib.optionalAttrs (cfg.backup.stores != { }) { stores = cfg.backup.stores; };
+    }
+    // lib.optionalAttrs (cfg ? trash && cfg.trash != null && cfg.trash.keep != null) {
+      trash = { keep = cfg.trash.keep; };
     };
   checkedConfig =
     package: cfg: name:

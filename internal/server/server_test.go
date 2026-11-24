@@ -309,15 +309,26 @@ func TestCleanupRemoveOrphansNeedsConfirmation(t *testing.T) {
 	client := unixClient(cfg)
 	waitServer(t, client)
 
-	var cleanup api.CleanupResult
-	postJSON(t, client, "http://storeboard/v1/cleanup", map[string]any{"removeOrphans": true}, &cleanup)
-	if !fileExists(orphanRoot) {
-		t.Fatal("cleanup removed orphan data even though orphan deletion is not implemented")
-	}
-	if len(cleanup.OrphanStores) == 0 {
-		t.Fatal("cleanup did not report the preserved orphan")
+	// The old flag is refused outright, and forgetting an orphan needs
+	// root; either way nothing is removed.
+	for _, body := range []string{`{"removeOrphans":true}`, `{"what":"orphans","stores":["photos-old"]}`} {
+		if os.Getuid() == 0 && strings.Contains(body, "orphans") {
+			continue
+		}
+		resp, err := client.Post("http://storeboard/v1/cleanup", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status %d, want 400", body, resp.StatusCode)
+		}
+		if !fileExists(orphanRoot) {
+			t.Fatalf("%s removed orphan data", body)
+		}
 	}
 }
+
 func TestCleanupRejectsGet(t *testing.T) {
 	cfg := testConfig(t)
 	srv, err := New(cfg, nil)

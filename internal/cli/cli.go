@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -41,8 +42,18 @@ Commands:
                   where it is); a name already taken is parked, not lost
   space           show how much disk each data category and each
                   unconfigured store uses
-  cleanup         expire trash and history, collect redundant blobs; data
-                  of unconfigured stores is reported, never deleted
+  cleanup         routine cleanup: expire trash and history by their
+                  windows, collect content nothing references
+  cleanup trash [STORE...] [--older-than DUR]
+                  empty the trash now (all of it, or what is older)
+  cleanup history [STORE...] [--older-than DUR] [--current]
+                  drop recorded versions; --current also drops the backup
+                  copy of each file as it is now
+  cleanup orphans [STORE...] [--force]
+                  forget stores no longer in the config (root only); their
+                  folders under the root are left for you
+                  These three show what would go and ask first; --dry-run
+                  only shows, --yes skips the question.
   status          show the daemon's status document
   doctor          check the daemon over and explain anything wrong:
                   mounts, queues, peers, clocks, disk, stalled transfers
@@ -342,46 +353,133 @@ func spaceCmd(ctx context.Context, configPath string, args []string, stdout, std
 	return nil
 }
 
-// cleanupCmd runs expiry, pruning and blob collection. Orphaned store data
-// is reported and never destroyed: the engine does not implement removing it
-// (it cannot tell a retired store from an unplugged disk or a renamed one).
+// cleanupCmd runs routine cleanup, or one of the explicit ones. An explicit
+// cleanup is planned first (a dry run at the daemon) and shown, then asked
+// about, unless --yes or --dry-run says otherwise.
 func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	jsonOut := false
-	for _, arg := range args {
-		switch arg {
-		case "--remove-orphans":
-			// Once suggested by this command's own output and silently
-			// ignored by the daemon. Saying so is the honest answer.
-			fmt.Fprintln(stderr, "storeboard: cleanup: --remove-orphans is not implemented; orphaned store data is only reported. Delete it by hand once you are sure the store is gone (storeboard space lists where it is)")
-			return ErrHandled
-		case "--json":
-			jsonOut = true
-		case "-h", "--help":
-			fmt.Fprintln(stderr, "storeboard: usage: storeboard cleanup [--json]")
-			return ErrHandled
+	const use = "usage: storeboard cleanup [trash|history|orphans] [STORE...] [--older-than DUR] [--current] [--force] [--dry-run] [--yes] [--json]"
+	var req api.CleanupRequest
+	jsonOut, yes := false, false
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "trash", "history", "orphans":
+			req.What = args[0]
+			args = args[1:]
 		default:
-			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n", arg)
+			fmt.Fprintf(stderr, "storeboard: cleanup: unknown kind %q: want trash, history or orphans\n", args[0])
 			return ErrHandled
 		}
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--remove-orphans":
+			fmt.Fprintln(stderr, "storeboard: cleanup: --remove-orphans is gone; use `storeboard cleanup orphans`")
+			return ErrHandled
+		case arg == "--json":
+			jsonOut = true
+		case arg == "--yes" || arg == "-y":
+			yes = true
+		case arg == "--dry-run" || arg == "-n":
+			req.DryRun = true
+		case arg == "--current":
+			req.Current = true
+		case arg == "--force":
+			req.Force = true
+		case arg == "--older-than" && i+1 < len(args):
+			i++
+			req.OlderThan = args[i]
+		case strings.HasPrefix(arg, "--older-than="):
+			req.OlderThan = strings.TrimPrefix(arg, "--older-than=")
+		case arg == "-h" || arg == "--help":
+			fmt.Fprintln(stderr, use)
+			return ErrHandled
+		case strings.HasPrefix(arg, "-"):
+			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n%s\n", arg, use)
+			return ErrHandled
+		case req.What != "":
+			req.Stores = append(req.Stores, arg)
+		default:
+			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n%s\n", arg, use)
+			return ErrHandled
+		}
+	}
+	if req.What == "" && (req.DryRun || yes || req.Current || req.Force || req.OlderThan != "") {
+		fmt.Fprintln(stderr, "storeboard: cleanup: options apply to `cleanup trash|history|orphans`; plain cleanup takes none but --json")
+		return ErrHandled
 	}
 	cfg, err := config.Load(config.ResolvePath(configPath))
 	if err != nil {
 		return err
 	}
-	body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/cleanup", map[string]any{}, noTimeout)
+	run := func(r api.CleanupRequest) (*api.CleanupResult, []byte, error) {
+		body, err := call(ctx, cfg.Socket, http.MethodPost, "/v1/cleanup", r, noTimeout)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cleanup: %w", err)
+		}
+		var res api.CleanupResult
+		if err := json.Unmarshal(body, &res); err != nil {
+			return nil, nil, fmt.Errorf("parse cleanup result: %w", err)
+		}
+		if res.What != r.What || res.DryRun != r.DryRun {
+			// A daemon older than these kinds ignores the fields and runs a
+			// routine cleanup instead; say so rather than report it as this.
+			return nil, nil, fmt.Errorf("cleanup: the daemon does not know `cleanup %s`; update and restart storeboardd", r.What)
+		}
+		return &res, body, nil
+	}
+
+	if req.What != "" && !req.DryRun && !yes {
+		// Plan, show, ask.
+		plan := req
+		plan.DryRun = true
+		res, _, err := run(plan)
+		if err != nil {
+			return err
+		}
+		renderCleanup(stderr, res)
+		if cleanupIsEmpty(res) {
+			fmt.Fprintln(stderr, "nothing to clean up")
+			return nil
+		}
+		if !stdinIsTerminal() {
+			fmt.Fprintln(stderr, "storeboard: cleanup: not a terminal to ask on; pass --yes to go ahead")
+			return ErrHandled
+		}
+		fmt.Fprint(stderr, "Delete this for good? [y/N] ")
+		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			fmt.Fprintln(stderr, "left as it was")
+			return ErrHandled
+		}
+	}
+	res, body, err := run(req)
 	if err != nil {
-		return fmt.Errorf("cleanup: %w", err)
+		return err
 	}
 	if jsonOut {
 		_, err := stdout.Write(body)
 		return err
 	}
-	var res api.CleanupResult
-	if err := json.Unmarshal(body, &res); err != nil {
-		return fmt.Errorf("parse cleanup result: %w", err)
-	}
-	renderCleanup(stdout, &res)
+	renderCleanup(stdout, res)
 	return nil
+}
+
+func cleanupIsEmpty(res *api.CleanupResult) bool {
+	if res.Blobs > 0 || res.TrashFiles > 0 || res.Versions > 0 {
+		return false
+	}
+	for _, it := range res.Items {
+		if it.Files > 0 || it.Bytes > 0 {
+			return false
+		}
+	}
+	return len(res.OrphanStores) == 0
+}
+
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // renderSpace prints a human-readable data directory breakdown.
@@ -396,19 +494,46 @@ func renderSpace(w io.Writer, sp *api.Space) {
 	}
 }
 
-// renderCleanup prints what an explicit cleanup removed.
+// renderCleanup prints what a cleanup removed, or would remove.
 func renderCleanup(w io.Writer, res *api.CleanupResult) {
-	fmt.Fprintf(w, "trash expired: %d files (%s)\n", res.TrashFiles, humanBytes(res.TrashBytes))
-	fmt.Fprintf(w, "blobs collected: %d (%s)\n", res.Blobs, humanBytes(res.BlobBytes))
-	if len(res.OrphanStores) > 0 {
-		fmt.Fprintf(w, "orphaned store data (%s):\n", humanBytes(res.OrphanBytes))
-		for _, id := range res.OrphanStores {
-			fmt.Fprintf(w, "  %s\n", id)
+	verb := func(done, would string) string {
+		if res.DryRun {
+			return would
 		}
-		fmt.Fprintln(w, "orphan data was left in place; storeboard never deletes it on its own")
-	} else {
-		fmt.Fprintln(w, "orphaned store data: none")
+		return done
 	}
+	if res.What == "" {
+		fmt.Fprintf(w, "trash expired: %d files (%s)\n", res.TrashFiles, humanBytes(res.TrashBytes))
+		fmt.Fprintf(w, "blobs collected: %d (%s)\n", res.Blobs, humanBytes(res.BlobBytes))
+		if len(res.OrphanStores) > 0 {
+			fmt.Fprintf(w, "stores no longer in the config (%s): %s\n", humanBytes(res.OrphanBytes), strings.Join(res.OrphanStores, ", "))
+			fmt.Fprintln(w, "left in place; `storeboard cleanup orphans` forgets them")
+		}
+		return
+	}
+	if res.DryRun {
+		fmt.Fprintln(w, "would remove:")
+	}
+	var direct int64
+	for _, it := range res.Items {
+		switch it.What {
+		case "trash":
+			fmt.Fprintf(w, "  trash/%-24s %6d files  %10s\n", it.Store, it.Files, humanBytes(it.Bytes))
+		case "history":
+			fmt.Fprintf(w, "  history/%-22s %6d versions\n", it.Store, it.Files)
+		case "orphans":
+			fmt.Fprintf(w, "  store %-25s %6d files  %10s\n", it.Store, it.Files, humanBytes(it.Bytes))
+		}
+		if it.Note != "" {
+			fmt.Fprintf(w, "    %s\n", it.Note)
+		}
+		direct += it.Bytes
+	}
+	if len(res.Items) == 0 {
+		fmt.Fprintln(w, "  nothing")
+	}
+	fmt.Fprintf(w, "content no longer referenced: %d blobs (%s)\n", res.Blobs, humanBytes(res.BlobBytes))
+	fmt.Fprintf(w, "%s %s in all\n", verb("freed", "would free"), humanBytes(direct+res.BlobBytes))
 }
 
 func humanBytes(bytes int64) string {
