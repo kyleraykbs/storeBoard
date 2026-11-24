@@ -247,3 +247,47 @@ func TestCleanupOrphans(t *testing.T) {
 		t.Fatal("the user's folder was touched")
 	}
 }
+
+// Status counts each store's trash and versions, attributes content to what
+// alone keeps it, and changes nothing.
+func TestCleanupStatus(t *testing.T) {
+	n := mkBackupNode(t, config.SyncLocal, "")
+	eng, fs := n.eng, n.store("docs")
+	path := filepath.Join(fs.root, "note.txt")
+	writeFile(t, path, "first version", time.Now().Add(-2*time.Hour))
+	if _, err := eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, "second!", time.Now())
+	if _, err := eng.scan(fs, true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(n.cfg.DataDir, "trash", "docs", "gone.txt"), "12345", time.Now())
+
+	st, err := eng.CleanupStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Stores) != 1 {
+		t.Fatalf("stores = %+v", st.Stores)
+	}
+	s := st.Stores[0]
+	if s.TrashFiles != 1 || s.TrashBytes != 5 || s.TrashNextExpiry == "" {
+		t.Fatalf("trash = %+v", s)
+	}
+	if s.OldVersions != 1 || s.OldVersionBytes != int64(len("first version")) {
+		t.Fatalf("old versions = %+v", s)
+	}
+	if s.CurrentCopies != 1 || s.CurrentCopyBytes != int64(len("second!")) {
+		t.Fatalf("current copies = %+v", s)
+	}
+	if len(fs.hist.Versions("note.txt")) != 2 {
+		t.Fatal("status changed the history")
+	}
+	if _, err := os.Stat(filepath.Join(n.cfg.DataDir, "trash", "docs", "gone.txt")); err != nil {
+		t.Fatal("status changed the trash")
+	}
+	if _, err := eng.RunCleanup(api.CleanupRequest{}, os.Getuid()); err == nil {
+		t.Fatal("a cleanup without a kind ran")
+	}
+}

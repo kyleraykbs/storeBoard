@@ -243,10 +243,7 @@ func (e *Engine) RunCleanup(req api.CleanupRequest, uid int) (api.CleanupResult,
 
 	switch req.What {
 	case "":
-		if req.DryRun || len(req.Stores) > 0 || req.OlderThan != "" || req.Current || req.Force {
-			return res, fmt.Errorf("routine cleanup takes no options; name what to clean: trash, history or orphans")
-		}
-		return e.Cleanup(false), nil
+		return res, fmt.Errorf("name what to clean: trash, history or orphans (the daemon expires both by their windows on its own)")
 
 	case CleanupTrash, CleanupHistory:
 		if req.What == CleanupTrash && (req.Current || req.Force) {
@@ -437,4 +434,152 @@ func (e *Engine) unreferenced(keep map[string]bool) (n int, bytes int64) {
 		}
 	}
 	return n, bytes
+}
+
+// CleanupStatus reports what is there to clean up and changes nothing: each
+// store's trash and recorded versions, the stores no longer in the config,
+// and content nothing references. Content bytes are counted for the one
+// thing that alone keeps them (a blob two of them name would survive either
+// cleanup alone, and is not promised to either).
+func (e *Engine) CleanupStatus() (api.CleanupStatus, error) {
+	st := api.CleanupStatus{APIVersion: api.Version, Stores: []api.CleanupStoreStatus{}, Orphans: []api.CleanupOrphanStatus{}}
+
+	// Blob sizes, once.
+	sizes := map[string]int64{}
+	storeDir := filepath.Join(e.dataDir, "store")
+	for _, ab := range listDir(storeDir) {
+		for _, cd := range listDir(filepath.Join(storeDir, ab)) {
+			dir := filepath.Join(storeDir, ab, cd)
+			for _, sum := range listDir(dir) {
+				if fi, err := os.Stat(filepath.Join(dir, sum)); err == nil && !fi.IsDir() {
+					sizes[sum] = fi.Size()
+				}
+			}
+		}
+	}
+
+	// base: blobs that are the only copy of a live file here. No cleanup
+	// frees them.
+	base := map[string]bool{}
+	for _, fs := range e.stores {
+		for _, ent := range fs.db.All() {
+			if ent.Blob != "" && !ent.Dir && !e.materialised(fs, ent) {
+				base[ent.Blob] = true
+			}
+		}
+	}
+
+	// Groups: each store's old versions, its current copies, each orphan.
+	var groups []map[string]bool
+	owners := map[string][]int{}
+	addGroup := func(set map[string]bool) int {
+		id := len(groups)
+		groups = append(groups, set)
+		for b := range set {
+			owners[b] = append(owners[b], id)
+		}
+		return id
+	}
+
+	type storeGroups struct{ old, cur int }
+	byStore := map[string]storeGroups{}
+	for _, fs := range e.stores {
+		row := api.CleanupStoreStatus{Store: fs.name, Stream: fs.stream, TrashKeep: fs.trashWindow().String()}
+		if fs.hist != nil {
+			row.HistoryKeep = fs.hist.keep.String()
+		}
+		var oldest time.Time
+		_ = filepath.WalkDir(filepath.Join(e.dataDir, "trash", fs.name), func(_ string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if fi, err := d.Info(); err == nil {
+				row.TrashFiles++
+				row.TrashBytes += fi.Size()
+				if t := trashTime(fi); oldest.IsZero() || t.Before(oldest) {
+					oldest = t
+				}
+			}
+			return nil
+		})
+		if !oldest.IsZero() {
+			row.TrashOldest = oldest.UTC().Format(time.RFC3339)
+			row.TrashNextExpiry = oldest.Add(fs.trashWindow()).UTC().Format(time.RFC3339)
+		}
+		old, cur := map[string]bool{}, map[string]bool{}
+		if byPath, err := readHistoryFile(filepath.Join(e.dataDir, "history", fs.name+".ndjson")); err == nil {
+			for _, versions := range byPath {
+				last := len(versions) - 1
+				for i, v := range versions {
+					if i == last && !v.Deleted {
+						if v.Blob != "" {
+							row.CurrentCopies++
+							cur[v.Blob] = true
+						}
+						continue
+					}
+					row.OldVersions++
+					if v.Blob != "" {
+						old[v.Blob] = true
+					}
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return st, fmt.Errorf("history %s: %w", fs.name, err)
+		}
+		byStore[fs.name] = storeGroups{addGroup(old), addGroup(cur)}
+		st.Stores = append(st.Stores, row)
+	}
+
+	orphanGroup := map[string]int{}
+	for _, id := range e.orphanStoreIDs() {
+		refs := map[string]bool{}
+		if err := refsFromJournal(filepath.Join(e.dataDir, "journal", id+".ndjson"), refs); err != nil && !os.IsNotExist(err) {
+			return st, fmt.Errorf("journal %s: %w", id, err)
+		}
+		if err := refsFromHistory(filepath.Join(e.dataDir, "history", id+".ndjson"), refs); err != nil && !os.IsNotExist(err) {
+			return st, fmt.Errorf("history %s: %w", id, err)
+		}
+		orphanGroup[id] = addGroup(refs)
+		row := api.CleanupOrphanStatus{Store: id, UnsentWrites: e.unsentWrites(id)}
+		for _, p := range e.orphanFiles(id) {
+			b, f := treeSize(p)
+			row.DataBytes += b
+			row.DataFiles += int(f)
+		}
+		folder := filepath.Join(e.cfg.Root, id)
+		if fi, err := os.Stat(folder); err == nil && fi.IsDir() {
+			row.Folder = folder
+			b, f := treeSize(folder)
+			row.FolderBytes, row.FolderFiles = b, int(f)
+		}
+		st.Orphans = append(st.Orphans, row)
+	}
+
+	// Attribute each blob's bytes to the one group that alone keeps it.
+	exclusive := make([]int64, len(groups))
+	for blob, size := range sizes {
+		if base[blob] {
+			continue
+		}
+		own := owners[blob]
+		switch len(own) {
+		case 0:
+			st.UnreferencedBlobs++
+			st.UnreferencedBytes += size
+		case 1:
+			exclusive[own[0]] += size
+		default:
+			st.SharedBytes += size
+		}
+	}
+	for i := range st.Stores {
+		g := byStore[st.Stores[i].Store]
+		st.Stores[i].OldVersionBytes = exclusive[g.old]
+		st.Stores[i].CurrentCopyBytes = exclusive[g.cur]
+	}
+	for i := range st.Orphans {
+		st.Orphans[i].ContentBytes = exclusive[orphanGroup[st.Orphans[i].Store]]
+	}
+	return st, nil
 }

@@ -34,34 +34,15 @@ func TestSpaceReportsOrphansAndCleanupLeavesThemByDefault(t *testing.T) {
 	if !found {
 		t.Fatalf("space report omitted orphan store: %+v", space)
 	}
-	res := n.eng.Cleanup(false)
-	if len(res.OrphanStores) == 0 {
-		t.Fatal("cleanup did not report orphan stores")
+	st, err := n.eng.CleanupStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Orphans) != 1 || st.Orphans[0].Store != "old-store" || st.Orphans[0].FolderFiles != 1 {
+		t.Fatalf("cleanup status did not report the orphan store: %+v", st.Orphans)
 	}
 	if _, err := os.Stat(orphanRoot); err != nil {
-		t.Fatalf("default cleanup removed orphan data: %v", err)
-	}
-}
-
-func TestCleanupRemoveOrphansIsExplicit(t *testing.T) {
-	n := mkNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2")
-	n.prepareAll()
-	orphanRoot := filepath.Join(n.cfg.Root, "old-store")
-	if err := os.MkdirAll(orphanRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(orphanRoot, "old.txt"), []byte("remove"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(n.cfg.DataDir, "journal", "old-store.ndjson"), []byte("{}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	result := n.eng.Cleanup(true)
-	if len(result.OrphanStores) == 0 {
-		t.Fatal("cleanup did not report the preserved orphan")
-	}
-	if _, err := os.Stat(orphanRoot); err != nil {
-		t.Fatalf("cleanup removed orphan data without implementation: %v", err)
+		t.Fatalf("cleanup status removed orphan data: %v", err)
 	}
 }
 

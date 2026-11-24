@@ -156,13 +156,17 @@ at all when a reference source cannot be read. The trash ages out after
 `trash.keep` ("1w", "30d"; unset follows `backup.keep`), counted from when a
 file got there.
 
-Freeing space by hand is `storeboard cleanup`. Plain, it does what the timers
-do (expiry by the windows, then collection). The explicit kinds show what they
-would remove, and how much content that leaves unreferenced, then ask:
+Both windows run on their own: the trash expires and history thins every
+hour, and content nothing references any more is collected right after.
+`storeboard cleanup` (or `cleanup status`) only reports: each store's trash
+and when it next expires, its old versions and backup copies of current files
+with the space only they hold, and stores no longer in the config. Freeing
+space before the windows do is explicit; each kind shows what it would remove,
+and how much content that leaves unreferenced, then asks:
 
     storeboard cleanup trash Videos                # empty a store's trash now
     storeboard cleanup trash --older-than 2w       # every store you own
-    storeboard cleanup history Projects            # old versions only
+    storeboard cleanup history Projects            # every old version, whatever its age
     storeboard cleanup history Projects --current  # and the backup copy of each file as it is now
     sudo storeboard cleanup orphans                # forget stores no longer in the config
 

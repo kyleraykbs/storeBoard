@@ -42,8 +42,9 @@ Commands:
                   where it is); a name already taken is parked, not lost
   space           show how much disk each data category and each
                   unconfigured store uses
-  cleanup         routine cleanup: expire trash and history by their
-                  windows, collect content nothing references
+  cleanup [status]
+                  show what there is to clean up: each store's trash and
+                  history, stores no longer in the config; changes nothing
   cleanup trash [STORE...] [--older-than DUR]
                   empty the trash now (all of it, or what is older)
   cleanup history [STORE...] [--older-than DUR] [--current]
@@ -357,10 +358,26 @@ func spaceCmd(ctx context.Context, configPath string, args []string, stdout, std
 // cleanup is planned first (a dry run at the daemon) and shown, then asked
 // about, unless --yes or --dry-run says otherwise.
 func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, stderr io.Writer) error {
-	const use = "usage: storeboard cleanup [trash|history|orphans] [STORE...] [--older-than DUR] [--current] [--force] [--dry-run] [--yes] [--json]"
+	const use = "usage: storeboard cleanup [status|trash|history|orphans] [STORE...] [--older-than DUR] [--current] [--force] [--dry-run] [--yes] [--json]"
 	var req api.CleanupRequest
 	jsonOut, yes := false, false
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") || args[0] == "status" {
+		if len(args) > 0 && args[0] == "status" {
+			args = args[1:]
+		}
+		for _, a := range args {
+			if a == "--remove-orphans" {
+				fmt.Fprintln(stderr, "storeboard: cleanup: --remove-orphans is gone; use `storeboard cleanup orphans`")
+				return ErrHandled
+			}
+		}
+		jsonOut, err := jsonFlag(args, "cleanup status", stderr)
+		if err != nil {
+			return err
+		}
+		return cleanupStatusCmd(ctx, configPath, jsonOut, stdout)
+	}
+	if len(args) > 0 {
 		switch args[0] {
 		case "trash", "history", "orphans":
 			req.What = args[0]
@@ -404,10 +421,6 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 			return ErrHandled
 		}
 	}
-	if req.What == "" && (req.DryRun || yes || req.Current || req.Force || req.OlderThan != "") {
-		fmt.Fprintln(stderr, "storeboard: cleanup: options apply to `cleanup trash|history|orphans`; plain cleanup takes none but --json")
-		return ErrHandled
-	}
 	cfg, err := config.Load(config.ResolvePath(configPath))
 	if err != nil {
 		return err
@@ -429,7 +442,7 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 		return &res, body, nil
 	}
 
-	if req.What != "" && !req.DryRun && !yes {
+	if !req.DryRun && !yes {
 		// Plan, show, ask.
 		plan := req
 		plan.DryRun = true
@@ -463,6 +476,103 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 	}
 	renderCleanup(stdout, res)
 	return nil
+}
+
+// cleanupStatusCmd shows what there is to clean up.
+func cleanupStatusCmd(ctx context.Context, configPath string, jsonOut bool, stdout io.Writer) error {
+	cfg, err := config.Load(config.ResolvePath(configPath))
+	if err != nil {
+		return err
+	}
+	body, err := call(ctx, cfg.Socket, http.MethodGet, "/v1/cleanup", nil, listTimeout)
+	if err != nil {
+		if strings.Contains(err.Error(), "method not allowed") {
+			return fmt.Errorf("cleanup status: the daemon predates it; update and restart storeboardd")
+		}
+		return fmt.Errorf("cleanup status: %w", err)
+	}
+	if jsonOut {
+		_, err := stdout.Write(body)
+		return err
+	}
+	var st api.CleanupStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return fmt.Errorf("parse cleanup status: %w", err)
+	}
+	renderCleanupStatus(stdout, &st)
+	return nil
+}
+
+// renderCleanupStatus prints the stores with something to clean, then the
+// leftover stores, then the commands that would act on them.
+func renderCleanupStatus(w io.Writer, st *api.CleanupStatus) {
+	day := func(rfc string) string {
+		if t, err := time.Parse(time.RFC3339, rfc); err == nil {
+			return t.Local().Format("2006-01-02")
+		}
+		return rfc
+	}
+	var total int64
+	fmt.Fprintln(w, "trash (expires on its own after trash.keep):")
+	any := false
+	for _, s := range st.Stores {
+		if s.TrashFiles == 0 {
+			continue
+		}
+		any = true
+		total += s.TrashBytes
+		fmt.Fprintf(w, "  %-16s %10s  %6d files  oldest %s, next expiry %s (keep %s)\n",
+			s.Store, humanBytes(s.TrashBytes), s.TrashFiles, day(s.TrashOldest), day(s.TrashNextExpiry), keepWords(s.TrashKeep))
+	}
+	if !any {
+		fmt.Fprintln(w, "  empty")
+	}
+	fmt.Fprintln(w, "history (thinned hourly; nothing kept past backup.keep except current copies):")
+	any = false
+	for _, s := range st.Stores {
+		if s.OldVersions == 0 && s.CurrentCopies == 0 {
+			continue
+		}
+		any = true
+		total += s.OldVersionBytes + s.CurrentCopyBytes
+		fmt.Fprintf(w, "  %-16s old versions %7d  %10s   current copies %7d  %10s\n",
+			s.Store, s.OldVersions, humanBytes(s.OldVersionBytes), s.CurrentCopies, humanBytes(s.CurrentCopyBytes))
+	}
+	if !any {
+		fmt.Fprintln(w, "  none")
+	}
+	fmt.Fprintln(w, "stores no longer in the config (kept until you forget them):")
+	if len(st.Orphans) == 0 {
+		fmt.Fprintln(w, "  none")
+	}
+	for _, o := range st.Orphans {
+		total += o.DataBytes + o.ContentBytes
+		fmt.Fprintf(w, "  %-16s %10s", o.Store, humanBytes(o.DataBytes+o.ContentBytes))
+		if o.Folder != "" && o.FolderFiles > 0 {
+			fmt.Fprintf(w, "   folder %s: %d files, %s (left to you)", o.Folder, o.FolderFiles, humanBytes(o.FolderBytes))
+		}
+		if o.UnsentWrites > 0 {
+			fmt.Fprintf(w, "   %d UNSENT WRITES", o.UnsentWrites)
+		}
+		fmt.Fprintln(w)
+	}
+	if st.UnreferencedBytes > 0 {
+		fmt.Fprintf(w, "unreferenced content: %d blobs, %s (collected within the hour)\n", st.UnreferencedBlobs, humanBytes(st.UnreferencedBytes))
+	}
+	if st.SharedBytes > 0 {
+		fmt.Fprintf(w, "shared content: %s (named by more than one of the above; freed once all of them go)\n", humanBytes(st.SharedBytes))
+	}
+	fmt.Fprintf(w, "reclaimable: %s\n", humanBytes(total))
+	fmt.Fprintln(w, "free it with: storeboard cleanup trash|history [STORE...] [--older-than DUR] [--current], sudo storeboard cleanup orphans [STORE...]")
+}
+
+// keepWords turns a Go duration ("168h0m0s") back into days.
+func keepWords(d string) string {
+	dur, err := time.ParseDuration(d)
+	if err != nil || dur < 24*time.Hour {
+		return d
+	}
+	return fmt.Sprintf("%dd", int(dur.Hours()/24))
 }
 
 func cleanupIsEmpty(res *api.CleanupResult) bool {
@@ -501,15 +611,6 @@ func renderCleanup(w io.Writer, res *api.CleanupResult) {
 			return would
 		}
 		return done
-	}
-	if res.What == "" {
-		fmt.Fprintf(w, "trash expired: %d files (%s)\n", res.TrashFiles, humanBytes(res.TrashBytes))
-		fmt.Fprintf(w, "blobs collected: %d (%s)\n", res.Blobs, humanBytes(res.BlobBytes))
-		if len(res.OrphanStores) > 0 {
-			fmt.Fprintf(w, "stores no longer in the config (%s): %s\n", humanBytes(res.OrphanBytes), strings.Join(res.OrphanStores, ", "))
-			fmt.Fprintln(w, "left in place; `storeboard cleanup orphans` forgets them")
-		}
-		return
 	}
 	if res.DryRun {
 		fmt.Fprintln(w, "would remove:")

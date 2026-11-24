@@ -244,6 +244,50 @@ type CleanupRequest struct {
 	RemoveOrphans bool `json:"removeOrphans,omitempty"`
 }
 
+// CleanupStatus is what there is to clean up; reading it changes nothing.
+// Content bytes are those only that thing keeps: dropping it frees them.
+// SharedBytes is content two of them name, freed only once both go.
+type CleanupStatus struct {
+	APIVersion        int                   `json:"apiVersion"`
+	Stores            []CleanupStoreStatus  `json:"stores"`
+	Orphans           []CleanupOrphanStatus `json:"orphans"`
+	SharedBytes       int64                 `json:"sharedBytes"`
+	UnreferencedBlobs int                   `json:"unreferencedBlobs"`
+	UnreferencedBytes int64                 `json:"unreferencedBytes"`
+}
+
+// CleanupStoreStatus is one configured store's trash and history.
+type CleanupStoreStatus struct {
+	Store           string `json:"store"`
+	Stream          bool   `json:"stream,omitempty"`
+	TrashFiles      int    `json:"trashFiles"`
+	TrashBytes      int64  `json:"trashBytes"`
+	TrashOldest     string `json:"trashOldest,omitempty"`
+	TrashNextExpiry string `json:"trashNextExpiry,omitempty"`
+	TrashKeep       string `json:"trashKeep"`
+	HistoryKeep     string `json:"historyKeep,omitempty"`
+	// OldVersions are versions other than a file's current one (deletion
+	// records included); OldVersionBytes the content only they keep.
+	OldVersions     int   `json:"oldVersions"`
+	OldVersionBytes int64 `json:"oldVersionBytes"`
+	// CurrentCopies are the backup copies of files as they are now;
+	// CurrentCopyBytes the content only they keep (the files hold the rest).
+	CurrentCopies    int   `json:"currentCopies"`
+	CurrentCopyBytes int64 `json:"currentCopyBytes"`
+}
+
+// CleanupOrphanStatus is a store no longer in the config.
+type CleanupOrphanStatus struct {
+	Store        string `json:"store"`
+	DataFiles    int    `json:"dataFiles"`
+	DataBytes    int64  `json:"dataBytes"`
+	ContentBytes int64  `json:"contentBytes"`
+	Folder       string `json:"folder,omitempty"`
+	FolderFiles  int    `json:"folderFiles,omitempty"`
+	FolderBytes  int64  `json:"folderBytes,omitempty"`
+	UnsentWrites int    `json:"unsentWrites,omitempty"`
+}
+
 // CleanupItem is what a cleanup did, or would do, to one store.
 type CleanupItem struct {
 	Store string `json:"store"`

@@ -244,12 +244,21 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.engine.Doctor(s.transport.Snapshot()))
 }
 
-// handleCleanup runs a cleanup. POST-only: nothing in GET may mutate state.
-// Routine cleanup (an empty "what") repeats what the daemon's timers do and
-// is anyone's to ask for; the engine authorizes the rest per store.
+// handleCleanup: GET reports what there is to clean up (anyone may look,
+// as with space); POST runs one cleanup, which the engine authorizes per
+// store.
 func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		st, err := s.engine.CleanupStatus()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
+		return
+	}
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
+		w.Header().Set("Allow", "GET, HEAD, POST")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}

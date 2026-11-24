@@ -271,7 +271,7 @@ func waitServer(t *testing.T, client *http.Client) {
 	t.Fatal("daemon did not become reachable")
 }
 
-func TestCleanupIsReadOnlyWithoutOrphanFlag(t *testing.T) {
+func TestCleanupStatusIsReadOnly(t *testing.T) {
 	cfg := testConfig(t)
 	serverOrphan(t, cfg)
 	srv, err := New(cfg, nil)
@@ -285,13 +285,28 @@ func TestCleanupIsReadOnlyWithoutOrphanFlag(t *testing.T) {
 	client := unixClient(cfg)
 	waitServer(t, client)
 
-	var cleanup api.CleanupResult
-	postJSON(t, client, "http://storeboard/v1/cleanup", map[string]any{}, &cleanup)
+	resp, err := client.Get("http://storeboard/v1/cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st api.CleanupStatus
+	err = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET cleanup = %d, %v", resp.StatusCode, err)
+	}
+	found := false
+	for _, o := range st.Orphans {
+		found = found || o.Store == "photos-old"
+	}
+	if !found {
+		t.Fatalf("status did not list the orphan: %+v", st.Orphans)
+	}
 	if orphan := filepath.Join(cfg.Root, "photos-old"); !fileExists(orphan) {
-		t.Fatalf("cleanup without remove-orphans deleted %s", orphan)
+		t.Fatalf("cleanup status deleted %s", orphan)
 	}
 	if orphanJ := filepath.Join(cfg.DataDir, "journal", "photos-old.ndjson"); !fileExists(orphanJ) {
-		t.Fatalf("cleanup without remove-orphans deleted %s", orphanJ)
+		t.Fatalf("cleanup status deleted %s", orphanJ)
 	}
 }
 
@@ -329,7 +344,7 @@ func TestCleanupRemoveOrphansNeedsConfirmation(t *testing.T) {
 	}
 }
 
-func TestCleanupRejectsGet(t *testing.T) {
+func TestCleanupRejectsPut(t *testing.T) {
 	cfg := testConfig(t)
 	srv, err := New(cfg, nil)
 	if err != nil {
@@ -338,13 +353,14 @@ func TestCleanupRejectsGet(t *testing.T) {
 	defer srv.Close()
 	ts := httptest.NewServer(srv.handler())
 	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/v1/cleanup")
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/cleanup", nil)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("GET cleanup = %s, want 405", resp.Status)
+		t.Fatalf("PUT cleanup = %s, want 405", resp.Status)
 	}
 }
 
@@ -738,8 +754,9 @@ func TestMalformedAndOversizedBodiesAreRefused(t *testing.T) {
 			t.Errorf("POST %s with a %d-byte body = %d %.80s, want 413", url, len(huge), code, body)
 		}
 	}
-	// An empty body is still "no fields": a bare POST cleanup works.
-	if code, body := post(t, client, "http://storeboard/v1/cleanup", ""); code != http.StatusOK {
+	// An empty body is still "no fields": a bare POST cleanup decodes, and
+	// is refused for naming nothing to clean.
+	if code, body := post(t, client, "http://storeboard/v1/cleanup", ""); code != http.StatusBadRequest || !strings.Contains(body, "name what to clean") {
 		t.Fatalf("POST cleanup with no body = %d %s", code, body)
 	}
 }
