@@ -1021,18 +1021,38 @@ func (m *storeMutator) Rename(from, to string) error {
 	}
 	dst := m.fs.db.Get(to)
 	var replaced map[string]uint64
+	var dstTomb *Entry
+	var records []queueOp // appended to the queue, in this order
 	if dst != nil && !dst.Deleted {
 		if len(entries) != 1 || entries[0].Dir || dst.Dir {
 			return os.ErrExist
 		}
 		vv := m.e.nextVV(m.fs, dst)
 		replaced = vv
-		_ = m.fs.db.Put(&Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv})
-		if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv}); err != nil {
-			return err
+		dstTomb = &Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv}
+		records = append(records, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv})
+	}
+
+	// The whole move is planned first and lands as one batch: one append to
+	// the queue file, one fsync, one compaction. Done per file, a folder of
+	// node_modules beside a running copy took the store lock for half an
+	// hour - every file scanned the queue, synced it and compacted it - and
+	// everything else on the mount queued behind it.
+	m.fs.queueMu.Lock()
+	defer m.fs.queueMu.Unlock()
+	queuedPut := make(map[string]int, len(m.fs.queue))
+	for i := len(m.fs.queue) - 1; i >= 0; i-- {
+		if op := m.fs.queue[i]; op.Op == opPut {
+			queuedPut[op.Path] = i // the first put of a path wins
 		}
 	}
+	type step struct {
+		old, moved *Entry
+		putIdx     int // the queued upload that follows the file, or -1
+	}
+	steps := make([]step, 0, len(entries))
 	moves := make([]renameMove, 0, len(entries))
+	var movedIdx []int
 	for _, ent := range entries {
 		newPath := to
 		if ent.Path != from {
@@ -1049,26 +1069,69 @@ func (m *storeMutator) Rename(from, to string) error {
 		moved := ent.clone()
 		moved.Path = newPath
 		moved.VV = vv
-		_ = m.fs.db.Put(old)
-		_ = m.fs.db.Put(moved)
+		st := step{old: old, moved: moved, putIdx: -1}
 		// A handle still open on the path follows it: it commits under the
 		// new name when it is released. One that created the file holds its
 		// only bytes, so there is nothing at the old name for a holder to
-		// move - only the empty placeholder to delete.
+		// move - only the empty placeholder to delete. A pending upload
+		// changes destination (GIO writes .goutputstream-* and renames it):
+		// the holder must pull those bytes under the final name, not
+		// receive a rename for a path it never materialised.
 		_, created := m.e.repathPending(m.fs, ent.Path, newPath)
-		if m.e.moveQueuedPut(m.fs, ent.Path, newPath, vv) || created {
-			if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv}); err != nil {
-				return err
-			}
+		if i, ok := queuedPut[ent.Path]; ok {
+			op := m.fs.queue[i]
+			op.Path = newPath
+			op.VV = vv
+			st.putIdx = i
+			movedIdx = append(movedIdx, i)
+			records = append(records, op, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv})
+		} else if created {
+			records = append(records, queueOp{ID: newOpID(m.e), Op: opDelete, Path: ent.Path, VV: vv})
 		} else {
 			moves = append(moves, renameMove{From: ent.Path, Old: old, New: moved})
 		}
+		steps = append(steps, st)
 	}
 	if len(moves) > 0 {
-		if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves, VV: moves[0].New.VV}); err != nil {
-			return err
+		records = append(records, queueOp{ID: newOpID(m.e), Op: opRename, Path: from, To: to, Dir: true, Moves: moves, VV: moves[0].New.VV})
+	}
+	// Durable first: if the queue cannot take it, nothing has moved.
+	if err := m.e.appendQueue(m.fs, records, true); err != nil {
+		return err
+	}
+	if dstTomb != nil {
+		_ = m.fs.db.Put(dstTomb)
+	}
+	for _, st := range steps {
+		_ = m.fs.db.Put(st.old)
+		_ = m.fs.db.Put(st.moved)
+	}
+	// The moved uploads leave their old places in the queue: they now
+	// happen after everything already queued - including the delete of the
+	// file they replace, which must not reach the holder after them.
+	if len(movedIdx) > 0 {
+		gone := make(map[int]bool, len(movedIdx))
+		for _, i := range movedIdx {
+			gone[i] = true
+			delete(m.fs.qx.sent, m.fs.queue[i].ID)
+		}
+		kept := m.fs.queue[:0]
+		for i, op := range m.fs.queue {
+			if !gone[i] {
+				kept = append(kept, op)
+			}
+		}
+		clear(m.fs.queue[len(kept):])
+		m.fs.queue = kept
+	}
+	for _, op := range records {
+		m.fs.queue = append(m.fs.queue, op)
+		if op.Op != opPut { // a moved upload's bytes were already counted
+			m.fs.queuedBytes += op.Size
 		}
 	}
+	m.fs.qx.ver++
+	m.e.compactLocked(m.fs)
 	go m.e.flushQueue(m.fs)
 	return nil
 }

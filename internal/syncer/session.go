@@ -273,7 +273,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 					continue
 				}
 				merged := MergeVV(loc.VV, rem.VV)
-				_ = fs.db.Put(&Entry{Path: rem.Path, Deleted: true, VV: merged})
+				_ = fs.db.PutIf(loc, &Entry{Path: rem.Path, Deleted: true, VV: merged})
 			} else {
 				e.sendIndexTo(peer, fs, []*Entry{loc})
 			}
@@ -358,7 +358,7 @@ func (e *Engine) handleIndex(peer string, fr *frame) {
 				merged := MergeVV(loc.VV, rem.VV)
 				upd := loc.clone()
 				upd.VV = merged
-				_ = fs.db.Put(upd)
+				_ = fs.db.PutIf(loc, upd)
 				continue
 			}
 			e.resolveConflict(peer, fs, loc, rem)
@@ -382,7 +382,7 @@ func (e *Engine) foldTombstone(fs *StoreState, rem, loc *Entry) {
 		vv = loc.VV
 	}
 	vv = MergeVV(vv, rem.VV)
-	if err := fs.db.Put(&Entry{Path: rem.Path, Dir: rem.Dir, Deleted: true, VV: vv}); err != nil {
+	if err := fs.db.PutIf(loc, &Entry{Path: rem.Path, Dir: rem.Dir, Deleted: true, VV: vv}); err != nil {
 		e.logger.Debug("record tombstone", "store", fs.name, "path", rem.Path, "error", err)
 	}
 }
@@ -404,7 +404,7 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 				return
 			}
 			merged := MergeVV(loc.VV, rem.VV)
-			_ = fs.db.Put(&Entry{Path: rem.Path, Dir: true, Deleted: true, VV: merged})
+			_ = fs.db.PutIf(loc, &Entry{Path: rem.Path, Dir: true, Deleted: true, VV: merged})
 			return
 		}
 		_ = e.sendIndexTo(peer, fs, []*Entry{loc})
@@ -459,7 +459,7 @@ func (e *Engine) handleDirEntry(peer string, fs *StoreState, rem, loc *Entry) {
 		merged := MergeVV(loc.VV, rem.VV)
 		upd := loc.clone()
 		upd.VV = merged
-		_ = fs.db.Put(upd)
+		_ = fs.db.PutIf(loc, upd)
 	}
 }
 
@@ -477,7 +477,9 @@ func (e *Engine) resolveConflict(peer string, fs *StoreState, loc, rem *Entry) {
 		e.request(peer, fs, rem, &pending{entry: rem, conflict: true, conflictName: name})
 		upd := loc.clone()
 		upd.VV = merged
-		_ = fs.db.Put(upd)
+		if fs.db.PutIf(loc, upd) != nil {
+			return // the path moved on while this was decided
+		}
 		e.broadcastIndex(fs, []*Entry{upd})
 		e.logger.Warn("conflict: kept local version, remote saved as copy",
 			"store", fs.name, "path", loc.Path, "copy", name, "peer", peer)
@@ -1224,9 +1226,14 @@ func (e *Engine) applyEntry(fs *StoreState, ent *Entry) error {
 		// would materialise a full copy of content the user asked this
 		// machine not to hold.
 		fs.scanMu.Lock()
-		err := fs.db.Put(ent)
-		fs.scanMu.Unlock()
-		return err
+		defer fs.scanMu.Unlock()
+		// Decided on an entry read earlier; a local change since (a rename
+		// that tombstoned the path) supersedes it, and writing it anyway
+		// put the file back at its old name.
+		if cur := fs.db.Get(ent.Path); cur != nil && Dominates(cur.VV, ent.VV) && !Dominates(ent.VV, cur.VV) {
+			return nil
+		}
+		return fs.db.Put(ent)
 	}
 	// Held across the write so a mount transition cannot swap the root out
 	// from under a file in flight.

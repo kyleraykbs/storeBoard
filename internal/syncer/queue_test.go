@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -849,5 +850,127 @@ func TestCompactQueue(t *testing.T) {
 		if ids(kept) != tc.kept || ids(dropped) != tc.drop {
 			t.Errorf("%s: kept %q dropped %q, want %q / %q", tc.name, ids(kept), ids(dropped), tc.kept, tc.drop)
 		}
+	}
+}
+
+// Moving a folder of many files that are still queued for upload is one
+// batch: it used to scan, sync and compact the whole queue once per file,
+// holding the store lock for half an hour on a node_modules tree.
+func TestRenameOfLargeQueuedFolderIsOneBatch(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	n.prepareAll()
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	m := &storeMutator{e: n.eng, fs: fs}
+	const files = 2000
+	if err := m.MakeDir("src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < files; i++ {
+		pf, err := m.Create(fmt.Sprintf("src/f%04d.js", i), 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pf.WriteAt([]byte(fmt.Sprintf("file %d", i)), 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := pf.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// And one already uploaded, so the batch carries a holder-side move too.
+	if err := fs.db.Put(&Entry{Path: "src/held.txt", Blob: strings.Repeat("ab", 32), Size: 3, VV: map[string]uint64{"b": 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := m.Rename("src", "lib/src"); err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	t.Logf("renamed %d queued files in %v", files, took)
+	if took > 5*time.Second {
+		t.Fatalf("renaming %d queued files took %v", files, took)
+	}
+
+	fs.queueMu.Lock()
+	puts, oldPuts, renames := 0, 0, 0
+	for _, op := range fs.queue {
+		switch {
+		case op.Op == opPut && strings.HasPrefix(op.Path, "lib/src/"):
+			puts++
+		case op.Op == opPut:
+			oldPuts++
+		case op.Op == opRename:
+			renames++
+			for _, mv := range op.Moves {
+				if mv.From != "src" && mv.From != "src/held.txt" {
+					t.Errorf("rename moves %s, which was still queued", mv.From)
+				}
+			}
+		}
+	}
+	fs.queueMu.Unlock()
+	if puts != files || oldPuts != 0 || renames != 1 {
+		t.Fatalf("queue: %d moved uploads, %d at the old path, %d renames", puts, oldPuts, renames)
+	}
+	for _, p := range []string{"src/f0000.js", "src/held.txt"} {
+		if e := fs.db.Get(p); e == nil || !e.Deleted {
+			t.Fatalf("%s still live after the move: %+v", p, e)
+		}
+	}
+	if e := fs.db.Get("lib/src/f1999.js"); e == nil || e.Deleted || e.Size == 0 {
+		t.Fatalf("moved file = %+v", e)
+	}
+
+	// The queue survives a restart as it is in memory.
+	fs.queueMu.Lock()
+	want := len(fs.queue)
+	fs.queueMu.Unlock()
+	n.eng.Close()
+	n.eng = newEngine(t, n.cfg, n.log)
+	fs = n.store("docs")
+	fs.queueMu.Lock()
+	got := len(fs.queue)
+	fs.queueMu.Unlock()
+	if got != want {
+		t.Fatalf("queue after restart has %d ops, want %d", got, want)
+	}
+}
+
+// A peer's index handled on an entry read before a local rename must not
+// write that stale entry back over the rename's tombstone.
+func TestStaleIndexDecisionDoesNotUndoARename(t *testing.T) {
+	n := newNode(t, "a", "b", "127.0.0.1:1", "127.0.0.1:2", "", map[string]config.Store{
+		"docs": {Group: "g", Sync: config.SyncStream},
+	})
+	t.Cleanup(n.eng.Close)
+	fs := n.store("docs")
+	blob := strings.Repeat("cd", 32)
+	before := &Entry{Path: "a.txt", Blob: blob, Size: 3, VV: map[string]uint64{"a": 5}}
+	if err := fs.db.Put(before); err != nil {
+		t.Fatal(err)
+	}
+	loc := fs.db.Get("a.txt") // what the index handler read
+	tomb := &Entry{Path: "a.txt", Deleted: true, VV: map[string]uint64{"a": 9}}
+	if err := fs.db.Put(tomb); err != nil { // the rename, in between
+		t.Fatal(err)
+	}
+	upd := loc.clone()
+	upd.VV = MergeVV(loc.VV, map[string]uint64{"b": 2})
+	if err := fs.db.PutIf(loc, upd); err == nil {
+		t.Fatal("a stale entry was written over the rename")
+	}
+	if e := fs.db.Get("a.txt"); e == nil || !e.Deleted {
+		t.Fatalf("a.txt = %+v, want the rename's tombstone", e)
+	}
+	// And a fetched version older than the tombstone is not applied.
+	if err := n.eng.applyEntry(fs, before); err != nil {
+		t.Fatal(err)
+	}
+	if e := fs.db.Get("a.txt"); e == nil || !e.Deleted {
+		t.Fatalf("an older fetched version undid the rename: %+v", e)
 	}
 }

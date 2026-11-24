@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"errors"
 	"bufio"
 	"encoding/json"
 	"fmt"
@@ -412,6 +413,22 @@ func sameEntry(a, b *Entry) bool {
 		}
 	}
 	return true
+}
+
+// errEntryChanged is PutIf's answer when the entry moved on.
+var errEntryChanged = errors.New("journal entry changed since it was read")
+
+// PutIf writes e only if the entry at its path is still expect (nil: still
+// absent). A decision taken on an entry read earlier - a peer's index
+// handled while a local rename ran - must not write over what happened in
+// between: that put renamed files back at their old paths.
+func (d *FileDB) PutIf(expect, e *Entry) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !sameEntry(d.entries[e.Path], expect) {
+		return errEntryChanged
+	}
+	return d.putLocked(e)
 }
 
 // Get returns a copy of the entry, or nil.
