@@ -168,9 +168,10 @@ and how much content that leaves unreferenced, then asks:
     storeboard cleanup trash --older-than 2w       # every store you own
     storeboard cleanup history Projects            # every old version, whatever its age
     storeboard cleanup history Projects --current  # and the backup copy of each file as it is now
-    sudo storeboard cleanup orphans                # forget stores no longer in the config
+    storeboard cleanup orphans                     # asks about each store no longer in the config
 
-`--dry-run` only shows; `--yes` skips the question. Forgetting a store removes
+`--dry-run` only shows; `--yes` skips the question. Forgetting a store needs
+root or the owner of the storeboard root; it removes
 what storeboard keeps for it (journal, history, trash, queue) and leaves its
 folder under the root to you; it refuses while the store still has unsent
 writes queued, unless `--force`.

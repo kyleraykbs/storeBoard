@@ -952,11 +952,7 @@ func TestSpaceAndCleanupAgainstLivePair(t *testing.T) {
 		t.Fatalf("cleanup --remove-orphans = %v:\n%s\nwant a pointer to `cleanup orphans`", err, out)
 	}
 	out, err = exec.Command(cli, "-config", a.cfgPath, "cleanup", "orphans", "--dry-run").CombinedOutput()
-	if os.Getuid() != 0 {
-		if err == nil || !strings.Contains(string(out), "needs root") {
-			t.Fatalf("cleanup orphans as a user = %v:\n%s\nwant a root-only refusal", err, out)
-		}
-	} else if err != nil || !strings.Contains(string(out), "old-store") {
+	if err != nil || !strings.Contains(string(out), "old-store") {
 		t.Fatalf("cleanup orphans --dry-run = %v:\n%s", err, out)
 	}
 	if _, err := os.Stat(orpRoot); err != nil {

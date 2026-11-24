@@ -324,12 +324,8 @@ func TestCleanupRemoveOrphansNeedsConfirmation(t *testing.T) {
 	client := unixClient(cfg)
 	waitServer(t, client)
 
-	// The old flag is refused outright, and forgetting an orphan needs
-	// root; either way nothing is removed.
-	for _, body := range []string{`{"removeOrphans":true}`, `{"what":"orphans","stores":["photos-old"]}`} {
-		if os.Getuid() == 0 && strings.Contains(body, "orphans") {
-			continue
-		}
+	// The old flag is refused outright and removes nothing.
+	for _, body := range []string{`{"removeOrphans":true}`} {
 		resp, err := client.Post("http://storeboard/v1/cleanup", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)

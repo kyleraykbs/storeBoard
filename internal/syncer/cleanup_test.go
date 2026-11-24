@@ -208,8 +208,8 @@ func TestCleanupOrphans(t *testing.T) {
 	writeFile(t, filepath.Join(d, "trash", "old", "t.txt"), "trash", time.Now())
 	writeFile(t, filepath.Join(n.cfg.Root, "old", "mine.txt"), "user file", time.Now())
 
-	if _, err := n.eng.RunCleanup(api.CleanupRequest{What: CleanupOrphans}, 1000); err == nil && os.Getuid() != 0 {
-		t.Fatal("a non-root caller forgot a store")
+	if _, err := n.eng.RunCleanup(api.CleanupRequest{What: CleanupOrphans}, os.Getuid()+12345); err == nil {
+		t.Fatal("a caller who owns neither the root nor anything else forgot a store")
 	}
 	if _, err := n.eng.RunCleanup(api.CleanupRequest{What: CleanupOrphans, Stores: []string{"docs"}}, 0); err == nil {
 		t.Fatal("a configured store was forgotten")
@@ -235,7 +235,8 @@ func TestCleanupOrphans(t *testing.T) {
 		t.Fatalf("unsent writes did not block: %v", err)
 	}
 
-	if _, err := n.eng.RunCleanup(api.CleanupRequest{What: CleanupOrphans, Force: true}, 0); err != nil {
+	// The owner of the storeboard root may; the store has no other owner.
+	if _, err := n.eng.RunCleanup(api.CleanupRequest{What: CleanupOrphans, Force: true}, os.Getuid()); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range []string{filepath.Join(d, "journal", "old.ndjson"), filepath.Join(d, "trash", "old"), queueBytesDir(d, "old"), filepath.Join(blobDir, sum)} {

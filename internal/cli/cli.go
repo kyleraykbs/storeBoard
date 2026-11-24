@@ -354,6 +354,37 @@ func spaceCmd(ctx context.Context, configPath string, args []string, stdout, std
 	return nil
 }
 
+const cleanupHelp = `usage: storeboard cleanup [status|trash|history|orphans] [STORE...] [options]
+
+The daemon cleans up on its own: every hour the trash drops what is older
+than trash.keep, history is thinned and drops what is older than
+backup.keep, and content nothing references any more is collected. These
+commands free space sooner.
+
+  cleanup [status]          show what there is to clean up; changes nothing
+  cleanup trash [STORE...]  empty the trash of these stores (default: all of yours)
+      --older-than DUR      only what has been in the trash longer than DUR
+  cleanup history [STORE...]
+                            drop every old version, whatever its age
+      --older-than DUR      only versions older than DUR
+      --current             also drop the backup copy of each file as it is
+                            now (the file itself stays; it is just no longer
+                            backed up until it changes)
+  cleanup orphans [STORE...]
+                            forget stores no longer in the config: their
+                            journal, history, trash and queue. Their folder
+                            under the root is left to you. With no STORE,
+                            asks about each one. Needs root or the owner of
+                            the storeboard root.
+      --force               even a store with unsent writes queued
+
+  --dry-run   show what would go, change nothing
+  --yes       do not ask
+  --json      machine-readable output
+
+DUR takes h/d/w/y units: 36h, 14d, 2w, 1y.
+`
+
 // cleanupCmd runs routine cleanup, or one of the explicit ones. An explicit
 // cleanup is planned first (a dry run at the daemon) and shown, then asked
 // about, unless --yes or --dry-run says otherwise.
@@ -369,6 +400,12 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 			if a == "--remove-orphans" {
 				fmt.Fprintln(stderr, "storeboard: cleanup: --remove-orphans is gone; use `storeboard cleanup orphans`")
 				return ErrHandled
+			}
+		}
+		for _, a := range args {
+			if a == "-h" || a == "--help" {
+				fmt.Fprint(stdout, cleanupHelp)
+				return nil
 			}
 		}
 		jsonOut, err := jsonFlag(args, "cleanup status", stderr)
@@ -409,8 +446,8 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 		case strings.HasPrefix(arg, "--older-than="):
 			req.OlderThan = strings.TrimPrefix(arg, "--older-than=")
 		case arg == "-h" || arg == "--help":
-			fmt.Fprintln(stderr, use)
-			return ErrHandled
+			fmt.Fprint(stdout, cleanupHelp)
+			return nil
 		case strings.HasPrefix(arg, "-"):
 			fmt.Fprintf(stderr, "storeboard: cleanup: unexpected argument %q\n%s\n", arg, use)
 			return ErrHandled
@@ -442,6 +479,15 @@ func cleanupCmd(ctx context.Context, configPath string, args []string, stdout, s
 		return &res, body, nil
 	}
 
+	if req.What == "orphans" && len(req.Stores) == 0 && !req.DryRun && !yes {
+		// Every leftover store gets its own question.
+		chosen, err := pickOrphans(ctx, cfg.Socket, req.Force, stderr)
+		if err != nil || len(chosen) == 0 {
+			return err
+		}
+		req.Stores = chosen
+		yes = true
+	}
 	if !req.DryRun && !yes {
 		// Plan, show, ask.
 		plan := req
@@ -563,7 +609,7 @@ func renderCleanupStatus(w io.Writer, st *api.CleanupStatus) {
 		fmt.Fprintf(w, "shared content: %s (named by more than one of the above; freed once all of them go)\n", humanBytes(st.SharedBytes))
 	}
 	fmt.Fprintf(w, "reclaimable: %s\n", humanBytes(total))
-	fmt.Fprintln(w, "free it with: storeboard cleanup trash|history [STORE...] [--older-than DUR] [--current], sudo storeboard cleanup orphans [STORE...]")
+	fmt.Fprintln(w, "free it with: storeboard cleanup trash|history [STORE...] [--older-than DUR] [--current], storeboard cleanup orphans [STORE...]")
 }
 
 // keepWords turns a Go duration ("168h0m0s") back into days.
@@ -573,6 +619,52 @@ func keepWords(d string) string {
 		return d
 	}
 	return fmt.Sprintf("%dd", int(dur.Hours()/24))
+}
+
+// pickOrphans asks about each store no longer in the config, one at a
+// time, and returns the ones to forget.
+func pickOrphans(ctx context.Context, socket string, force bool, stderr io.Writer) ([]string, error) {
+	body, err := call(ctx, socket, http.MethodGet, "/v1/cleanup", nil, listTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("cleanup orphans: %w", err)
+	}
+	var st api.CleanupStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return nil, fmt.Errorf("parse cleanup status: %w", err)
+	}
+	if len(st.Orphans) == 0 {
+		fmt.Fprintln(stderr, "no stores left over from the config")
+		return nil, nil
+	}
+	if !stdinIsTerminal() {
+		fmt.Fprintln(stderr, "storeboard: cleanup orphans: not a terminal to ask on; name the stores and pass --yes")
+		return nil, ErrHandled
+	}
+	in := bufio.NewReader(os.Stdin)
+	var chosen []string
+	for _, o := range st.Orphans {
+		fmt.Fprintf(stderr, "\n%s: %s of storeboard data (%d files) and %s of content only it keeps\n",
+			o.Store, humanBytes(o.DataBytes), o.DataFiles, humanBytes(o.ContentBytes))
+		if o.Folder != "" && o.FolderFiles > 0 {
+			fmt.Fprintf(stderr, "  folder %s: %d files, %s - left in place either way\n", o.Folder, o.FolderFiles, humanBytes(o.FolderBytes))
+		}
+		if o.UnsentWrites > 0 && !force {
+			fmt.Fprintf(stderr, "  skipped: %d unsent writes may be the only copy (copy them out, or rerun with --force)\n", o.UnsentWrites)
+			continue
+		}
+		fmt.Fprintf(stderr, "Forget %s? [y/N] ", o.Store)
+		answer, err := in.ReadString('\n')
+		if a := strings.ToLower(strings.TrimSpace(answer)); a == "y" || a == "yes" {
+			chosen = append(chosen, o.Store)
+		}
+		if err != nil {
+			break // end of input: everything not yet answered stays
+		}
+	}
+	if len(chosen) == 0 {
+		fmt.Fprintln(stderr, "\nleft as it was")
+	}
+	return chosen, nil
 }
 
 func cleanupIsEmpty(res *api.CleanupResult) bool {

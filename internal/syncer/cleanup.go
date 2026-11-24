@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -281,8 +282,8 @@ func (e *Engine) RunCleanup(req api.CleanupRequest, uid int) (api.CleanupResult,
 		return e.finishCleanup(res, plan, req.DryRun)
 
 	case CleanupOrphans:
-		if uid != 0 {
-			return res, fmt.Errorf("forgetting a store no longer in the config needs root: it has no owner left to ask")
+		if !req.DryRun && !e.ownsRoot(uid) {
+			return res, fmt.Errorf("forgetting a store no longer in the config needs root or the owner of %s: it has no owner of its own left to ask", e.cfg.Root)
 		}
 		if req.OlderThan != "" || req.Current {
 			return res, fmt.Errorf("orphans cleanup takes no --older-than or --current")
@@ -304,7 +305,7 @@ func (e *Engine) RunCleanup(req api.CleanupRequest, uid int) (api.CleanupResult,
 			if !validStoreName(id) || !known[id] {
 				return res, fmt.Errorf("no leftover store %q (storeboard space lists them)", id)
 			}
-			if n := e.unsentWrites(id); n > 0 && !req.Force {
+			if n := e.unsentWrites(id); n > 0 && !req.Force && !req.DryRun {
 				return res, fmt.Errorf("store %q has %d unsent writes in %s that may be the only copy; copy them out, or pass --force", id, n, queueBytesDir(e.dataDir, id))
 			}
 		}
@@ -328,6 +329,9 @@ func (e *Engine) RunCleanup(req api.CleanupRequest, uid int) (api.CleanupResult,
 				item.Note = fmt.Sprintf("folder %s left in place (%d files, %s): it is yours to keep or delete", root, f, humanSize(b))
 			} else if !req.DryRun {
 				removeEmptyDirs(root)
+			}
+			if n := e.unsentWrites(id); n > 0 && req.DryRun {
+				item.Note = strings.TrimSpace(item.Note + fmt.Sprintf("\n%d unsent writes in %s; forgetting it needs --force", n, queueBytesDir(e.dataDir, id)))
 			}
 			plan.orphans[id] = true
 			res.OrphanStores = append(res.OrphanStores, id)
@@ -582,4 +586,18 @@ func (e *Engine) CleanupStatus() (api.CleanupStatus, error) {
 		st.Orphans[i].ContentBytes = exclusive[orphanGroup[st.Orphans[i].Store]]
 	}
 	return st, nil
+}
+
+// ownsRoot reports whether uid is root or owns the storeboard root, the one
+// owner a store the config no longer names still has.
+func (e *Engine) ownsRoot(uid int) bool {
+	if uid == 0 {
+		return true
+	}
+	fi, err := os.Stat(e.cfg.Root)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == uid
 }
