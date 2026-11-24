@@ -252,6 +252,11 @@ type Engine struct {
 	scanEvery, linkEvery, indexEvery, pruneEvery time.Duration
 
 	blobFrames [blobShards]chan peerFrame
+	// Blob flow control (credit.go): what this side may still send per
+	// link, and what it owes each peer in acknowledgements.
+	creditMu sync.Mutex
+	credits  map[transport.Sender]*credit
+	owed     map[string]int64
 
 	// evalCh asks evaluateLoop to re-check which streamed stores have a
 	// holder; capacity one, so requests coalesce.
@@ -319,7 +324,11 @@ const (
 	wantQueueBytes = 4 << 20
 	readQueueBytes = 4 << 20
 	opsQueueBytes  = 16 << 20
-	blobFrameQueue = 64
+	// blobFrameQueue holds a shard's incoming chunks. A peer that keeps a
+	// blob window (credit.go) never has more than blobWindow in flight, so
+	// this is room for several such peers in one shard without the link's
+	// read loop ever waiting; an older peer still blocks it when full.
+	blobFrameQueue = 128
 )
 
 // frameQueue is one worker's backlog: FIFO, bounded by bytes, and never
@@ -501,12 +510,16 @@ func (e *Engine) startFrameWorkers() {
 					case <-e.closed:
 						return
 					case pf := <-ch:
+						if hook := blobWorkHook.Load(); hook != nil {
+							(*hook)(e, pf)
+						}
 						switch pf.fr.Type {
 						case "blob":
 							e.handleBlob(pf.peer, &pf.fr)
 						case "blobEnd":
 							e.handleBlobEnd(pf.peer, &pf.fr)
 						}
+						e.returnCredit(pf.peer, pf.size, len(ch) == 0)
 					}
 				}
 			}(ch)
@@ -597,6 +610,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 		reads:       map[int64]chan readReply{},
 		holderRates: map[string]holderRate{},
 		readGates:   map[string]*readGate{},
+		credits:     map[transport.Sender]*credit{},
+		owed:        map[string]int64{},
 		readCancels: map[cancelKey]time.Time{},
 		verified:    map[string]verifiedFile{},
 		fullSent:    map[string]fullIndexMark{},
@@ -1037,9 +1052,18 @@ var _ transport.UrgentHandler = (*Engine)(nil)
 func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 	e.cancelPeerSends(peer)
 	e.mu.Lock()
+	prev := e.sends[peer]
 	e.sends[peer] = send
 	stale := e.forgetPeerLocked(peer)
 	e.mu.Unlock()
+	if prev != nil && !sameSender(prev, send) {
+		e.forgetCredit(prev)
+	}
+	// Acknowledgements owed for the old link's chunks mean nothing on this
+	// one: the peer's window for it starts empty.
+	e.creditMu.Lock()
+	delete(e.owed, peer)
+	e.creditMu.Unlock()
 	e.peerLinkChanged(peer) // reads sent over a replaced link will not be answered
 	closeIncoming(stale)
 
@@ -1080,6 +1104,7 @@ func (e *Engine) OnPeerDisconnected(peer string, send transport.Sender) {
 	e.peerLinkChanged(peer)
 	closeIncoming(stale)
 	e.cancelPeerSends(peer)
+	e.forgetCredit(send)
 	e.requestEvaluate()
 }
 
@@ -1158,6 +1183,8 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 		e.noteReadCancel(peer, fr.ID)
 	case "blob", "blobEnd":
 		e.enqueueBlob(e.blobFrames[blobShard(peer, &fr)], pf)
+	case "blobCredit":
+		e.gotCredit(peer, fr.Length)
 	}
 }
 
@@ -1170,6 +1197,13 @@ func (e *Engine) OnPeerUrgent(peer string, line []byte) bool {
 	// Every frame off the link passes here first: it is the evidence a
 	// streamed read waits on that the holder is still sending (readStalled).
 	e.heard(peer)
+	if bytes.HasPrefix(line, creditPrefix) {
+		var fr frame
+		if json.Unmarshal(line, &fr) == nil {
+			e.gotCredit(peer, fr.Length)
+		}
+		return true
+	}
 	for _, prefix := range urgentPrefixes {
 		if bytes.HasPrefix(line, prefix) {
 			var fr frame
@@ -1182,6 +1216,10 @@ func (e *Engine) OnPeerUrgent(peer string, line []byte) bool {
 	}
 	return false
 }
+
+// creditPrefix marks a receiver's blob acknowledgement: a sender's transfers
+// wait on it, so it is taken off the read loop like a read's reply.
+var creditPrefix = []byte(`{"type":"blobCredit"`)
 
 var urgentPrefixes = [][]byte{
 	[]byte(`{"type":"readData"`),

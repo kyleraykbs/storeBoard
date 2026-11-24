@@ -361,7 +361,7 @@ func TestInteractiveLaneGoesBeforeBulk(t *testing.T) {
 		deadline := time.Now().Add(time.Second)
 		for {
 			w.mu.Lock()
-			n := w.waiting[lane]
+			n := len(w.queues[lane])
 			w.mu.Unlock()
 			if n > 0 || time.Now().After(deadline) {
 				return
@@ -376,5 +376,64 @@ func TestInteractiveLaneGoesBeforeBulk(t *testing.T) {
 	wg.Wait()
 	if len(order) != 3 || order[0] != lanePriority || order[1] != laneInteractive || order[2] != laneBulk {
 		t.Fatalf("lanes served in order %v, want priority, interactive, bulk", order)
+	}
+}
+
+// Writers that keep coming back - transfers sending chunk after chunk - take
+// turns: interactive and bulk alternate, and two transfers in one lane
+// alternate, so neither starves the other.
+func TestLanesShareTheLinkEvenly(t *testing.T) {
+	w := newLinkWriter(nil)
+	w.acquire(lanePriority) // hold the link while everyone queues
+	var mu sync.Mutex
+	var order []string
+	var wg sync.WaitGroup
+	const turns = 20
+	writer := func(name string, lane int) {
+		defer wg.Done()
+		for i := 0; i < turns; i++ {
+			w.acquire(lane)
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			w.release()
+		}
+	}
+	wg.Add(3)
+	go writer("video", laneInteractive)
+	go writer("copyA", laneBulk)
+	go writer("copyB", laneBulk)
+	waitQueued := func(lane, n int) {
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			w.mu.Lock()
+			got := len(w.queues[lane])
+			w.mu.Unlock()
+			if got >= n {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("writers never queued on lane %d", lane)
+	}
+	waitQueued(laneInteractive, 1)
+	waitQueued(laneBulk, 2)
+	w.release()
+	wg.Wait()
+
+	// While all three were busy (the first 2*turns turns at least), the
+	// video had every other turn and the copies split the rest.
+	window := order[:turns]
+	count := map[string]int{}
+	for _, name := range window {
+		count[name]++
+	}
+	if count["video"] < turns/2-1 || count["copyA"] < turns/4-1 || count["copyB"] < turns/4-1 {
+		t.Fatalf("first %d turns %v: %v", turns, count, window)
+	}
+	for i := 1; i < len(window); i++ {
+		if window[i] == window[i-1] && window[i] != "video" {
+			t.Fatalf("%s took two turns in a row while others waited: %v", window[i], window)
+		}
 	}
 }

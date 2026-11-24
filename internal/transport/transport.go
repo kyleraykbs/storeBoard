@@ -303,8 +303,12 @@ type linkWriter struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	busy bool
-	// waiting counts writers queued at each level (see the lane constants).
-	waiting [lanes]int
+	// queues holds each lane's waiting writers by ticket, oldest first.
+	queues [lanes][]uint64
+	ticket uint64
+	// lastShared is the lane that had the last turn when interactive and
+	// bulk writers were both waiting.
+	lastShared int
 	c       net.Conn
 	// features is what the peer's hello advertised.
 	features []string
@@ -322,15 +326,14 @@ type linkWriter struct {
 // up to a blob chunk a frame, a large one is a lot of memory per link.
 const linkFrameQueue = 128
 
-// Lanes, most urgent first. A writer waits while the socket is busy or while
-// anyone is queued at a more urgent lane, so it only ever waits behind the
-// frame currently on the wire plus more urgent traffic.
-//
-// Interactive sits between the two others for a reason: a streamed read is
-// what someone is looking at right now (a photo half drawn on screen), and
-// used to take turns with background sync chunks on the bulk lane - on a slow
-// link, one turn per chunk of a whole-file transfer. It is big frames, so it
-// still yields to control traffic and keepalives.
+// Lanes. Priority (control frames, keepalives) always goes first. The other
+// two take turns frame for frame while both have writers waiting:
+// interactive is a streamed read someone is looking at, bulk a background
+// transfer, and strict priority let a playing video starve a copy - or a
+// streamed read of a big file starve everything behind it. Within a lane
+// writers go in the order they asked, and a transfer asks again for each
+// chunk, so concurrent transfers share the link evenly instead of one
+// winning every race for the lock.
 const (
 	lanePriority = iota
 	laneInteractive
@@ -338,31 +341,50 @@ const (
 	lanes
 )
 
+// notSentLowat bounds the bytes the kernel holds unsent (see tuneConn): about
+// half a blob frame, so the next turn is decided within one frame's time.
+const notSentLowat = 128 << 10
+
 func newLinkWriter(c net.Conn) *linkWriter {
-	w := &linkWriter{c: c}
+	w := &linkWriter{c: c, lastShared: laneBulk}
 	w.cond = sync.NewCond(&w.mu)
 	return w
 }
 
-// acquire takes the socket for a writer at the given lane.
+// acquire takes the socket for a writer at the given lane, in its turn.
 func (w *linkWriter) acquire(lane int) {
 	w.mu.Lock()
-	w.waiting[lane]++
-	for w.busy || w.moreUrgentWaiting(lane) {
+	w.ticket++
+	me := w.ticket
+	w.queues[lane] = append(w.queues[lane], me)
+	for w.busy || w.nextLocked() != lane || w.queues[lane][0] != me {
 		w.cond.Wait()
 	}
-	w.waiting[lane]--
+	w.queues[lane] = w.queues[lane][1:]
+	if lane != lanePriority {
+		w.lastShared = lane
+	}
 	w.busy = true
 	w.mu.Unlock()
 }
 
-func (w *linkWriter) moreUrgentWaiting(lane int) bool {
-	for l := 0; l < lane; l++ {
-		if w.waiting[l] > 0 {
-			return true
-		}
+// nextLocked is the lane whose oldest writer goes next.
+func (w *linkWriter) nextLocked() int {
+	if len(w.queues[lanePriority]) > 0 {
+		return lanePriority
 	}
-	return false
+	ia, bulk := len(w.queues[laneInteractive]) > 0, len(w.queues[laneBulk]) > 0
+	switch {
+	case ia && bulk:
+		if w.lastShared == laneInteractive {
+			return laneBulk
+		}
+		return laneInteractive
+	case ia:
+		return laneInteractive
+	default:
+		return laneBulk
+	}
 }
 
 func (w *linkWriter) release() {
@@ -549,6 +571,9 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) (rebind bool)
 		delay := acceptBackoffMin
 		for {
 			c, err := ln.Accept()
+			if err == nil {
+				tuneConn(c)
+			}
 			if err != nil {
 				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 					acceptErr <- nil
@@ -652,6 +677,7 @@ func (m *Manager) tryDial(ctx context.Context, p *peerState) {
 			m.noteDialFailure(p, ep, err)
 			continue
 		}
+		tuneConn(c)
 		h, reader, herr := m.handshake(c)
 		if herr != nil {
 			m.noteDialFailure(p, ep, herr)

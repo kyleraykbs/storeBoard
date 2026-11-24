@@ -492,7 +492,7 @@ func (e *Engine) runSend(j *sendJob) {
 		if n > 0 {
 			// Bulk: index frames for every store overtake a transfer in
 			// progress instead of waiting behind gigabytes of video.
-			if err := sendOn(send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: seq, Data: buf[:n]}, true); err != nil {
+			if err := e.sendBlobFrame(j.ctx, send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: seq, Data: buf[:n]}, true); err != nil {
 				return
 			}
 			seq++
@@ -502,7 +502,7 @@ func (e *Engine) runSend(j *sendJob) {
 			// never opened a transfer and dropped the blobEnd on the floor.
 			// Send the empty first chunk to open the transfer.
 			if seq == 0 {
-				if err := sendOn(send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: 0}, true); err != nil {
+				if err := e.sendBlobFrame(j.ctx, send, frame{Type: "blob", Store: fs.name, Path: j.path, Blob: ent.Blob, Seq: 0}, true); err != nil {
 					return
 				}
 			}
@@ -516,7 +516,7 @@ func (e *Engine) runSend(j *sendJob) {
 	if j.ctx.Err() != nil {
 		return
 	}
-	if err := sendOn(send, frame{Type: "blobEnd", Store: fs.name, Path: j.path, Blob: ent.Blob, Entry: ent, Offset: j.offset, Length: j.length}, false); err != nil {
+	if err := e.sendBlobFrame(j.ctx, send, frame{Type: "blobEnd", Store: fs.name, Path: j.path, Blob: ent.Blob, Entry: ent, Offset: j.offset, Length: j.length}, false); err != nil {
 		e.logger.Debug("blobEnd", "peer", j.peer, "error", err)
 	}
 }
