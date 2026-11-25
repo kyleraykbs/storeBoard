@@ -31,7 +31,7 @@ Go module `codeberg.org/kyleraykbs/storeboard`.
 - `internal/transport` — the peer wire: listener, dial loops, hello
   handshake, keepalives, cross-dial tie-break; hands frames to a Handler
   (the engine).
-- `internal/server` — the unix-socket HTTP server, socket lifecycle (stale
+- `internal/server` — the unix-socket HTTP server (status, store verbs incl. `scan`), socket lifecycle (stale
   takeover, live-daemon refusal, cleanup) and the `/v1/status` document.
 - `internal/cli` — the command set; stdout carries reports/data, stderr
   carries diagnostics; `ErrHandled` marks a failure already reported.

@@ -1654,3 +1654,33 @@ func TestUnreadableDirectoryIsSkippedNotDeleted(t *testing.T) {
 		t.Fatalf("file inside the unreadable directory was tombstoned: %+v", ent)
 	}
 }
+
+// TestScanSoon: with the poll far away, asking for a scan carries a new
+// file to the peer at once, which is what StrongBox does after a write.
+func TestScanSoon(t *testing.T) {
+	old := scanInterval
+	scanInterval = time.Hour
+	defer func() { scanInterval = old }()
+
+	epA, epB := twoEndpoints(t)
+	a := mkNode(t, "a", "b", epA, epB)
+	b := mkNode(t, "b", "a", epB, epA)
+	startNode(t, a)
+	startNode(t, b)
+	time.Sleep(300 * time.Millisecond) // the first scans and the link
+
+	writeFile(t, filepath.Join(a.root("docs"), "slot.age"), "x", time.Now())
+	time.Sleep(500 * time.Millisecond)
+	if exists(filepath.Join(b.root("docs"), "slot.age")) {
+		t.Fatal("arrived without a scan; the test proves nothing")
+	}
+	if err := a.eng.ScanSoon("docs"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the file on B after a scan request", func() bool {
+		return exists(filepath.Join(b.root("docs"), "slot.age"))
+	})
+	if err := a.eng.ScanSoon("nope"); err == nil {
+		t.Fatal("an unknown store accepted")
+	}
+}

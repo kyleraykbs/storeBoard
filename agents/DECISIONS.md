@@ -472,3 +472,15 @@
 - **Reversible:** every frame field and frame type is additive; a peer
   without the features is served the old way.
 
+
+## 2026-11-24 — POST /v1/stores/<name>/scan: scan now, not at the next poll
+
+- **Decision:** a store's scan loop also takes requests (`Engine.ScanSoon`, the socket's
+  `scan` verb); any number while one is pending make one pass, run in the loop itself, so
+  a request never overlaps a scan. Anyone who can reach the socket may ask: a scan only
+  reads what is there.
+- **Why:** StrongBox keeps its store in a storeboard store, and enrolling a machine is a
+  request one way and a slot back: two 15 s polls, 30 s of waiting on a LAN. StrongBox
+  now asks for a scan after it writes. inotify was the alternative; a request is a much
+  smaller change to the engine and covers any program that writes into a store.
+- **Reversible:** yes; nothing else depends on it.

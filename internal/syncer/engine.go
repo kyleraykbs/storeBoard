@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -124,6 +125,9 @@ type StoreState struct {
 
 	perm   perms
 	scanMu sync.Mutex
+	// scanSoon asks the scan loop for a pass now: a program that just
+	// wrote into the store (StrongBox) need not wait for the next poll.
+	scanSoon chan struct{}
 
 	// metaMu guards published, the status document's copy of this store's
 	// state. Snapshot refreshes it whenever the scan lock happens to be
@@ -665,6 +669,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 			state = stateDetached
 		}
 		fs := &StoreState{
+			scanSoon:  make(chan struct{}, 1),
 			name:      v.ID,
 			group:     v.Group,
 			stream:    streamMode,
@@ -950,8 +955,25 @@ func (e *Engine) scanLoop(ctx context.Context, fs *StoreState) {
 			return
 		case <-t.C:
 			e.scanOnce(fs)
+		case <-fs.scanSoon:
+			e.scanOnce(fs)
 		}
 	}
+}
+
+// ScanSoon asks for a scan of a store now instead of at the next poll. The
+// pass runs in the store's own scan loop, so requests never overlap a scan,
+// and any number of them while one is pending make one pass.
+func (e *Engine) ScanSoon(name string) error {
+	fs := e.byName[name]
+	if fs == nil {
+		return fmt.Errorf("unknown store %q", name)
+	}
+	select {
+	case fs.scanSoon <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (e *Engine) broadcastFullIndex(fs *StoreState) error {

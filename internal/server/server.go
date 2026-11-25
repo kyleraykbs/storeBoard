@@ -289,6 +289,7 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 //	POST /v1/stores/<name>/takeover
 //	POST /v1/stores/<name>/restore   {"path": …, "blob"?: …, "at"?: …, "to"?: …}
 //	POST /v1/stores/<name>/send      {"source": …, "path"?: …}
+//	POST /v1/stores/<name>/scan      scan now, not at the next poll
 func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/stores/")
 	name, verb, ok := strings.Cut(rest, "/")
@@ -305,9 +306,26 @@ func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 		s.handleRestore(w, r, name)
 	case "send":
 		s.handleSend(w, r, name)
+	case "scan":
+		s.handleScan(w, r, name)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("no such store verb %q", verb)})
 	}
+}
+
+// handleScan scans a store now. Anyone who can reach the socket may ask:
+// a scan only reads what is already there.
+func (s *Server) handleScan(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if err := s.engine.ScanSoon(name); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"scan": "requested"})
 }
 
 // handleSend copies a local file into a store: the share sheet's path onto
