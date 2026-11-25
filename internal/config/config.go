@@ -296,6 +296,10 @@ type Config struct {
 	// Permissions overrides, per store on THIS machine, the ownership and
 	// mode the daemon gives the store's entries.
 	Permissions map[string]Permissions `json:"permissions,omitempty"`
+
+	// RequestedBy names, for stores merged from runtime requests
+	// (WithRequested), who asked. It is never read from the config file.
+	RequestedBy map[string]string `json:"-"`
 }
 
 type StoreView struct {
@@ -887,12 +891,13 @@ func (c *Config) Stores() []api.Store {
 			symlinks = []string{}
 		}
 		out = append(out, api.Store{
-			Name:     v.ID,
-			Group:    v.Group,
-			Sync:     v.Sync,
-			Root:     v.Dir,
-			Symlinks: symlinks,
-			Links:    v.Links,
+			Name:        v.ID,
+			Group:       v.Group,
+			Sync:        v.Sync,
+			Root:        v.Dir,
+			Symlinks:    symlinks,
+			Links:       v.Links,
+			RequestedBy: c.RequestedBy[v.ID],
 		})
 	}
 	return out

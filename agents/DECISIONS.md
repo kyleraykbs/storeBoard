@@ -484,3 +484,21 @@
   now asks for a scan after it writes. inotify was the alternative; a request is a much
   smaller change to the engine and covers any program that writes into a store.
 - **Reversible:** yes; nothing else depends on it.
+
+## 2026-11-25 — Programs may request their own stores
+
+- **Decision (author's idea, this shape agreed):** `POST /v1/stores {name, group, sync?,
+  permissions?, noBackup?}` lets a program ask for a store. A system service may only ask
+  for names in its own namespace (`strongbox.service` → `strongbox.*`, from the peer's
+  cgroup; a user's own services count as nobody); root outside a service may ask for any.
+  The group must be declared with this machine in it: a program never picks peers.
+- **The config always wins:** a declared store of the same name is the answer, and every
+  setting (sync, holder, symlinks, permissions, device overrides) stays declarable.
+  Requests live in `<dataDir>/requested.json` and are merged at start
+  (`Config.WithRequested`) for names nothing declares; status shows `requestedBy`.
+  Nothing requested is ever deleted automatically.
+- **How a new one is carried:** the engine builds its stores once, so a new request ends
+  the daemon's pass and `storeboardd` builds itself again with it merged in, in-process.
+  Requests are rare (once per program per machine), so this beats making the engine's
+  store set mutable.
+- **Reversible:** yes: delete requested.json and the stores are no longer carried.

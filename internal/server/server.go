@@ -66,6 +66,11 @@ type Server struct {
 	closed    bool
 	cancelRun context.CancelFunc
 	engineRun chan struct{}
+
+	// restart is closed when a program requested a new store: the daemon
+	// then builds itself again with the store merged in (cmd/storeboardd).
+	restart     chan struct{}
+	restartOnce sync.Once
 }
 
 // New prepares the state and socket directories, then binds the socket. A
@@ -141,6 +146,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	ok = true
 
 	s := &Server{
+		restart:   make(chan struct{}),
 		cfg:       cfg,
 		logger:    logger,
 		startedAt: time.Now(),
@@ -159,8 +165,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		// world-writable socket cannot be used to move somebody else's files
 		// (DESIGN invariant 10).
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if uid, ok := peerUID(c); ok {
-				return context.WithValue(ctx, peerUIDKey{}, uid)
+			if uid, pid, ok := peerCred(c); ok {
+				ctx = context.WithValue(ctx, peerUIDKey{}, uid)
+				return context.WithValue(ctx, peerPIDKey{}, pid)
 			}
 			return ctx
 		},
@@ -185,6 +192,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/v1/space", s.handleSpace)
 	mux.HandleFunc("/v1/doctor", s.handleDoctor)
 	mux.HandleFunc("/v1/cleanup", s.handleCleanup)
+	mux.HandleFunc("/v1/stores", s.handleRequestStore)
 	mux.HandleFunc("/v1/stores/", s.handleStore)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
@@ -586,15 +594,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // connection (Linux SO_PEERCRED). It reports false when the connection
 // cannot say — the caller then refuses the request rather than guessing.
 func peerUID(c net.Conn) (int, bool) {
+	uid, _, ok := peerCred(c)
+	return uid, ok
+}
+
+// peerCred is the uid and pid of the process on the other end.
+func peerCred(c net.Conn) (int, int, bool) {
 	sc, ok := c.(syscall.Conn)
 	if !ok {
-		return -1, false
+		return -1, -1, false
 	}
 	raw, err := sc.SyscallConn()
 	if err != nil {
-		return -1, false
+		return -1, -1, false
 	}
-	uid := -1
+	uid, pid := -1, -1
 	var readErr error
 	if err := raw.Control(func(fd uintptr) {
 		cred, cerr := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
@@ -602,12 +616,12 @@ func peerUID(c net.Conn) (int, bool) {
 			readErr = cerr
 			return
 		}
-		uid = int(cred.Uid)
+		uid, pid = int(cred.Uid), int(cred.Pid)
 	}); err != nil {
-		return -1, false
+		return -1, -1, false
 	}
 	if readErr != nil || uid < 0 {
-		return -1, false
+		return -1, -1, false
 	}
-	return uid, true
+	return uid, pid, true
 }

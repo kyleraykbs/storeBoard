@@ -36,15 +36,9 @@ func run() int {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	cfg, err := config.Load(config.ResolvePath(*configPath))
+	declared, err := config.Load(config.ResolvePath(*configPath))
 	if err != nil {
 		logger.Error("invalid config", "error", err)
-		return 1
-	}
-
-	srv, err := server.New(cfg, logger)
-	if err != nil {
-		logger.Error("startup failed", "error", err)
 		return 1
 	}
 
@@ -58,14 +52,45 @@ func run() int {
 		stop()
 	}()
 
-	code := 0
-	if err := srv.Run(ctx); err != nil {
-		logger.Error("server failed", "error", err)
-		code = 1
+	// Each pass is the declared config plus the stores programs requested;
+	// a new request ends the pass and the next one carries it.
+	for {
+		req, err := config.LoadRequested(declared.DataDir)
+		if err != nil {
+			logger.Error("requested stores", "error", err)
+			return 1
+		}
+		cfg, merged := declared.WithRequested(req)
+		if len(merged) > 0 {
+			logger.Info("carrying requested stores", "stores", merged)
+		}
+		srv, err := server.New(cfg, logger)
+		if err != nil {
+			logger.Error("startup failed", "error", err)
+			return 1
+		}
+		pass, endPass := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-srv.Restart():
+				logger.Info("a store was requested; starting again to carry it")
+			case <-pass.Done():
+			}
+			endPass()
+		}()
+		code := 0
+		if err := srv.Run(pass); err != nil {
+			logger.Error("server failed", "error", err)
+			code = 1
+		}
+		if err := srv.Close(); err != nil {
+			logger.Error("close failed", "error", err)
+			code = 1
+		}
+		restarting := ctx.Err() == nil && code == 0
+		endPass()
+		if !restarting {
+			return code
+		}
 	}
-	if err := srv.Close(); err != nil {
-		logger.Error("close failed", "error", err)
-		code = 1
-	}
-	return code
 }

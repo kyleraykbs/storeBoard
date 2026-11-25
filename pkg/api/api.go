@@ -45,6 +45,9 @@ type Store struct {
 	Root     string            `json:"root"`
 	Symlinks []string          `json:"symlinks"`
 	Links    map[string]string `json:"links"`
+	// RequestedBy is set for a store a program requested at runtime instead
+	// of one the config declares: the service that asked, or "root".
+	RequestedBy string `json:"requestedBy,omitempty"`
 }
 
 // Connection is this machine's link to one declared peer, as the daemon

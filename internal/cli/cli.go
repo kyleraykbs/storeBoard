@@ -1160,6 +1160,9 @@ func renderStatus(w io.Writer, st *api.Status) {
 			where = s.Parent + "/" + s.Path + " -> " + s.Root
 		}
 		fmt.Fprintf(w, "  %s\n    group %s\n    sync  %s\n    root  %s\n", s.Name, s.Group, s.Sync, where)
+		if s.RequestedBy != "" {
+			fmt.Fprintf(w, "    requested by %s\n", s.RequestedBy)
+		}
 		if len(s.Symlinks) > 0 {
 			fmt.Fprintf(w, "    links %s\n", strings.Join(s.Symlinks, " "))
 		}
