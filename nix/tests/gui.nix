@@ -11,6 +11,7 @@ let
       environment = {
         STOREBOARD_GUI_PAGE = if force then pkgs.lib.mkForce p else p;
         STOREBOARD_GUI_EXPAND = "1";
+        STOREBOARD_GUI_TRACE = "1";
       };
     };
   };
@@ -76,9 +77,13 @@ in
         machine.succeed(f"{base}/specialisation/{p}/bin/switch-to-configuration test")
         machine.succeed("systemctl reset-failed cage-tty1.service; systemctl restart cage-tty1.service")
         machine.wait_for_unit("cage-tty1.service")
-        # Stores: long enough for several redraws (scans move the times), so
-        # the screenshot shows whether an open row stays open by itself.
+        # Stores: long enough for the data to change several times (scans
+        # move the times); the page must update in place, not be rebuilt.
         machine.sleep(40 if p == "stores" else 8)
         machine.screenshot(p)
+        if p == "stores":
+            since = machine.succeed("systemctl show -p ActiveEnterTimestamp --value cage-tty1.service").strip()
+            rebuilt = machine.succeed(f"journalctl -b --since '{since}' -o cat | grep -c 'rebuild Stores (data)' || true").strip()
+            assert rebuilt == "1", f"the Stores page was built from data {rebuilt} times in 40 s"
   '';
 }

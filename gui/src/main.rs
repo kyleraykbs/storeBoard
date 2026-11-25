@@ -53,6 +53,11 @@ struct Inner {
     /// Space and cleanup, counted separately (they are slow), and when.
     heavy: RefCell<Option<Result<api::Heavy, String>>>,
     heavy_at: std::cell::Cell<Option<std::time::Instant>>,
+    /// How the page on screen updates itself from new data, and the shape
+    /// it was built for: new data of the same shape updates the widgets in
+    /// place (scroll, open rows and menus stay); a new shape rebuilds.
+    live: RefCell<Vec<Box<dyn Fn(&Snapshot)>>>,
+    shape: RefCell<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -117,7 +122,7 @@ impl Ui {
         bp.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(bp);
 
-        let ui = Ui(Rc::new(Inner { window, toasts, split, sidebar, content, title, page: RefCell::new(Page::Overview), snap: RefCell::new(None), shown: RefCell::new(None), opened: std::cell::Cell::new(false), heavy: RefCell::new(None), heavy_at: std::cell::Cell::new(None) }));
+        let ui = Ui(Rc::new(Inner { window, toasts, split, sidebar, content, title, page: RefCell::new(Page::Overview), snap: RefCell::new(None), shown: RefCell::new(None), opened: std::cell::Cell::new(false), heavy: RefCell::new(None), heavy_at: std::cell::Cell::new(None), live: RefCell::new(vec![]), shape: RefCell::new(None) }));
         let u = ui.clone();
         ui.sidebar.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -162,16 +167,7 @@ impl Ui {
         }
         let u = self.clone();
         glib::spawn_future_local(async move {
-            let snap = gio::spawn_blocking(api::snapshot).await.unwrap_or_else(|_| Err("crashed".into())).map(|mut s| {
-                // The uptime moves every second; on its own it is no reason
-                // to redraw (the next real change shows it).
-                if let Some(Ok(old)) = u.snap.borrow().as_ref() {
-                    if old.status.version == s.status.version && s.status.uptime >= old.status.uptime {
-                        s.status.uptime = old.status.uptime;
-                    }
-                }
-                s
-            });
+            let snap = gio::spawn_blocking(api::snapshot).await.unwrap_or_else(|_| Err("crashed".into()));
             if u.snap.borrow().as_ref() == Some(&snap) {
                 return;
             }
@@ -194,7 +190,7 @@ impl Ui {
             if u.heavy.borrow().as_ref() != Some(&h) {
                 *u.heavy.borrow_mut() = Some(h);
                 if *u.page.borrow() == Page::Space {
-                    u.render();
+                    u.rebuild();
                 }
             }
         });
@@ -216,39 +212,85 @@ impl Ui {
         });
     }
 
+    /// Shows new data: in place when the page has the same shape, else a
+    /// fresh page.
     fn render(&self) {
+        let page = *self.page.borrow();
+        let snap = self.snap.borrow().clone();
+        self.badges(snap.as_ref().and_then(|s| s.as_ref().ok()));
+        if let Some(Ok(s)) = &snap {
+            let shape = shape_of(page, s);
+            if *self.shown.borrow() == Some(page) && self.shape.borrow().as_deref() == Some(shape.as_str()) {
+                for f in self.live.borrow().iter() {
+                    f(s);
+                }
+                return;
+            }
+        }
+        self.rebuild();
+    }
+
+    /// Builds the page from scratch: on a page change, a new shape, or new
+    /// counts for the Space page.
+    fn rebuild(&self) {
         let page = *self.page.borrow();
         let (_, name, _) = PAGES.iter().find(|p| p.0 == page).copied().unwrap();
         self.title.set_title(name);
         let snap = self.snap.borrow().clone();
-        self.badges(snap.as_ref().and_then(|s| s.as_ref().ok()));
-        let view: gtk::Widget = match snap {
+        self.live.borrow_mut().clear();
+        *self.shape.borrow_mut() = None;
+        // STOREBOARD_GUI_TRACE: say when a page is built from scratch (the
+        // VM test checks that new data alone never does it).
+        if std::env::var("STOREBOARD_GUI_TRACE").is_ok() {
+            eprintln!("storeboard-gui: rebuild {name} ({})", match &snap { None => "loading", Some(Err(_)) => "error", Some(Ok(_)) => "data" });
+        }
+        let view: gtk::Widget = match &snap {
             None => adw::Spinner::new().upcast(),
             Some(Err(e)) => adw::StatusPage::builder()
                 .icon_name("network-offline-symbolic")
                 .title("storeboard is not reachable")
-                .description(format!("{e}\n\nIt runs as storeboard.service."))
+                .description(format!("{e}\n\nIt runs as storeboard.service. This window tries again by itself."))
                 .build()
                 .upcast(),
-            Some(Ok(s)) => match page {
-                Page::Overview => self.overview(&s),
-                Page::Stores => self.stores(&s),
-                Page::Peers => self.peers(&s),
-                Page::Space => self.space(),
-            },
+            Some(Ok(s)) => {
+                let v = match page {
+                    Page::Overview => self.overview(s),
+                    Page::Stores => self.stores(s),
+                    Page::Peers => self.peers(s),
+                    Page::Space => self.space(),
+                };
+                *self.shape.borrow_mut() = Some(shape_of(page, s));
+                // Each live part sets itself from the data it was built with.
+                for f in self.live.borrow().iter() {
+                    f(s);
+                }
+                v
+            }
         };
-        // Same page redrawn: keep where the reader was.
-        let same = *self.shown.borrow() == Some(page);
-        let keep = self.content.first_child().filter(|_| same).map(|c| kept(&c));
         while let Some(c) = self.content.first_child() {
             self.content.remove(&c);
         }
         view.set_vexpand(true);
         self.content.append(&view);
-        if let Some(k) = keep {
-            restore(&view, k);
-        }
         *self.shown.borrow_mut() = Some(page);
+    }
+
+    /// Registers how part of the page follows new data.
+    fn live(&self, f: impl Fn(&Snapshot) + 'static) {
+        self.live.borrow_mut().push(Box::new(f));
+    }
+
+    /// A property row whose value follows new data.
+    fn live_info(&self, title: &str, f: impl Fn(&Snapshot) -> String + 'static) -> adw::ActionRow {
+        let r = info(title, "");
+        let rr = r.clone();
+        self.live(move |s| {
+            let v = glib::markup_escape_text(&f(s)).to_string();
+            if rr.subtitle().as_deref() != Some(v.as_str()) {
+                rr.set_subtitle(&v);
+            }
+        });
+        r
     }
 
     fn badges(&self, s: Option<&Snapshot>) {
@@ -276,36 +318,62 @@ impl Ui {
         let page = adw::PreferencesPage::new();
         let me = adw::PreferencesGroup::builder().title("This machine").build();
         me.add(&info("Peer", &st.peer));
-        me.add(&info("Version", &format!("{} · up {}", st.version, api::duration(st.uptime))));
+        me.add(&self.live_info("Version", |s| format!("{} · up {}", s.status.version, api::duration(s.status.uptime))));
         let root = info("Root", &st.root);
         root.add_suffix(&open_button(&st.root, self));
         me.add(&root);
         me.add(&info("Daemon state", &st.data_dir));
         page.add(&me);
 
-        let up = st.connections.iter().filter(|c| c.state == "connected").count();
-        let conflicts: i64 = st.sync.iter().map(|x| x.conflicts).sum();
+        let grid = adw::PreferencesGroup::builder().title("At a glance").build();
+        grid.add(&self.live_info("Peers connected", |s| {
+            let up = s.status.connections.iter().filter(|c| c.state == "connected").count();
+            format!("{up} of {}", s.status.connections.len())
+        }));
+        grid.add(&self.live_info("Stores", |s| {
+            let req = s.status.stores.iter().filter(|x| !x.requested_by.is_empty()).count();
+            format!("{} ({req} requested by programs)", s.status.stores.len())
+        }));
         // Pending is "known here but not on this machine": for a streamed
         // store that is every file, by design. In flight is what is moving.
-        let pending: i64 = st.sync.iter().map(|x| x.receiving + if streamed(st, &x.store) { 0 } else { x.pending }).sum();
-        let grid = adw::PreferencesGroup::builder().title("At a glance").build();
-        grid.add(&info("Peers connected", &format!("{up} of {}", st.connections.len())));
-        grid.add(&info("Stores", &format!("{} ({} requested by programs)", st.stores.len(), st.stores.iter().filter(|x| !x.requested_by.is_empty()).count())));
-        grid.add(&info("In flight", &if pending == 0 { "nothing: every store is in step".to_string() } else { format!("{pending} files") }));
-        grid.add(&info("Conflicts", &conflicts.to_string()));
+        grid.add(&self.live_info("In flight", |s| {
+            let st = &s.status;
+            let n: i64 = st.sync.iter().map(|x| x.receiving + if streamed(st, &x.store) { 0 } else { x.pending }).sum();
+            if n == 0 {
+                "nothing: every store is in step".to_string()
+            } else {
+                format!("{n} files")
+            }
+        }));
+        grid.add(&self.live_info("Conflicts", |s| s.status.sync.iter().map(|x| x.conflicts).sum::<i64>().to_string()));
         page.add(&grid);
 
-        let health = adw::PreferencesGroup::builder()
-            .title("Health")
-            .description(format!("storeboard's own checks: {}", if s.doctor.status.is_empty() { "unknown" } else { &s.doctor.status }))
-            .build();
+        let health = adw::PreferencesGroup::builder().title("Health").build();
+        let hg = health.clone();
+        self.live(move |s| {
+            let d = format!("storeboard's own checks: {}", if s.doctor.status.is_empty() { "unknown" } else { &s.doctor.status });
+            if hg.description().as_deref() != Some(d.as_str()) {
+                hg.set_description(Some(&d));
+            }
+        });
         for c in &s.doctor.checks {
-            let r = row(&c.name, &if c.hint.is_empty() { c.detail.clone() } else { format!("{} — {}", c.detail, c.hint) });
-            r.add_prefix(&gtk::Image::from_icon_name(match c.status.as_str() {
-                "ok" => "object-select-symbolic",
-                "warn" | "warning" => "dialog-warning-symbolic",
-                _ => "dialog-error-symbolic",
-            }));
+            let name = c.name.clone();
+            let icon = gtk::Image::new();
+            let r = row(&c.name, "");
+            r.add_prefix(&icon);
+            let rr = r.clone();
+            self.live(move |s| {
+                let Some(c) = s.doctor.checks.iter().find(|c| c.name == name) else { return };
+                let sub = glib::markup_escape_text(&if c.hint.is_empty() { c.detail.clone() } else { format!("{} — {}", c.detail, c.hint) }).to_string();
+                if rr.subtitle().as_deref() != Some(sub.as_str()) {
+                    rr.set_subtitle(&sub);
+                }
+                icon.set_icon_name(Some(match c.status.as_str() {
+                    "ok" => "object-select-symbolic",
+                    "warn" | "warning" => "dialog-warning-symbolic",
+                    _ => "dialog-error-symbolic",
+                }));
+            });
             health.add(&r);
         }
         page.add(&health);
@@ -334,72 +402,96 @@ impl Ui {
     }
 
     fn store_row(&self, s: &Snapshot, st: &api::Store) -> adw::ExpanderRow {
-        let sync = s.status.sync.iter().find(|x| x.store == st.name).cloned().unwrap_or_default();
+        let name = st.name.clone();
         let stream = st.sync == "stream";
-        let subtitle = if stream {
-            format!("streamed · {} · {} files, fetched when opened", sync.state, sync.entries)
-        } else {
-            format!("local · {} · {} files", sync.state, sync.entries)
-        };
-        let r = adw::ExpanderRow::builder().title(glib::markup_escape_text(&st.name)).subtitle(subtitle).build();
-        r.add_prefix(&gtk::Image::from_icon_name(if st.sync == "stream" { "folder-remote-symbolic" } else { "folder-symbolic" }));
+        let sync_of = move |s: &Snapshot, n: &str| s.status.sync.iter().find(|x| x.store == n).cloned().unwrap_or_default();
+        let r = adw::ExpanderRow::builder().title(glib::markup_escape_text(&st.name)).build();
+        r.add_prefix(&gtk::Image::from_icon_name(if stream { "folder-remote-symbolic" } else { "folder-symbolic" }));
         if !st.requested_by.is_empty() {
             let l = gtk::Label::new(Some(&format!("requested by {}", st.requested_by)));
             l.add_css_class("caption");
             l.add_css_class("dim-label");
             r.add_suffix(&l);
         }
-        if sync.conflicts > 0 {
-            let w = gtk::Image::from_icon_name("dialog-warning-symbolic");
-            w.set_tooltip_text(Some(&format!("{} conflicts", sync.conflicts)));
-            r.add_suffix(&w);
-        }
-        // Only real work spins: a streamed store keeps its files elsewhere.
-        if sync.scanning || sync.receiving > 0 || (!stream && sync.pending > 0) {
-            r.add_suffix(&adw::Spinner::new());
-        }
+        // Always there, shown when they mean something: no rebuild needed
+        // when a scan starts or a conflict appears.
+        let warn = gtk::Image::from_icon_name("dialog-warning-symbolic");
+        let spin = adw::Spinner::new();
+        r.add_suffix(&warn);
+        r.add_suffix(&spin);
+        let (rr, n) = (r.clone(), name.clone());
+        self.live(move |s| {
+            let x = sync_of(s, &n);
+            let sub = if stream {
+                format!("streamed · {} · {} files, fetched when opened", x.state, x.entries)
+            } else {
+                format!("local · {} · {} files", x.state, x.entries)
+            };
+            if rr.subtitle().as_str() != sub {
+                rr.set_subtitle(&sub);
+            }
+            warn.set_visible(x.conflicts > 0);
+            warn.set_tooltip_text(Some(&format!("{} conflicts", x.conflicts)));
+            // Only real work spins: a streamed store keeps its files elsewhere.
+            spin.set_visible(x.scanning || x.receiving > 0 || (!stream && x.pending > 0));
+        });
+
         let root = info("Folder", &st.root);
         root.add_suffix(&open_button(&st.root, self));
         r.add_row(&root);
-        r.add_row(&info(
-            "Files",
-            &if stream {
-                format!("{} known · {} kept on this machine · {} arriving", sync.entries, sync.local, sync.receiving)
+        let n = name.clone();
+        r.add_row(&self.live_info("Files", move |s| {
+            let x = sync_of(s, &n);
+            if stream {
+                format!("{} known · {} kept on this machine · {} arriving", x.entries, x.local, x.receiving)
             } else {
-                format!("{} here of {} · {} still to fetch · {} arriving", sync.local, sync.entries, sync.pending, sync.receiving)
-            },
-        ));
-        r.add_row(&info("Last scan", &sync.last_scan.map(|t| api::ago(&t)).unwrap_or("not yet".into())));
-        r.add_row(&info("Ownership", &format!("{}:{} {}", sync.permissions.user, sync.permissions.group, sync.permissions.mode)));
-        for l in &sync.symlinks {
-            let lr = row(&l.path, &if l.busy.is_empty() { l.state.clone() } else { format!("{}: {}", l.state, l.busy) });
-            lr.add_prefix(&gtk::Image::from_icon_name("emblem-symbolic-link-symbolic"));
-            if l.state == "busy" {
-                let b = flat("Take over");
-                b.set_tooltip_text(Some("Move what is in the way into the store and link the folder"));
-                let (u, n) = (self.clone(), st.name.clone());
-                b.connect_clicked(move |_| {
-                    let n2 = n.clone();
-                    u.act(move || api::post(&format!("/v1/stores/{}/takeover", api::esc(&n2)), json!({})), |u, _| u.toast("Taken over"));
-                });
-                lr.add_suffix(&b);
+                format!("{} here of {} · {} still to fetch · {} arriving", x.local, x.entries, x.pending, x.receiving)
             }
+        }));
+        let n = name.clone();
+        r.add_row(&self.live_info("Last scan", move |s| sync_of(s, &n).last_scan.map(|t| api::ago(&t)).unwrap_or("not yet".into())));
+        let n = name.clone();
+        r.add_row(&self.live_info("Ownership", move |s| {
+            let p = sync_of(s, &n).permissions;
+            format!("{}:{} {}", p.user, p.group, p.mode)
+        }));
+        let links = s.status.sync.iter().find(|x| x.store == st.name).map(|x| x.symlinks.clone()).unwrap_or_default();
+        for l in &links {
+            let lr = row(&l.path, "");
+            lr.add_prefix(&gtk::Image::from_icon_name("emblem-symbolic-link-symbolic"));
+            let take = flat("Take over");
+            take.set_tooltip_text(Some("Move what is in the way into the store and link the folder"));
+            let (u, n2) = (self.clone(), name.clone());
+            take.connect_clicked(move |_| {
+                let n3 = n2.clone();
+                u.act(move || api::post(&format!("/v1/stores/{}/takeover", api::esc(&n3)), json!({})), |u, _| u.toast("Taken over"));
+            });
+            lr.add_suffix(&take);
+            let (lrr, n2, path) = (lr.clone(), name.clone(), l.path.clone());
+            self.live(move |s| {
+                let Some(l) = sync_of(s, &n2).symlinks.into_iter().find(|l| l.path == path) else { return };
+                let sub = if l.busy.is_empty() { l.state.clone() } else { format!("{}: {}", l.state, l.busy) };
+                if lrr.subtitle().as_deref() != Some(sub.as_str()) {
+                    lrr.set_subtitle(&glib::markup_escape_text(&sub));
+                }
+                take.set_visible(l.state == "busy");
+            });
             r.add_row(&lr);
         }
         let actions = row("Actions", "");
         let scan = flat("Scan now");
-        let (u, n) = (self.clone(), st.name.clone());
+        let (u, n) = (self.clone(), name.clone());
         scan.connect_clicked(move |_| {
             let n2 = n.clone();
             u.act(move || api::post(&format!("/v1/stores/{}/scan", api::esc(&n2)), json!({})), |u, _| u.toast("Scanning"));
         });
         actions.add_suffix(&scan);
         let send = flat("Send a file…");
-        let (u, n) = (self.clone(), st.name.clone());
+        let (u, n) = (self.clone(), name.clone());
         send.connect_clicked(move |_| u.send_file(&n));
         actions.add_suffix(&send);
         let vers = flat("Versions…");
-        let (u, n, root) = (self.clone(), st.name.clone(), st.root.clone());
+        let (u, n, root) = (self.clone(), name.clone(), st.root.clone());
         vers.connect_clicked(move |_| u.pick_versions(&n, &root));
         actions.add_suffix(&vers);
         r.add_row(&actions);
@@ -411,25 +503,42 @@ impl Ui {
         let page = adw::PreferencesPage::new();
         let g = adw::PreferencesGroup::builder().title("Peers").description("Every machine this one syncs with.").build();
         for p in st.peers.iter().filter(|p| p.name != st.peer) {
-            let c = st.connections.iter().find(|c| c.peer == p.name).cloned().unwrap_or_default();
-            let mut sub = format!("{} · {}", c.state, p.endpoints.join(", "));
-            if let Some(t) = c.since {
-                sub.push_str(&format!(" · since {}", api::ago(&t)));
+            let r = adw::ExpanderRow::builder().title(glib::markup_escape_text(&p.name)).build();
+            let icon = gtk::Image::new();
+            r.add_prefix(&icon);
+            // Each detail row is always there and shown when it has a value.
+            let through = info("Connected through", "");
+            let version = info("Version", "");
+            let skew = info("Clock skew", "");
+            let error = info("Last error", "");
+            for d in [&through, &version, &skew, &error] {
+                r.add_row(d);
             }
-            let r = adw::ExpanderRow::builder().title(glib::markup_escape_text(&p.name)).subtitle(glib::markup_escape_text(&sub)).build();
-            r.add_prefix(&gtk::Image::from_icon_name(if c.state == "connected" { "network-transmit-receive-symbolic" } else { "network-offline-symbolic" }));
-            if !c.endpoint.is_empty() {
-                r.add_row(&info("Connected through", &c.endpoint));
-            }
-            if !c.version.is_empty() {
-                r.add_row(&info("Version", &c.version));
-            }
-            if c.clock_skew_ms != 0 {
-                r.add_row(&info("Clock skew", &format!("{} ms", c.clock_skew_ms)));
-            }
-            if !c.error.is_empty() {
-                r.add_row(&info("Last error", &c.error));
-            }
+            let (rr, name, endpoints) = (r.clone(), p.name.clone(), p.endpoints.join(", "));
+            self.live(move |s| {
+                let c = s.status.connections.iter().find(|c| c.peer == name).cloned().unwrap_or_default();
+                let mut sub = format!("{} · {endpoints}", if c.state.is_empty() { "unknown" } else { &c.state });
+                if let Some(t) = c.since {
+                    sub.push_str(&format!(" · since {}", api::ago(&t)));
+                }
+                let sub = glib::markup_escape_text(&sub).to_string();
+                if rr.subtitle().as_str() != sub {
+                    rr.set_subtitle(&sub);
+                }
+                icon.set_icon_name(Some(if c.state == "connected" { "network-transmit-receive-symbolic" } else { "network-offline-symbolic" }));
+                for (row, v) in [
+                    (&through, c.endpoint.clone()),
+                    (&version, c.version.clone()),
+                    (&skew, if c.clock_skew_ms == 0 { String::new() } else { format!("{} ms", c.clock_skew_ms) }),
+                    (&error, c.error.clone()),
+                ] {
+                    row.set_visible(!v.is_empty());
+                    let v = glib::markup_escape_text(&v).to_string();
+                    if row.subtitle().as_deref() != Some(v.as_str()) {
+                        row.set_subtitle(&v);
+                    }
+                }
+            });
             g.add(&r);
         }
         page.add(&g);
@@ -596,6 +705,45 @@ impl Ui {
 
 // {{{ Small widgets
 
+/// What a page is built from, as opposed to the values it shows: the same
+/// shape updates in place.
+fn shape_of(page: Page, s: &Snapshot) -> String {
+    let st = &s.status;
+    let mut out = format!("{:?}|", page as u8);
+    match page {
+        Page::Overview => {
+            for c in &s.doctor.checks {
+                out += &c.name;
+                out += ",";
+            }
+        }
+        Page::Stores => {
+            for g in &st.groups {
+                out += &format!("g:{}:{}|", g.name, g.peers.join(","));
+            }
+            for x in &st.stores {
+                out += &format!("s:{}:{}:{}:{}:{}|", x.name, x.group, x.sync, x.root, x.requested_by);
+            }
+            for x in &st.sync {
+                for l in &x.symlinks {
+                    out += &format!("l:{}:{}|", x.store, l.path);
+                }
+            }
+        }
+        Page::Peers => {
+            for p in &st.peers {
+                out += &format!("p:{}:{}|", p.name, p.endpoints.join(","));
+            }
+            for g in &st.groups {
+                out += &format!("g:{}:{}:{}|", g.name, g.peers.join(","), g.stores.join(","));
+            }
+        }
+        // Rebuilt when its counts arrive (rebuild), never by the poll.
+        Page::Space => {}
+    }
+    out
+}
+
 fn streamed(st: &api::Status, store: &str) -> bool {
     st.stores.iter().any(|x| x.name == store && x.sync == "stream")
 }
@@ -633,72 +781,6 @@ fn open_button(path: &str, ui: &Ui) -> gtk::Button {
         });
     });
     b
-}
-
-// }}}
-
-// {{{ Keeping the view across a redraw
-//
-// A page is rebuilt when its data changes; without this, every redraw would
-// throw the reader back to the top and close what they opened.
-
-/// Where the reader is: the scroll position and which rows are open.
-struct Kept {
-    scroll: f64,
-    open: Vec<String>,
-}
-
-fn kept(w: &gtk::Widget) -> Kept {
-    let mut k = Kept { scroll: 0.0, open: vec![] };
-    walk(w, &mut |c| {
-        if let Some(s) = c.downcast_ref::<gtk::ScrolledWindow>() {
-            if k.scroll == 0.0 {
-                k.scroll = s.vadjustment().value();
-            }
-        }
-        if let Some(r) = c.downcast_ref::<adw::ExpanderRow>() {
-            if r.is_expanded() {
-                k.open.push(r.title().to_string());
-            }
-        }
-    });
-    k
-}
-
-fn restore(w: &gtk::Widget, k: Kept) {
-    let mut scroller = None;
-    walk(w, &mut |c| {
-        if let Some(r) = c.downcast_ref::<adw::ExpanderRow>() {
-            if k.open.iter().any(|t| t.as_str() == r.title().as_str()) {
-                r.set_expanded(true);
-            }
-        }
-        if scroller.is_none() {
-            scroller = c.downcast_ref::<gtk::ScrolledWindow>().cloned();
-        }
-    });
-    let (Some(s), true) = (scroller, k.scroll > 0.0) else { return };
-    // The new page has no height until it is laid out: wait for it.
-    let adj = s.vadjustment();
-    let done = std::rc::Rc::new(std::cell::Cell::new(false));
-    let d = done.clone();
-    let target = k.scroll;
-    adj.connect_changed(move |a| {
-        if !d.get() && a.upper() - a.page_size() >= target {
-            a.set_value(target);
-            d.set(true);
-        }
-    });
-    glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || done.set(true));
-}
-
-fn walk(w: &gtk::Widget, f: &mut impl FnMut(&gtk::Widget)) {
-    f(w);
-    let mut c = w.first_child();
-    while let Some(ch) = c {
-        walk(&ch, f);
-        c = ch.next_sibling();
-    }
 }
 
 // }}}
