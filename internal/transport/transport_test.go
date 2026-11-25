@@ -97,7 +97,7 @@ func TestHandshakeValidation(t *testing.T) {
 				c2.Write([]byte(tt.reply + "\n"))
 			}()
 
-			_, _, err := m.handshake(c1)
+			_, _, err := m.handshake(c1, "", false)
 			if tt.wantEr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)

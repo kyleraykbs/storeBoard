@@ -61,6 +61,30 @@ rec {
             example = [ "192.168.1.10:4242" ];
             description = "Declared host:port endpoints other peers dial.";
           };
+          signIn = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.submodule {
+                options = {
+                  gatehouse = lib.mkOption {
+                    type = lib.types.str;
+                    example = "http://amanita.friends:4849";
+                    description = "That grid's GateHouse, as this machine reaches it.";
+                  };
+                  credentials = lib.mkOption {
+                    type = lib.types.str;
+                    default = "/var/lib/storeboard/signin.json";
+                    description = "Where `storeboard login <peer>` keeps the sign-in (root's).";
+                  };
+                };
+              }
+            );
+            default = null;
+            description = ''
+              The peer belongs to someone else's grid, whose owner shares
+              stores with this machine's person: connect to it signed in
+              with that grid's GateHouse (`storeboard login <peer>` once).
+            '';
+          };
         };
       }
     );
@@ -70,6 +94,32 @@ rec {
       phone.endpoints = [ ];
     };
     description = "Devices this machine may sync with, by name.";
+  };
+
+  friends = lib.mkOption {
+    type = lib.types.nullOr (
+      lib.types.submodule {
+        options = {
+          listen = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            example = [ "[fd00::1]:4243" ];
+            description = "Where friends' devices connect (only friends are accepted there).";
+          };
+          gatehouse = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "This grid's GateHouse as people reach it, for `storeboard share`.";
+          };
+        };
+      }
+    );
+    default = null;
+    description = ''
+      Let people this grid's GateHouse knows sync, from their own devices,
+      the stores they are given (`storeboard share`, or the grants
+      storeboard.read and storeboard.write scoped to a store). Needs the
+      GateHouse agent on this machine.
+    '';
   };
 
   groups = lib.mkOption {
@@ -268,7 +318,9 @@ rec {
     // lib.optionalAttrs (cfg ? root) { root = cfg.root; }
     // lib.optionalAttrs (cfg ? peer && cfg.peer != "") { peer = cfg.peer; }
     // lib.optionalAttrs (cfg ? peers) {
-      peers = lib.mapAttrs (_: p: { endpoints = p.endpoints; }) cfg.peers;
+      peers = lib.mapAttrs (
+        _: p: { endpoints = p.endpoints; } // lib.optionalAttrs (p.signIn != null) { signIn = p.signIn; }
+      ) cfg.peers;
     }
     // lib.optionalAttrs (cfg ? groups) {
       groups = lib.mapAttrs (
@@ -280,6 +332,9 @@ rec {
       ) cfg.groups;
     }
     // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; }
+    // lib.optionalAttrs (cfg ? friends && cfg.friends != null) {
+      friends = { listen = cfg.friends.listen; } // lib.optionalAttrs (cfg.friends.gatehouse != null) { gatehouse = cfg.friends.gatehouse; };
+    }
     # Both were options the daemon module exposed and this file never wrote,
     # so `backup.enable = true` and per-store permissions silently did
     # nothing. Null fields are dropped: the config is strict, and absent is

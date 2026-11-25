@@ -20,6 +20,7 @@ import (
 	"net"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,10 @@ type hello struct {
 	// Features names optional protocol the sender understands; frames only
 	// a newer peer handles are sent to peers that list them.
 	Features []string `json:"features,omitempty"`
+	// Token is a GateHouse access token (for service "storeboard"), sent by
+	// a friend's device to a machine of another grid: there it is not a
+	// declared peer, and the token says whose device it is.
+	Token string `json:"token,omitempty"`
 }
 
 // ClockSkewWarn is the skew worth telling the user about: conflicts are
@@ -92,7 +97,10 @@ type FeatureSender interface {
 // by mu; the linkReset channel is closed (and replaced) whenever a live
 // link dies, waking the dial loop without polling.
 type peerState struct {
-	name      string
+	name string
+	// person is set for a friend's device: the GateHouse account its token
+	// named. It is never a declared peer.
+	person    string
 	endps     []string // dial targets, from the peer's registry entry
 	direction string   // the registered link: inbound or outbound
 	state     string
@@ -141,10 +149,11 @@ func (p *peerState) snapshot() api.Connection {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := api.Connection{
-		Peer:  p.name,
-		State: p.state,
-		Since: p.since,
-		Error: p.lastErr,
+		Peer:   p.name,
+		State:  p.state,
+		Since:  p.since,
+		Error:  p.lastErr,
+		Person: p.person,
 	}
 	if p.conn != nil {
 		out.Endpoint = p.conn.RemoteAddr().String()
@@ -245,6 +254,13 @@ type Manager struct {
 	// from package variables so tests can turn them.
 	listenFn     func(ep string) (net.Listener, error)
 	acceptRebind time.Duration
+
+	// Friends verifies the token a device sends on a friends listener and
+	// names its person; nil accepts no friends. SignIn gives the token to
+	// send a declared peer that belongs to another grid (config signIn).
+	// Both are set before Run.
+	Friends func(token string) (person string, err error)
+	SignIn  func(peer string) (token string, err error)
 
 	// cancel ends the context Run derived from the caller's. Close uses it
 	// so teardown never depends on the caller cancelling first: a caller
@@ -506,8 +522,27 @@ func (m *Manager) sortedPeers() []*peerState {
 // the nebula address is not assigned yet; it retries instead of dying.
 func (m *Manager) runListeners(ctx context.Context) {
 	for _, ep := range m.selfEndpoints() {
-		m.spawn(func() { m.listenLoop(ctx, ep) })
+		m.spawn(func() { m.listenLoop(ctx, ep, false) })
 	}
+	if m.cfg.Friends != nil && m.Friends != nil {
+		for _, ep := range m.cfg.Friends.Listen {
+			m.spawn(func() { m.listenLoop(ctx, ep, true) })
+		}
+	}
+}
+
+// Person names the GateHouse account a friend's device signed in as; empty
+// for a declared peer.
+func (m *Manager) Person(peer string) string {
+	m.mu.Lock()
+	p, ok := m.peers[peer]
+	m.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.person
 }
 
 // listenTCP and acceptRebindAfter are the defaults New copies; vars only for
@@ -522,7 +557,7 @@ const (
 	acceptBackoffMax = time.Second
 )
 
-func (m *Manager) listenLoop(ctx context.Context, ep string) {
+func (m *Manager) listenLoop(ctx context.Context, ep string, friends bool) {
 	for {
 		ln, err := m.listenFn(ep)
 		if err == nil {
@@ -534,8 +569,8 @@ func (m *Manager) listenLoop(ctx context.Context, ep string) {
 			}
 			m.listen = append(m.listen, ln)
 			m.mu.Unlock()
-			m.logger.Info("transport listening", "endpoint", ep)
-			rebind := m.acceptLoop(ctx, ln)
+			m.logger.Info("transport listening", "endpoint", ep, "friends", friends)
+			rebind := m.acceptLoop(ctx, ln, friends)
 			m.mu.Lock()
 			m.listen = slices.DeleteFunc(m.listen, func(l net.Listener) bool { return l == ln })
 			m.mu.Unlock()
@@ -564,7 +599,7 @@ func (m *Manager) listenLoop(ctx context.Context, ep string) {
 // descriptors (EMFILE), a connection reset before it was taken (ECONNABORTED)
 // - and used to end the loop for good, leaving the daemon unreachable until it
 // restarted.
-func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) (rebind bool) {
+func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener, friends bool) (rebind bool) {
 	acceptErr := make(chan error, 1)
 	go func() {
 		var failing time.Time
@@ -597,7 +632,7 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) (rebind bool)
 				continue
 			}
 			failing, delay = time.Time{}, acceptBackoffMin
-			if !m.spawn(func() { m.accept(ctx, c) }) {
+			if !m.spawn(func() { m.accept(ctx, c, friends) }) {
 				c.Close()
 			}
 		}
@@ -616,14 +651,31 @@ func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) (rebind bool)
 	}
 }
 
-func (m *Manager) accept(ctx context.Context, c net.Conn) {
-	h, reader, err := m.handshake(c)
+func (m *Manager) accept(ctx context.Context, c net.Conn, friends bool) {
+	h, reader, err := m.handshake(c, "", friends)
 	if err != nil {
 		m.logger.Warn("rejected inbound connection", "remote", c.RemoteAddr().String(), "error", err)
 		c.Close()
 		return
 	}
 	m.register(ctx, h, c, reader, "inbound")
+}
+
+// friendPeer is the peer for a friend's device that proved person: made on
+// its first connection, never dialled.
+func (m *Manager) friendPeer(name, person string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.peers[name]; ok {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.person != person {
+			return fmt.Errorf("%q is not %s's device", name, person)
+		}
+		return nil
+	}
+	m.peers[name] = &peerState{name: name, person: person, state: stateUnaddressed, since: time.Now().UTC(), linkReset: make(chan struct{})}
+	return nil
 }
 
 // dialLoop keeps one peer's link up: dial → handshake → serve until it
@@ -678,7 +730,22 @@ func (m *Manager) tryDial(ctx context.Context, p *peerState) {
 			continue
 		}
 		tuneConn(c)
-		h, reader, herr := m.handshake(c)
+		var token string
+		if pc, ok := m.cfg.Peers[p.name]; ok && pc.SignIn != nil {
+			if m.SignIn == nil {
+				c.Close()
+				m.noteDialFailure(p, ep, errors.New("signing in to another grid is not set up"))
+				continue
+			}
+			t, err := m.SignIn(p.name)
+			if err != nil {
+				c.Close()
+				m.noteDialFailure(p, ep, fmt.Errorf("sign in: %w", err))
+				continue
+			}
+			token = t
+		}
+		h, reader, herr := m.handshake(c, token, false)
 		if herr != nil {
 			m.noteDialFailure(p, ep, herr)
 			c.Close()
@@ -707,7 +774,11 @@ func (m *Manager) noteDialFailure(p *peerState, ep string, err error) {
 // handshake performs the hello exchange with hard deadlines. It returns the
 // bufio reader it used, because bytes it buffered past the hello line would
 // otherwise be lost when the serving loop builds its own reader.
-func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
+//
+// On a friends listener (friend) the other side is a friend's device: it
+// must send a GateHouse token, which names its person, and a name of its
+// own under that person (lain, or lain.laptop) that no declared peer has.
+func (m *Manager) handshake(c net.Conn, token string, friend bool) (hello, *bufio.Reader, error) {
 	var got hello
 	_ = c.SetDeadline(time.Now().Add(handshakeTimeout))
 	defer c.SetDeadline(time.Time{})
@@ -716,7 +787,7 @@ func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
 	if fh, ok := m.getHandler().(FeatureHandler); ok {
 		features = fh.Features()
 	}
-	line, err := json.Marshal(hello{Protocol: WireVersion, Name: m.cfg.Peer, Version: version.Version, Time: time.Now().UnixNano(), Features: features})
+	line, err := json.Marshal(hello{Protocol: WireVersion, Name: m.cfg.Peer, Version: version.Version, Time: time.Now().UnixNano(), Features: features, Token: token})
 	if err != nil {
 		return got, nil, err
 	}
@@ -747,6 +818,24 @@ func (m *Manager) handshake(c net.Conn) (hello, *bufio.Reader, error) {
 		return got, reader, fmt.Errorf("empty peer name")
 	case got.Name == m.cfg.Peer:
 		return got, reader, fmt.Errorf("peer claims to be me")
+	case friend:
+		if got.Token == "" {
+			return got, reader, fmt.Errorf("%q sent no sign-in: this listener is for friends' devices", got.Name)
+		}
+		if _, ok := m.cfg.Peers[got.Name]; ok {
+			return got, reader, fmt.Errorf("%q is a declared peer, not a friend's device", got.Name)
+		}
+		person, err := m.Friends(got.Token)
+		if err != nil {
+			return got, reader, fmt.Errorf("%q: sign-in refused: %w", got.Name, err)
+		}
+		if got.Name != person && !strings.HasPrefix(got.Name, person+".") {
+			return got, reader, fmt.Errorf("%q is not a name of %s's (%s, or %s.<device>)", got.Name, person, person, person)
+		}
+		if err := m.friendPeer(got.Name, person); err != nil {
+			return got, reader, err
+		}
+		got.Token = ""
 	default:
 		if _, ok := m.cfg.Peers[got.Name]; !ok {
 			return got, reader, fmt.Errorf("undeclared peer %q", got.Name)

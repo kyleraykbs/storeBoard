@@ -65,6 +65,11 @@ let
   storeReadWrite = lib.concatMap (
     s: lib.concatMap (p: [ "-${p}" "-${builtins.dirOf p}" ]) s.symlinks
   ) allStores;
+
+  # Sign-ins to other grids: the daemon keeps the newest refresh token.
+  signInDirs = lib.unique (
+    map (p: builtins.dirOf p.signIn.credentials) (lib.filter (p: p.signIn != null) (lib.attrValues cfg.peers))
+  );
 in
 {
   options.services.storeboard = {
@@ -133,6 +138,7 @@ in
       peer
       peers
       groups
+      friends
       stores
       permissions
       backup
@@ -141,6 +147,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    systemd.tmpfiles.rules = map (d: "d ${d} 0700 ${cfg.user} - -") signInDirs;
     assertions = [
       {
         assertion = cfg.groups == { } || cfg.peer != "";
@@ -204,7 +211,7 @@ in
         ReadWritePaths = [
           cfg.dataDir
           cfg.root
-        ] ++ storeReadWrite;
+        ] ++ storeReadWrite ++ signInDirs;
         # Content has to land owned by the human, not by root.
         AmbientCapabilities = [
           "CAP_CHOWN"

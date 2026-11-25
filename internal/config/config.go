@@ -68,6 +68,32 @@ func normalSync(s string) string {
 // host:port addresses other peers dial.
 type Peer struct {
 	Endpoints []string `json:"endpoints"`
+	// SignIn marks a peer of another grid, whose owner shares stores with
+	// this machine's person: the hello carries a GateHouse token for it,
+	// from a sign-in kept in Credentials (`storeboard login`).
+	SignIn *SignIn `json:"signIn,omitempty"`
+}
+
+// SignIn is where to sign in for a peer of another grid.
+type SignIn struct {
+	// GateHouse is that grid's GateHouse, as this machine reaches it
+	// (http://amanita.friends:4849).
+	GateHouse string `json:"gatehouse"`
+	// Credentials is the file `storeboard login` keeps the sign-in in.
+	Credentials string `json:"credentials"`
+}
+
+// Friends lets people of this grid's GateHouse sync, from their own
+// devices, the stores they are given (storeboard.read, storeboard.write):
+// devices that are not declared peers, and know of no store they may not
+// read.
+type Friends struct {
+	// Listen is where their devices connect: only friends, never a
+	// declared peer, are accepted here.
+	Listen []string `json:"listen"`
+	// GateHouse is this grid's GateHouse as people reach it, for
+	// `storeboard share`.
+	GateHouse string `json:"gatehouse,omitempty"`
 }
 
 // Group is a set of peers that share stores. Every group must include this
@@ -284,6 +310,9 @@ type Config struct {
 	// StoreTree is the store tree, by id. Ids are globally unique and name
 	// the canonical directory under root.
 	StoreTree map[string]Store `json:"stores"`
+
+	// Friends, per machine, accepts other people's devices (see Friends).
+	Friends *Friends `json:"friends,omitempty"`
 
 	// Backup, per machine, keeps a thinned history of every file's versions.
 	// A store that is streamed on this machine keeps none.
@@ -568,6 +597,27 @@ func (c *Config) Validate() error {
 		for _, ep := range p.Endpoints {
 			if err := checkEndpoint(ep); err != nil {
 				return fmt.Errorf("peer %q endpoint %q: %w", name, ep, err)
+			}
+		}
+		if si := p.SignIn; si != nil {
+			if name == c.Peer {
+				return fmt.Errorf("peer %q: signIn is for peers of another grid, not this machine", name)
+			}
+			if !strings.HasPrefix(si.GateHouse, "http://") && !strings.HasPrefix(si.GateHouse, "https://") {
+				return fmt.Errorf("peer %q signIn.gatehouse %q: an http(s) address", name, si.GateHouse)
+			}
+			if !filepath.IsAbs(si.Credentials) {
+				return fmt.Errorf("peer %q signIn.credentials %q: path must be absolute", name, si.Credentials)
+			}
+		}
+	}
+	if c.Friends != nil {
+		if len(c.Friends.Listen) == 0 {
+			return fmt.Errorf("friends.listen is empty: friends' devices would have nowhere to connect")
+		}
+		for _, ep := range c.Friends.Listen {
+			if err := checkEndpoint(ep); err != nil {
+				return fmt.Errorf("friends.listen %q: %w", ep, err)
 			}
 		}
 	}

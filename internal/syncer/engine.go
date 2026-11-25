@@ -242,6 +242,10 @@ type Engine struct {
 	// grants answers whether a person GateHouse knows may act on a store
 	// beyond its Linux owner (the acting verbs); nil grants nothing.
 	grants         gatehouse.Checker
+	// Friends' devices (friends.go).
+	friends      friendState
+	friendPerson func(peer string) string
+	friendMay    func(person, perm, store string) bool
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
@@ -1052,10 +1056,22 @@ func (e *Engine) broadcastIndex(fs *StoreState, entries []*Entry) {
 func (e *Engine) sendListFor(fs *StoreState) []transport.Sender {
 	members := e.cfg.Groups[fs.group].Peers
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	out := make([]transport.Sender, 0, len(e.sends))
+	var friends map[string]transport.Sender
 	for peer, s := range e.sends {
 		if slices.Contains(members, peer) {
+			out = append(out, s)
+		} else {
+			if friends == nil {
+				friends = map[string]transport.Sender{}
+			}
+			friends[peer] = s
+		}
+	}
+	e.mu.Unlock()
+	// GateHouse is asked outside the engine's lock.
+	for peer, s := range friends {
+		if e.friendReads(peer, fs.name) {
 			out = append(out, s)
 		}
 	}
@@ -1076,6 +1092,7 @@ var _ transport.UrgentHandler = (*Engine)(nil)
 // peer are discarded, and every want this side had pointed at the peer may be
 // asked again at once rather than after wantRefresh.
 func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
+	e.noteFriend(peer)
 	e.cancelPeerSends(peer)
 	e.mu.Lock()
 	prev := e.sends[peer]
@@ -1184,6 +1201,10 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 	e.startFrameWorkers()
 	var fr frame
 	if err := json.Unmarshal(line, &fr); err != nil {
+		return
+	}
+	if person := e.friendOf(peer); person != "" && !e.friendFrame(person, &fr) {
+		e.logger.Debug("frame from a friend's device refused", "peer", peer, "person", person, "type", fr.Type, "store", fr.Store)
 		return
 	}
 	pf := peerFrame{peer: peer, fr: fr, size: len(line)}
@@ -1303,9 +1324,10 @@ func (e *Engine) evaluatePeers() {
 	}
 }
 
-// storeSharedWith reports whether peer is in the store's group.
+// storeSharedWith reports whether peer is in the store's group, or is a
+// friend's device whose person may read it.
 func (e *Engine) storeSharedWith(fs *StoreState, peer string) bool {
-	return slices.Contains(e.cfg.Groups[fs.group].Peers, peer)
+	return slices.Contains(e.cfg.Groups[fs.group].Peers, peer) || e.friendReads(peer, fs.name)
 }
 
 func (e *Engine) participantConnected(fs *StoreState) bool {

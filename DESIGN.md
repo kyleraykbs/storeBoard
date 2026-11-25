@@ -76,10 +76,19 @@ one, it changes here first, deliberately, with a decision log entry.
     caller's to name: `send` reads only a regular file the caller owns, and
     copies it; `restore --to` writes only into an existing directory the
     caller owns, and is never forwarded to a holder.
-12. Peers are declared, never invented: the config (Nix-generated) is the
-    authoritative peer list, and the daemon learns a peer only from it.
-    Address discovery (DNS, NAT traversal) may layer on top later;
-    declaration stays authoritative, and removing a peer revokes it.
+12. Machines are declared, never invented: the config (Nix-generated) is
+    the authoritative list of this grid's machines, and the daemon learns
+    one only from it. Address discovery (DNS, NAT traversal) may layer on
+    top later; declaration stays authoritative, and removing a peer revokes
+    it. People are the one exception (decided 2026-11-25): on a `friends`
+    listener, a device that is not declared may connect with a GateHouse
+    token for storeboard, checked by the local agent, under a name of its
+    person's (`lain` or `lain.<device>`). It sees only the stores its
+    person may read (`storeboard.read` or `storeboard.write` on that store)
+    and changes only those it may write; GateHouse is asked again at least
+    every 30 s, so a grant taken back stops the next frames. It is never a
+    holder of this grid's stores and never runs an acting verb. A friend's
+    own daemon declares the host as an ordinary peer with `signIn`.
 
 ## The tree and the scanner
 

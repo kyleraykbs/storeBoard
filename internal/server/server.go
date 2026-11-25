@@ -157,6 +157,21 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		lock:      lock,
 	}
 	s.transport.SetHandler(engine)
+	// Friends' devices, checked by the local GateHouse agent (DESIGN 12).
+	if cfg.Friends != nil {
+		sock := gatehouse.Socket()
+		s.transport.Friends = gatehouse.Verifier(sock)
+		engine.SetFriends(s.transport.Person, gatehouse.People(sock))
+	}
+	// Peers of another grid: this device signs in there (storeboard login).
+	tokens := &gatehouse.Tokens{}
+	s.transport.SignIn = func(peer string) (string, error) {
+		p, ok := cfg.Peers[peer]
+		if !ok || p.SignIn == nil {
+			return "", fmt.Errorf("%s needs no sign-in", peer)
+		}
+		return tokens.Token(p.SignIn.Credentials)
+	}
 	s.http = &http.Server{
 		Handler:           s.handler(),
 		ReadHeaderTimeout: readHeaderTimeout,

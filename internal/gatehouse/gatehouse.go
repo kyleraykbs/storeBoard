@@ -8,6 +8,8 @@ package gatehouse
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/user"
@@ -44,26 +46,69 @@ func Agent(socket string) Checker {
 	}
 }
 
+// People is Agent for a person by GateHouse name rather than a local uid:
+// the person behind a friend's device.
+func People(socket string) func(person, perm, store string) bool {
+	return func(person, perm, store string) bool { return ask(socket, person, perm, store) }
+}
+
+// Verifier checks a friend's device's token with the agent (offline: the
+// agent holds the server's key) and names its person. The token must be
+// for storeboard, and its account still enabled.
+func Verifier(socket string) func(token string) (string, error) {
+	return func(token string) (string, error) {
+		var out struct {
+			Name string `json:"name"`
+		}
+		if err := call(socket, "verify", map[string]string{"token": token, "service": Service}, &out); err != nil {
+			return "", err
+		}
+		if out.Name == "" {
+			return "", errors.New("the token names nobody")
+		}
+		return out.Name, nil
+	}
+}
+
+// Service is storeboard's name in GateHouse: its tokens' audience and its
+// client id.
+const Service = "storeboard"
+
 func ask(socket, name, perm, store string) bool {
+	var out struct {
+		Allowed bool `json:"allowed"`
+	}
+	err := call(socket, "check", map[string]string{"user": name, "perm": perm, "resource": store}, &out)
+	return err == nil && out.Allowed
+}
+
+func call(socket, method string, params, result any) error {
 	c, err := net.DialTimeout("unix", socket, 2*time.Second)
 	if err != nil {
-		return false
+		return fmt.Errorf("GateHouse agent: %w", err)
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(3 * time.Second))
-	req, _ := json.Marshal(map[string]any{"id": 1, "method": "check",
-		"params": map[string]string{"user": name, "perm": perm, "resource": store}})
+	req, _ := json.Marshal(map[string]any{"id": 1, "method": method, "params": params})
 	if _, err := c.Write(append(req, '\n')); err != nil {
-		return false
+		return fmt.Errorf("GateHouse agent: %w", err)
 	}
 	line, err := bufio.NewReader(c).ReadBytes('\n')
 	if err != nil {
-		return false
+		return fmt.Errorf("GateHouse agent: %w", err)
 	}
 	var resp struct {
-		Result *struct {
-			Allowed bool `json:"allowed"`
-		} `json:"result"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	return json.Unmarshal(line, &resp) == nil && resp.Result != nil && resp.Result.Allowed
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return fmt.Errorf("GateHouse agent: %w", err)
+	}
+	if resp.Error != nil {
+		return errors.New(resp.Error.Message)
+	}
+	return json.Unmarshal(resp.Result, result)
 }

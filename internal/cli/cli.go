@@ -55,6 +55,11 @@ Commands:
                   folders under the root are left for you
                   These three show what would go and ask first; --dry-run
                   only shows, --yes skips the question.
+  share <store> <person> [--write] [--revoke]
+                  let someone sync a store from their own devices (or stop):
+                  read, or read and write; you need storeboard.manage on it
+  login <peer>    sign in to the grid a peer belongs to, when it is someone
+                  else's (the peer has signIn): opens the browser once
   status          show the daemon's status document
   doctor          check the daemon over and explain anything wrong:
                   mounts, queues, peers, clocks, disk, stalled transfers
@@ -100,6 +105,10 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return storeCmd(ctx, configPath, rest, stdout, stderr)
 	case "backup":
 		return backupCmd(ctx, configPath, rest, stdout, stderr)
+	case "login":
+		return loginCmd(ctx, configPath, rest, stdout, stderr)
+	case "share":
+		return shareCmd(ctx, configPath, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "storeboard: unknown command %q\n\n%s", cmd, usage)
 		return ErrHandled

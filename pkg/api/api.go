@@ -65,6 +65,9 @@ type Connection struct {
 	// (negative: behind), measured at the handshake. Conflicts are decided
 	// by modification time, so a large skew picks the wrong winner.
 	ClockSkewMs int64 `json:"clockSkewMs,omitempty"`
+	// Person is set for a friend's device: the GateHouse account it signed
+	// in as (it is not a declared peer).
+	Person string `json:"person,omitempty"`
 }
 
 // Permissions is a store's resolved ownership and mode: what the daemon gives
