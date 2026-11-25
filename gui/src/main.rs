@@ -46,6 +46,13 @@ struct Inner {
     title: adw::WindowTitle,
     page: RefCell<Page>,
     snap: RefCell<Option<Result<Snapshot, String>>>,
+    /// The page on screen, to tell a redraw from a page change.
+    shown: RefCell<Option<Page>>,
+    /// Whether the test-only expand option has opened its row once.
+    opened: std::cell::Cell<bool>,
+    /// Space and cleanup, counted separately (they are slow), and when.
+    heavy: RefCell<Option<Result<api::Heavy, String>>>,
+    heavy_at: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -110,17 +117,25 @@ impl Ui {
         bp.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(bp);
 
-        let ui = Ui(Rc::new(Inner { window, toasts, split, sidebar, content, title, page: RefCell::new(Page::Overview), snap: RefCell::new(None) }));
+        let ui = Ui(Rc::new(Inner { window, toasts, split, sidebar, content, title, page: RefCell::new(Page::Overview), snap: RefCell::new(None), shown: RefCell::new(None), opened: std::cell::Cell::new(false), heavy: RefCell::new(None), heavy_at: std::cell::Cell::new(None) }));
         let u = ui.clone();
         ui.sidebar.connect_row_selected(move |_, row| {
             if let Some(row) = row {
                 *u.page.borrow_mut() = PAGES[row.index() as usize].0;
                 u.split.set_show_content(true);
+                if PAGES[row.index() as usize].0 == Page::Space {
+                    u.count_space(false);
+                }
                 u.render();
             }
         });
         let u = ui.clone();
-        refresh.connect_clicked(move |_| u.refresh());
+        refresh.connect_clicked(move |_| {
+            if *u.page.borrow() == Page::Space {
+                u.count_space(true);
+            }
+            u.refresh();
+        });
         // STOREBOARD_GUI_PAGE opens on another page (screenshots, shortcuts).
         let start = match std::env::var("STOREBOARD_GUI_PAGE").as_deref() {
             Ok("stores") => 1,
@@ -142,14 +157,46 @@ impl Ui {
     }
 
     fn refresh(&self) {
+        if *self.page.borrow() == Page::Space {
+            self.count_space(false);
+        }
         let u = self.clone();
         glib::spawn_future_local(async move {
-            let snap = gio::spawn_blocking(api::snapshot).await.unwrap_or_else(|_| Err("crashed".into()));
+            let snap = gio::spawn_blocking(api::snapshot).await.unwrap_or_else(|_| Err("crashed".into())).map(|mut s| {
+                // The uptime moves every second; on its own it is no reason
+                // to redraw (the next real change shows it).
+                if let Some(Ok(old)) = u.snap.borrow().as_ref() {
+                    if old.status.version == s.status.version && s.status.uptime >= old.status.uptime {
+                        s.status.uptime = old.status.uptime;
+                    }
+                }
+                s
+            });
             if u.snap.borrow().as_ref() == Some(&snap) {
                 return;
             }
             *u.snap.borrow_mut() = Some(snap);
             u.render();
+        });
+    }
+
+    /// Counts space and cleanup: when the Space page asks, at most once a
+    /// minute unless `now`.
+    fn count_space(&self, now: bool) {
+        let fresh = self.heavy_at.get().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+        if fresh && !now {
+            return;
+        }
+        self.heavy_at.set(Some(std::time::Instant::now()));
+        let u = self.clone();
+        glib::spawn_future_local(async move {
+            let h = gio::spawn_blocking(api::heavy).await.unwrap_or_else(|_| Err("crashed".into()));
+            if u.heavy.borrow().as_ref() != Some(&h) {
+                *u.heavy.borrow_mut() = Some(h);
+                if *u.page.borrow() == Page::Space {
+                    u.render();
+                }
+            }
         });
     }
 
@@ -187,14 +234,21 @@ impl Ui {
                 Page::Overview => self.overview(&s),
                 Page::Stores => self.stores(&s),
                 Page::Peers => self.peers(&s),
-                Page::Space => self.space(&s),
+                Page::Space => self.space(),
             },
         };
+        // Same page redrawn: keep where the reader was.
+        let same = *self.shown.borrow() == Some(page);
+        let keep = self.content.first_child().filter(|_| same).map(|c| kept(&c));
         while let Some(c) = self.content.first_child() {
             self.content.remove(&c);
         }
         view.set_vexpand(true);
         self.content.append(&view);
+        if let Some(k) = keep {
+            restore(&view, k);
+        }
+        *self.shown.borrow_mut() = Some(page);
     }
 
     fn badges(&self, s: Option<&Snapshot>) {
@@ -205,7 +259,7 @@ impl Ui {
                 let up = s.status.connections.iter().filter(|c| c.state == "connected").count();
                 format!("{up}/{}", s.status.connections.len())
             }),
-            s.map(|s| api::bytes(s.space.total)),
+            s.and(self.heavy.borrow().as_ref().and_then(|h| h.as_ref().ok()).map(|h| api::bytes(h.space.total))),
         ];
         for (i, n) in counts.iter().enumerate() {
             if let Some(row) = self.sidebar.row_at_index(i as i32) {
@@ -231,7 +285,9 @@ impl Ui {
 
         let up = st.connections.iter().filter(|c| c.state == "connected").count();
         let conflicts: i64 = st.sync.iter().map(|x| x.conflicts).sum();
-        let pending: i64 = st.sync.iter().map(|x| x.pending + x.receiving).sum();
+        // Pending is "known here but not on this machine": for a streamed
+        // store that is every file, by design. In flight is what is moving.
+        let pending: i64 = st.sync.iter().map(|x| x.receiving + if streamed(st, &x.store) { 0 } else { x.pending }).sum();
         let grid = adw::PreferencesGroup::builder().title("At a glance").build();
         grid.add(&info("Peers connected", &format!("{up} of {}", st.connections.len())));
         grid.add(&info("Stores", &format!("{} ({} requested by programs)", st.stores.len(), st.stores.iter().filter(|x| !x.requested_by.is_empty()).count())));
@@ -264,7 +320,7 @@ impl Ui {
             for st in s.status.stores.iter().filter(|x| x.group == g.name) {
                 let r = self.store_row(s, st);
                 // STOREBOARD_GUI_EXPAND opens the first store (screenshots).
-                if !any && std::env::var("STOREBOARD_GUI_EXPAND").is_ok() {
+                if !any && !self.opened.replace(true) && std::env::var("STOREBOARD_GUI_EXPAND").is_ok() {
                     r.set_expanded(true);
                 }
                 group.add(&r);
@@ -279,10 +335,13 @@ impl Ui {
 
     fn store_row(&self, s: &Snapshot, st: &api::Store) -> adw::ExpanderRow {
         let sync = s.status.sync.iter().find(|x| x.store == st.name).cloned().unwrap_or_default();
-        let r = adw::ExpanderRow::builder()
-            .title(glib::markup_escape_text(&st.name))
-            .subtitle(format!("{} · {} · {} files", st.sync, sync.state, sync.entries))
-            .build();
+        let stream = st.sync == "stream";
+        let subtitle = if stream {
+            format!("streamed · {} · {} files, fetched when opened", sync.state, sync.entries)
+        } else {
+            format!("local · {} · {} files", sync.state, sync.entries)
+        };
+        let r = adw::ExpanderRow::builder().title(glib::markup_escape_text(&st.name)).subtitle(subtitle).build();
         r.add_prefix(&gtk::Image::from_icon_name(if st.sync == "stream" { "folder-remote-symbolic" } else { "folder-symbolic" }));
         if !st.requested_by.is_empty() {
             let l = gtk::Label::new(Some(&format!("requested by {}", st.requested_by)));
@@ -295,7 +354,8 @@ impl Ui {
             w.set_tooltip_text(Some(&format!("{} conflicts", sync.conflicts)));
             r.add_suffix(&w);
         }
-        if sync.scanning || sync.receiving > 0 || sync.pending > 0 {
+        // Only real work spins: a streamed store keeps its files elsewhere.
+        if sync.scanning || sync.receiving > 0 || (!stream && sync.pending > 0) {
             r.add_suffix(&adw::Spinner::new());
         }
         let root = info("Folder", &st.root);
@@ -303,7 +363,11 @@ impl Ui {
         r.add_row(&root);
         r.add_row(&info(
             "Files",
-            &format!("{} here of {} · {} waiting to send · {} arriving", sync.local, sync.entries, sync.pending, sync.receiving),
+            &if stream {
+                format!("{} known · {} kept on this machine · {} arriving", sync.entries, sync.local, sync.receiving)
+            } else {
+                format!("{} here of {} · {} still to fetch · {} arriving", sync.local, sync.entries, sync.pending, sync.receiving)
+            },
         ));
         r.add_row(&info("Last scan", &sync.last_scan.map(|t| api::ago(&t)).unwrap_or("not yet".into())));
         r.add_row(&info("Ownership", &format!("{}:{} {}", sync.permissions.user, sync.permissions.group, sync.permissions.mode)));
@@ -377,7 +441,23 @@ impl Ui {
         page.upcast()
     }
 
-    fn space(&self, s: &Snapshot) -> gtk::Widget {
+    fn space(&self) -> gtk::Widget {
+        let heavy = self.heavy.borrow().clone();
+        let s = match heavy {
+            None => {
+                self.count_space(false);
+                return adw::StatusPage::builder()
+                    .icon_name("drive-harddisk-symbolic")
+                    .title("Counting…")
+                    .description("storeboard walks its data directory for this: a few seconds on a big mesh.")
+                    .child(&adw::Spinner::new())
+                    .build()
+                    .upcast();
+            }
+            Some(Err(e)) => return adw::StatusPage::builder().icon_name("dialog-error-symbolic").title("Could not count").description(e).build().upcast(),
+            Some(Ok(h)) => h,
+        };
+        let s = &s;
         let page = adw::PreferencesPage::new();
         let g = adw::PreferencesGroup::builder().title(format!("Daemon state · {}", api::bytes(s.space.total))).description("Blobs, journals, history and trash, by directory.").build();
         let mut entries = s.space.entries.clone();
@@ -516,6 +596,10 @@ impl Ui {
 
 // {{{ Small widgets
 
+fn streamed(st: &api::Status, store: &str) -> bool {
+    st.stores.iter().any(|x| x.name == store && x.sync == "stream")
+}
+
 fn row(title: &str, subtitle: &str) -> adw::ActionRow {
     adw::ActionRow::builder().title(glib::markup_escape_text(title)).subtitle(glib::markup_escape_text(subtitle)).build()
 }
@@ -549,6 +633,72 @@ fn open_button(path: &str, ui: &Ui) -> gtk::Button {
         });
     });
     b
+}
+
+// }}}
+
+// {{{ Keeping the view across a redraw
+//
+// A page is rebuilt when its data changes; without this, every redraw would
+// throw the reader back to the top and close what they opened.
+
+/// Where the reader is: the scroll position and which rows are open.
+struct Kept {
+    scroll: f64,
+    open: Vec<String>,
+}
+
+fn kept(w: &gtk::Widget) -> Kept {
+    let mut k = Kept { scroll: 0.0, open: vec![] };
+    walk(w, &mut |c| {
+        if let Some(s) = c.downcast_ref::<gtk::ScrolledWindow>() {
+            if k.scroll == 0.0 {
+                k.scroll = s.vadjustment().value();
+            }
+        }
+        if let Some(r) = c.downcast_ref::<adw::ExpanderRow>() {
+            if r.is_expanded() {
+                k.open.push(r.title().to_string());
+            }
+        }
+    });
+    k
+}
+
+fn restore(w: &gtk::Widget, k: Kept) {
+    let mut scroller = None;
+    walk(w, &mut |c| {
+        if let Some(r) = c.downcast_ref::<adw::ExpanderRow>() {
+            if k.open.iter().any(|t| t.as_str() == r.title().as_str()) {
+                r.set_expanded(true);
+            }
+        }
+        if scroller.is_none() {
+            scroller = c.downcast_ref::<gtk::ScrolledWindow>().cloned();
+        }
+    });
+    let (Some(s), true) = (scroller, k.scroll > 0.0) else { return };
+    // The new page has no height until it is laid out: wait for it.
+    let adj = s.vadjustment();
+    let done = std::rc::Rc::new(std::cell::Cell::new(false));
+    let d = done.clone();
+    let target = k.scroll;
+    adj.connect_changed(move |a| {
+        if !d.get() && a.upper() - a.page_size() >= target {
+            a.set_value(target);
+            d.set(true);
+        }
+    });
+    glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || done.set(true));
+}
+
+fn walk(w: &gtk::Widget, f: &mut impl FnMut(&gtk::Widget)) {
+    f(w);
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        walk(&ch, f);
+        c = ch.next_sibling();
+    }
 }
 
 // }}}

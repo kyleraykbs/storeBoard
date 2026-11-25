@@ -284,22 +284,27 @@ pub struct Versions {
     pub versions: Vec<FileVersion>,
 }
 
-/// Everything the window shows.
+/// What the window polls: cheap for the daemon (milliseconds).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub status: Status,
     pub doctor: Doctor,
+}
+
+pub fn snapshot() -> Result<Snapshot, String> {
+    Ok(Snapshot { status: get("/v1/status")?, doctor: get("/v1/doctor").unwrap_or_default() })
+}
+
+/// Space and cleanup walk the daemon's data directory: seconds on a big
+/// mesh. Fetched only for the Space page, and not often.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Heavy {
     pub space: Space,
     pub cleanup: Cleanup,
 }
 
-pub fn snapshot() -> Result<Snapshot, String> {
-    Ok(Snapshot {
-        status: get("/v1/status")?,
-        doctor: get("/v1/doctor").unwrap_or_default(),
-        space: get("/v1/space").unwrap_or_default(),
-        cleanup: get("/v1/cleanup").unwrap_or_default(),
-    })
+pub fn heavy() -> Result<Heavy, String> {
+    Ok(Heavy { space: get("/v1/space")?, cleanup: get("/v1/cleanup")? })
 }
 
 pub fn bytes(n: i64) -> String {

@@ -76,7 +76,9 @@ in
         machine.succeed(f"{base}/specialisation/{p}/bin/switch-to-configuration test")
         machine.succeed("systemctl reset-failed cage-tty1.service; systemctl restart cage-tty1.service")
         machine.wait_for_unit("cage-tty1.service")
-        machine.sleep(8)
+        # Stores: long enough for several redraws (scans move the times), so
+        # the screenshot shows whether an open row stays open by itself.
+        machine.sleep(40 if p == "stores" else 8)
         machine.screenshot(p)
   '';
 }
