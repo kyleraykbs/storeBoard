@@ -190,6 +190,8 @@ func newEngine(t *testing.T, cfg *config.Config, ring *ringLog) *Engine {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Hermetic: never the machine's own GateHouse agent.
+	eng.grants = nil
 	return eng
 }
 

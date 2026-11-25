@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
@@ -57,7 +58,7 @@ func (e *Engine) Takeover(name, path string, uid int) (api.TakeoverResult, error
 // top-level entries moved.
 func (e *Engine) takeoverLocked(fs *StoreState, path string, uid int) (int, error) {
 	fs.perm = e.resolvePerms(fs)
-	if uid != 0 && uid != fs.perm.uid {
+	if uid != 0 && uid != fs.perm.uid && !e.granted(uid, gatehouse.Manage, fs.name) {
 		owner := "root"
 		if fs.perm.uid > 0 {
 			owner = "uid " + strconv.Itoa(fs.perm.uid)

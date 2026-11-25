@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
@@ -359,7 +360,7 @@ func (e *Engine) cleanupStores(names []string, uid int, what string) ([]*StoreSt
 	var out []*StoreState
 	if len(names) == 0 {
 		for _, fs := range e.stores {
-			if err := e.checkOwner(fs, uid, "cleanup "+what); err == nil {
+			if err := e.checkOwner(fs, uid, gatehouse.Manage, "cleanup "+what); err == nil {
 				out = append(out, fs)
 			}
 		}
@@ -373,7 +374,7 @@ func (e *Engine) cleanupStores(names []string, uid int, what string) ([]*StoreSt
 		if fs == nil {
 			return nil, fmt.Errorf("unknown store %q", name)
 		}
-		if err := e.checkOwner(fs, uid, "cleanup "+what); err != nil {
+		if err := e.checkOwner(fs, uid, gatehouse.Manage, "cleanup "+what); err != nil {
 			return nil, err
 		}
 		out = append(out, fs)

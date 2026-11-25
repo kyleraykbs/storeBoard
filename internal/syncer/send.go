@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -33,7 +34,7 @@ func (e *Engine) Send(name string, uid int, src, dst string) (api.SendResult, er
 	if fs == nil {
 		return api.SendResult{}, fmt.Errorf("unknown store %q", name)
 	}
-	if err := e.checkOwner(fs, uid, "send into"); err != nil {
+	if err := e.checkOwner(fs, uid, gatehouse.Write, "send into"); err != nil {
 		return api.SendResult{}, err
 	}
 	// The daemon's working directory is its data dir, not the caller's: a

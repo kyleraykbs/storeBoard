@@ -225,7 +225,11 @@ owned by storeboard, and file bytes are not retained on this machine.
   `send`, `backup restore`, and the `backup list` read (socket peer
   credentials, root or the store's owner, refusal when the uid cannot be
   read); `send` sources and `restore --to` targets are checked against the
-  caller's uid too. Everything else on the socket is status-grade.
+  caller's uid too. Where the grid's GateHouse agent runs, a person it grants
+  `storeboard.read@<store>` (versions), `storeboard.write@<store>` (send,
+  restore) or `storeboard.manage@<store>` (cleanup, takeover) may act too;
+  no agent or no answer grants nothing. Everything else on the socket is
+  status-grade.
 - 12: config-only peers; the transport rejects undeclared names.
 - 13: canonical dirs under root, child links and external symlinks created
   and reported; the scanner skips every symlink. Covered by

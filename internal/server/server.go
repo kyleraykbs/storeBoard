@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/internal/statelock"
 	"codeberg.org/kyleraykbs/storeboard/internal/syncer"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
@@ -415,7 +416,7 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, name str
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot determine the requesting user"})
 		return
 	}
-	if err := s.engine.CheckOwner(name, uid, "list the versions of"); err != nil {
+	if err := s.engine.CheckOwner(name, uid, gatehouse.Read, "list the versions of"); err != nil {
 		code := http.StatusForbidden
 		if strings.HasPrefix(err.Error(), "unknown store") {
 			code = http.StatusNotFound

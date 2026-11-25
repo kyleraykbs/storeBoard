@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -257,7 +258,7 @@ func (e *Engine) Restore(name string, uid int, path, blob string, at time.Time, 
 	if !validRel(path) {
 		return api.RestoreResult{}, fmt.Errorf("unsafe path %q", path)
 	}
-	if err := e.checkOwner(fs, uid, "restore from"); err != nil {
+	if err := e.checkOwner(fs, uid, gatehouse.Write, "restore from"); err != nil {
 		return api.RestoreResult{}, err
 	}
 	if to != "" {
@@ -508,28 +509,33 @@ func (e *Engine) writeRestoreCopy(to string, uid int, sum string, mode uint32, m
 
 // CheckOwner is checkOwner by store name, for callers outside the engine (the
 // daemon's read-only verbs that still reveal a store's contents).
-func (e *Engine) CheckOwner(name string, uid int, what string) error {
+func (e *Engine) CheckOwner(name string, uid int, grant, what string) error {
 	fs := e.byName[name]
 	if fs == nil {
 		return fmt.Errorf("unknown store %q", name)
 	}
-	return e.checkOwner(fs, uid, what)
+	return e.checkOwner(fs, uid, grant, what)
 }
 
-// checkOwner is the authorization shared by the acting verbs: root, or the
-// store's owner.
-func (e *Engine) checkOwner(fs *StoreState, uid int, what string) error {
+// checkOwner is the authorization shared by the acting verbs: root, the
+// store's owner, or a person GateHouse grants `grant` on this store.
+func (e *Engine) checkOwner(fs *StoreState, uid int, grant, what string) error {
 	fs.scanMu.Lock()
 	perm := e.resolvePerms(fs)
 	fs.scanMu.Unlock()
-	if uid == 0 || uid == perm.uid {
+	if uid == 0 || uid == perm.uid || e.granted(uid, grant, fs.name) {
 		return nil
 	}
 	owner := "root"
 	if perm.uid > 0 {
 		owner = fmt.Sprintf("uid %d", perm.uid)
 	}
-	return fmt.Errorf("store %q belongs to %s: run %s as that user, or as root", fs.name, owner, what)
+	return fmt.Errorf("store %q belongs to %s: run %s as that user, or as root, or hold %s@%s in GateHouse", fs.name, owner, what, grant, fs.name)
+}
+
+// granted asks GateHouse; without it, nobody is granted anything.
+func (e *Engine) granted(uid int, perm, store string) bool {
+	return uid > 0 && e.grants != nil && e.grants(uid, perm, store)
 }
 
 // pruneLoop applies retention until ctx ends: once at startup, then on a

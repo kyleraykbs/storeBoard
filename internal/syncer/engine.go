@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/internal/gatehouse"
 	"codeberg.org/kyleraykbs/storeboard/internal/store"
 	"codeberg.org/kyleraykbs/storeboard/internal/streamfs"
 	"codeberg.org/kyleraykbs/storeboard/internal/transport"
@@ -233,11 +234,14 @@ type Engine struct {
 	// trashMu: moving a file into the trash holds it shared (make the
 	// directory, move in); an explicit cleanup removing emptied
 	// directories holds it exclusively.
-	trashMu        sync.RWMutex
-	readCancels    map[cancelKey]time.Time
-	verified       map[string]verifiedFile
-	fullSent       map[string]fullIndexMark
-	sx             streamExtra // stream.go: open write handles, read bookkeeping
+	trashMu     sync.RWMutex
+	readCancels map[cancelKey]time.Time
+	verified    map[string]verifiedFile
+	fullSent    map[string]fullIndexMark
+	sx          streamExtra // stream.go: open write handles, read bookkeeping
+	// grants answers whether a person GateHouse knows may act on a store
+	// beyond its Linux owner (the acting verbs); nil grants nothing.
+	grants         gatehouse.Checker
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
@@ -596,6 +600,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Engine, error) {
 	}
 
 	e := &Engine{
+		grants:      gatehouse.Agent(gatehouse.Socket()),
 		cfg:         cfg,
 		logger:      logger,
 		dataDir:     cfg.DataDir,
