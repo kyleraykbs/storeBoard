@@ -147,7 +147,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    systemd.tmpfiles.rules = map (d: "d ${d} 0700 ${cfg.user} - -") signInDirs;
     assertions = [
       {
         assertion = cfg.groups == { } || cfg.peer != "";
@@ -184,7 +183,9 @@ in
 	  # the parent directory on startup.
 	  "d ${cfg.root} 0755 - - -"
 	  "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
-	];
+	]
+	# Sign-ins to other grids (peers with signIn).
+	++ map (d: "d ${d} 0700 ${cfg.user} - -") signInDirs;
 
     systemd.services.storeboard = {
       description = "Storeboard sync daemon";
