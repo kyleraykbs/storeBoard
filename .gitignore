@@ -15,3 +15,6 @@ android/local.properties
 # Pid files from local daemon runs.
 *.pid
 .claude/worktrees/
+
+# The desktop window (gui/), built by cargo.
+gui/target/

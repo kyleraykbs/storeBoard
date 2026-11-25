@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Storeboard
+Comment=Your stores, peers and space, kept in step across your machines
+Exec=storeboard-gui
+Icon=folder-remote
+Categories=System;FileTools;GTK;
+StartupNotify=true

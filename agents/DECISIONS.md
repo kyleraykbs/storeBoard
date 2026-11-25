@@ -502,3 +502,15 @@
   Requests are rare (once per program per machine), so this beats making the engine's
   store set mutable.
 - **Reversible:** yes: delete requested.json and the stores are no longer carried.
+
+## 2026-11-25 — A desktop window: GTK 4 and libadwaita, in Rust (gui/)
+
+- **Decision (author's call: GTK 4 + libadwaita; Rust chosen over gotk4):** `storeboard-gui`
+  shows everything the socket reports: this machine, health (the doctor's checks), every
+  store (state, counts, last scan, ownership, folder links, who requested it), peers and
+  their connections, groups, daemon-state space, trash and history per store. Its verbs:
+  scan now, send a file, browse a file's versions and restore one, take over a busy
+  folder, empty a store's trash, open a folder.
+- **Why Rust:** gtk4-rs and libadwaita-rs are the most mature GTK 4 bindings; the daemon
+  stays Go and the window only speaks its socket (HTTP/1.1 over the unix socket).
+- **Tested:** `checks.vm-gui` runs it under cage on a real daemon and screenshots every page.

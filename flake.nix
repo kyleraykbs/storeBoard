@@ -93,10 +93,33 @@
               mainProgram = "storeboard";
             };
           };
+          # The desktop window (gui/): Rust, GTK 4 and libadwaita, over the
+          # daemon's socket.
+          storeboard-gui = pkgs.rustPlatform.buildRustPackage {
+            pname = "storeboard-gui";
+            inherit version;
+            src = lib.cleanSource ./gui;
+            cargoLock.lockFile = ./gui/Cargo.lock;
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              wrapGAppsHook4
+            ];
+            buildInputs = with pkgs; [
+              gtk4
+              libadwaita
+            ];
+            postInstall = ''
+              install -Dm644 ${./gui/dev.grid.Storeboard.desktop} $out/share/applications/dev.grid.Storeboard.desktop
+            '';
+            meta = {
+              description = "Storeboard's window: stores, peers and space";
+              mainProgram = "storeboard-gui";
+            };
+          };
         in
         {
           packages = {
-            inherit storeboard;
+            inherit storeboard storeboard-gui;
             default = storeboard;
           };
 
@@ -116,6 +139,14 @@
 
           checks = {
             inherit storeboard;
+
+            # The window on a real daemon, a screenshot per page.
+            vm-gui = pkgs.testers.runNixOSTest (
+              import ./nix/tests/gui.nix {
+                module = self.nixosModules.storeboard;
+                gui = storeboard-gui;
+              }
+            );
 
             # The example config must stay valid against the real validator —
             # it is what the README tells people to copy.

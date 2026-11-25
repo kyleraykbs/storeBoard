@@ -1,0 +1,16 @@
+[package]
+name = "storeboard-gui"
+version = "0.1.0"
+edition = "2021"
+description = "storeboard: see and manage every store on this machine"
+license = "MIT"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+
+[profile.release]
+lto = "thin"
