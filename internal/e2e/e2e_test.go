@@ -118,6 +118,7 @@ type storeDecl struct {
 	Sync     string            `json:"sync,omitempty"`
 	Symlinks []string          `json:"symlinks,omitempty"`
 	Links    map[string]string `json:"links,omitempty"`
+	Holders  []string          `json:"holders,omitempty"`
 }
 
 // network is a set of daemons sharing one group. A peer can be stopped and
@@ -281,6 +282,18 @@ func writeConfigExt(t *testing.T, p *peer, stores map[string]storeDecl, top map[
 	members := []string{}
 	for name := range peers {
 		members = append(members, name)
+	}
+	// A store streamed here reads from the other peers: its holders.
+	for id, s := range stores {
+		if s.Sync != "" && s.Sync != "local" && len(s.Holders) == 0 {
+			for _, m := range members {
+				if m != p.name {
+					s.Holders = append(s.Holders, m)
+				}
+			}
+			sort.Strings(s.Holders)
+			stores[id] = s
+		}
 	}
 	doc := map[string]any{
 		"configVersion": 2,

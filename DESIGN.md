@@ -240,6 +240,22 @@ be told the tree by its config: its peers tell it.
   the daemon, as a request does. Unsubscribing deletes nothing (invariant
   1): the files stay where they are.
 
+### Holders (decided 2026-11-25)
+
+All machines are peers; a holder is one that keeps a store in full, always.
+Holders are declared on a group (`holders`) or a store (its own list wins).
+
+- A holder carries the store local whatever its `sync` says; every other
+  machine carries it the way `sync` says (a store's default: local stays
+  local everywhere, stream streams). A machine's own config can still say
+  otherwise for itself.
+- There is always a holder: a store streamed on a machine must name a holder
+  other than that machine, or the config fails validation (and with it the
+  Nix build). A holder must be in the store's group.
+- Offers carry the holders, so a learned store has them; a holder cannot
+  subscribe itself to stream or off. `storeboard doctor` warns when no holder
+  of a streamed store is connected.
+
 ## Enforced today
 
 - 1, 2: nothing is destroyed without a copy — remote deletes go to trash,

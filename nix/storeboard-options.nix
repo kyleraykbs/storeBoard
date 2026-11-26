@@ -154,6 +154,17 @@ rec {
             description = "Member peers; must include this machine's `peer`.";
           };
 
+          holders = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [ "amanita" ];
+            description = ''
+              Machines that keep every store of the group in full, whatever
+              its sync says (a store may name its own). A store streamed on a
+              machine must have a holder other than it.
+            '';
+          };
+
           permissions = lib.mkOption {
             type = lib.types.nullOr permSubmodule;
             default = null;
@@ -189,6 +200,7 @@ rec {
         group = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
         sync = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "local" "remote" "stream" ]); default = null; };
         preferred = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Preferred peer for streamed reads. Must share the store's group."; };
+        holders = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; description = "Machines that keep this store in full; empty means the group's holders."; };
         offline = lib.mkOption {
           type = lib.types.nullOr (lib.types.submodule {
             options = {
@@ -318,6 +330,7 @@ rec {
 	  lib.optionalAttrs (s.group != null) { group = s.group; }
 	  // lib.optionalAttrs (s.sync != null) { sync = s.sync; }
 	  // lib.optionalAttrs (s.preferred != null) { preferred = s.preferred; }
+	  // lib.optionalAttrs (s.holders != [ ]) { holders = s.holders; }
 	  // lib.optionalAttrs (s.offline != null) {
 	    offline = { policy = s.offline.policy; } // lib.optionalAttrs (s.offline.maxBytes != null) { maxBytes = s.offline.maxBytes; };
 	  }
@@ -349,6 +362,7 @@ rec {
       groups = lib.mapAttrs (
         _: g:
         { peers = g.peers; }
+        // lib.optionalAttrs (g.holders != [ ]) { holders = g.holders; }
         // lib.optionalAttrs (g.permissions != null) {
           permissions = lib.filterAttrs (_: v: v != null) g.permissions;
         }

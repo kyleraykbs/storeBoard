@@ -401,7 +401,7 @@ func TestEmbeddedSendIntoStreamedStore(t *testing.T) {
   "socket": "` + filepath.Join(dir, "unused.sock") + `",
   "peers": {"phone": {}, "amanita": {"endpoints": ["127.0.0.1:1"]}},
   "groups": {"kyle": {"peers": ["phone", "amanita"]}},
-  "stores": {"Pictures": {"group": "kyle", "sync": "stream"}}
+  "stores": {"Pictures": {"group": "kyle", "sync": "stream", "holders": ["amanita"]}}
 }`
 	d, err := Start(cfg, "")
 	if err != nil {

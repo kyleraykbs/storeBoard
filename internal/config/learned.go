@@ -41,6 +41,9 @@ type Offer struct {
 	// Group is the store's group on the offering peer, and the group the
 	// store joins here.
 	Group string `json:"group"`
+	// Holders keep it in full (DESIGN: holders); empty from a peer that
+	// predates them.
+	Holders []string `json:"holders,omitempty"`
 	// Links are the store's children, by id, at their relative paths.
 	Links map[string]string `json:"links,omitempty"`
 	// From are the peers that offered it.
@@ -182,7 +185,19 @@ func (c *Config) WithLearned(offers map[string]Offer, subs map[string]Subscripti
 			out.Groups[o.Group] = Group{Peers: append([]string{c.Peer}, from...)}
 			out.LearnedGroups[o.Group] = true
 		}
-		out.StoreTree[name] = Store{Group: o.Group, Sync: mode}
+		// Holders: the offer's, among this group's peers; a peer that names
+		// none (an older build) holds it itself, having offered it.
+		group := out.Groups[o.Group]
+		var holders []string
+		for _, h := range o.Holders {
+			if slices.Contains(group.Peers, h) {
+				holders = append(holders, h)
+			}
+		}
+		if len(holders) == 0 {
+			holders = from
+		}
+		out.StoreTree[name] = Store{Group: o.Group, Sync: mode, Holders: holders}
 		out.LearnedFrom[name] = from
 		merged = append(merged, name)
 	}
@@ -270,7 +285,10 @@ func (c *Config) OfferList(offers map[string]Offer, subs map[string]Subscription
 	for _, name := range slices.Sorted(maps.Keys(offers)) {
 		o := offers[name]
 		_, chosen := subs[name]
-		a := api.Offered{Name: name, Group: o.Group, From: o.From, Seen: o.Seen, Mode: c.LearnedMode(name, subs), Subscribed: chosen}
+		a := api.Offered{Name: name, Group: o.Group, Holders: o.Holders, From: o.From, Seen: o.Seen, Mode: c.LearnedMode(name, subs), Subscribed: chosen}
+		if slices.Contains(o.Holders, c.Peer) {
+			a.Mode = SyncLocal // a holder keeps it in full, whatever is chosen
+		}
 		switch {
 		case c.LearnedFrom[name] != nil:
 			a.Carried = "learned"
@@ -302,6 +320,9 @@ func (c *Config) Subscribe(name, sync, by string) (bool, error) {
 	}
 	if c.Declared(name) && c.LearnedFrom[name] == nil {
 		return false, fmt.Errorf("%q is in this machine's config, which decides how it is carried", name)
+	}
+	if slices.Contains(offers[name].Holders, c.Peer) && sync != SyncLocal && sync != "" {
+		return false, fmt.Errorf("this machine is a holder of %q: it keeps it in full, so other machines can stream it", name)
 	}
 	subs, err := LoadSubscriptions(c.DataDir)
 	if err != nil {

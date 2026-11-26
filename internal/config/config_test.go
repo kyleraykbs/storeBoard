@@ -46,7 +46,7 @@ func valid() *Config {
 		},
 		Groups: map[string]Group{
 			"family": {Peers: []string{"laptop", "desktop", "phone"}},
-			"media":  {Peers: []string{"laptop", "desktop"}},
+			"media":  {Peers: []string{"laptop", "desktop"}, Holders: []string{"desktop"}},
 		},
 		StoreTree: map[string]Store{
 			"pictures":  {Group: "family", Links: map[string]string{"bulk": "Bulk"}},
@@ -153,7 +153,7 @@ func TestLoadFullModel(t *testing.T) {
 		},
 		"groups": {
 			"family": { "peers": ["laptop", "desktop"] },
-			"media": { "peers": ["laptop"] }
+			"media": { "peers": ["laptop", "desktop"], "holders": ["desktop"] }
 		},
 		"stores": {
 			"pictures": { "group": "family", "links": { "bulk": "Bulk" } },

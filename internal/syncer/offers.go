@@ -19,9 +19,10 @@ const featureOffers = "offers"
 
 // storeOffer is one store in an "offers" frame.
 type storeOffer struct {
-	Name  string            `json:"name"`
-	Group string            `json:"group"`
-	Links map[string]string `json:"links,omitempty"`
+	Name    string            `json:"name"`
+	Group   string            `json:"group"`
+	Holders []string          `json:"holders,omitempty"`
+	Links   map[string]string `json:"links,omitempty"`
 }
 
 // SetLearnedChanged sets what to call when offers change what this machine
@@ -48,7 +49,7 @@ func (e *Engine) sendOffers(peer string) {
 		if !slices.Contains(e.cfg.Groups[v.Group].Peers, peer) {
 			continue
 		}
-		out = append(out, storeOffer{Name: name, Group: v.Group, Links: st.Links})
+		out = append(out, storeOffer{Name: name, Group: v.Group, Holders: v.Holders, Links: st.Links})
 	}
 	if err := e.sendTo(peer, frame{Type: "offers", Offers: out}); err != nil {
 		e.logger.Debug("send offers", "peer", peer, "error", err)
@@ -69,12 +70,13 @@ func (e *Engine) handleOffers(peer string, fr *frame) {
 			got[o.Name] = true
 			cur, ok := offers[o.Name]
 			next := cur
-			next.Group, next.Links = o.Group, o.Links
+			next.Group, next.Links, next.Holders = o.Group, o.Links, o.Holders
 			if !slices.Contains(next.From, peer) {
 				next.From = append(slices.Clone(next.From), peer)
 				slices.Sort(next.From)
 			}
-			differs := !ok || cur.Group != next.Group || !maps.Equal(cur.Links, next.Links) || !slices.Equal(cur.From, next.From)
+			differs := !ok || cur.Group != next.Group || !maps.Equal(cur.Links, next.Links) || !slices.Equal(cur.From, next.From) ||
+				!slices.Equal(cur.Holders, next.Holders)
 			// Seen moves at most hourly, so a reconnect is not a write.
 			if differs || now.Sub(cur.Seen) > time.Hour {
 				next.Seen = now

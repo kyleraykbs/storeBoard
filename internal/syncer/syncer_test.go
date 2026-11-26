@@ -155,6 +155,13 @@ func newNode(t *testing.T, name, other, epSelf, epOther, container string, store
 	if container == "" {
 		container = dir
 	}
+	// A store streamed here reads from the other node: its holder.
+	for id, s := range stores {
+		if s.Sync != "" && s.Sync != config.SyncLocal && len(s.Holders) == 0 {
+			s.Holders = []string{other}
+			stores[id] = s
+		}
+	}
 	cfg := &config.Config{
 		ConfigVersion: config.ConfigVersion,
 		Root:          filepath.Join(container, "Storeboard"),

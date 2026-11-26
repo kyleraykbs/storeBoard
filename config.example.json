@@ -15,7 +15,8 @@
       "permissions": { "group": "users" }
     },
     "media": {
-      "peers": ["laptop", "desktop"]
+      "peers": ["laptop", "desktop"],
+      "holders": ["desktop"]
     }
   },
   "stores": {

@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -100,6 +101,9 @@ type Friends struct {
 // peer.
 type Group struct {
 	Peers []string `json:"peers"`
+	// Holders keep every store of the group in full, whatever its sync
+	// says, unless a store names its own (Store.Holders).
+	Holders []string `json:"holders,omitempty"`
 	// Permissions is the group default for its stores; a store's own
 	// declaration overrides it field by field.
 	Permissions *Permissions `json:"permissions,omitempty"`
@@ -270,8 +274,13 @@ type OfflineQueue struct {
 // store; old canonical data and durable state remain untouched for manual
 // migration.
 type Store struct {
-	Group       string            `json:"group,omitempty"`
-	Sync        string            `json:"sync,omitempty"`
+	Group string `json:"group,omitempty"`
+	// Sync is how a machine that is not a holder carries the store.
+	Sync string `json:"sync,omitempty"`
+	// Holders are the machines that keep the store in full, always: their
+	// copy is what a streamed machine reads and uploads to (DESIGN: holders).
+	// Empty means the group's.
+	Holders     []string          `json:"holders,omitempty"`
 	Preferred   string            `json:"preferred,omitempty"`
 	Offline     *OfflineQueue     `json:"offline,omitempty"`
 	Symlinks    []string          `json:"symlinks,omitempty"`
@@ -342,9 +351,12 @@ type Config struct {
 }
 
 type StoreView struct {
-	ID          string
-	Group       string
-	Sync        string
+	ID    string
+	Group string
+	// Sync is how this machine carries it: local on a holder.
+	Sync string
+	// Holders are the store's, else its group's.
+	Holders     []string
 	Preferred   string
 	Offline     *OfflineQueue
 	Symlinks    []string
@@ -647,6 +659,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("group %q: unknown peer %q", name, member)
 			}
 		}
+		for _, h := range g.Holders {
+			if !containsString(g.Peers, h) {
+				return fmt.Errorf("group %q: holder %q is not one of its peers", name, h)
+			}
+		}
 		if c.Peer == "" {
 			return fmt.Errorf("groups are declared but this machine has no peer name; set peer")
 		}
@@ -678,6 +695,11 @@ func (c *Config) Validate() error {
 		case SyncLocal, SyncRemote, SyncStream:
 		default:
 			return fmt.Errorf("store %q: sync %q must be %q or %q", v.ID, v.Sync, SyncLocal, SyncStream)
+		}
+		for _, h := range v.Holders {
+			if !containsString(c.Groups[v.Group].Peers, h) {
+				return fmt.Errorf("store %q: holder %q is not in group %q", v.ID, h, v.Group)
+			}
 		}
 		if v.Preferred != "" {
 			if _, ok := c.Peers[v.Preferred]; !ok {
@@ -788,6 +810,14 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	// Last, so a more specific problem is reported first: the files must
+	// live in full somewhere, so a store streamed here needs a holder that
+	// is not this machine (DESIGN: holders).
+	for _, v := range c.StoreViews() {
+		if v.Sync != SyncLocal && !slices.ContainsFunc(v.Holders, func(h string) bool { return h != c.Peer }) {
+			return fmt.Errorf("store %q is streamed here but names no holder: declare holders (on the store or its group) so its files always live in full on some machine", v.ID)
+		}
+	}
 	return nil
 }
 
@@ -837,10 +867,19 @@ func (c *Config) StoreViews() []StoreView {
 		for target, path := range s.Links {
 			links[target] = path
 		}
+		holders := s.Holders
+		if len(holders) == 0 {
+			holders = c.Groups[s.Group].Holders
+		}
+		sync := normalSync(s.Sync)
+		if slices.Contains(holders, c.Peer) {
+			sync = SyncLocal
+		}
 		out = append(out, StoreView{
 			ID:          id,
 			Group:       s.Group,
-			Sync:        normalSync(s.Sync),
+			Holders:     slices.Clone(holders),
+			Sync:        sync,
 			Preferred:   s.Preferred,
 			Offline:     s.Offline,
 			Symlinks:    append([]string(nil), s.Symlinks...),
@@ -961,6 +1000,7 @@ func (c *Config) Stores() []api.Store {
 			Symlinks:    symlinks,
 			Links:       v.Links,
 			RequestedBy: c.RequestedBy[v.ID],
+			Holders:     v.Holders,
 			LearnedFrom: c.LearnedFrom[v.ID],
 		})
 	}

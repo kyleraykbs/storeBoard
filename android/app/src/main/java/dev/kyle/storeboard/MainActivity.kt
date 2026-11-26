@@ -364,6 +364,10 @@ private fun StoresCard(snap: Snapshot, choose: (String, String) -> Unit) {
     val offers = snap.offers?.optJSONArray("offers") ?: JSONArray()
     val sync = snap.status?.optJSONArray("sync") ?: JSONArray()
     val state = (0 until sync.length()).associate { sync.getJSONObject(it).let { s -> s.optString("store") to s } }
+    val me = snap.status?.optString("peer").orEmpty()
+    val connections = snap.status?.optJSONArray("connections") ?: JSONArray()
+    val connected = (0 until connections.length()).map { connections.getJSONObject(it) }
+        .filter { it.optString("state") == "connected" }.map { it.optString("peer") }.toSet()
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Stores", style = MaterialTheme.typography.titleMedium)
@@ -387,8 +391,13 @@ private fun StoresCard(snap: Snapshot, choose: (String, String) -> Unit) {
                 val name = o.getString("name")
                 val from = o.optJSONArray("from")?.let { a -> (0 until a.length()).joinToString(", ") { a.getString(it) } } ?: ""
                 val s = state[name]
+                val holders = o.optJSONArray("holders")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
+                val holder = me in holders
                 val detail = buildString {
-                    append("from $from")
+                    append(if (holders.isNotEmpty()) "held by ${holders.joinToString(", ")}" else "from $from")
+                    if (holders.isNotEmpty() && !holder && o.optString("mode") == "stream" && holders.none { it in connected }) {
+                        append(" · no holder connected")
+                    }
                     if (s != null) {
                         append(" · ${s.optInt("entries")} files")
                         if (s.optInt("pending") > 0) append(", ${s.optInt("pending")} to send")
@@ -399,6 +408,8 @@ private fun StoresCard(snap: Snapshot, choose: (String, String) -> Unit) {
                     Text(detail, style = MaterialTheme.typography.bodySmall)
                     if (o.optString("carried") == "declared") {
                         Text("Set in this phone's config", style = MaterialTheme.typography.bodySmall)
+                    } else if (holder) {
+                        Text("This phone is a holder: it keeps it in full", style = MaterialTheme.typography.bodySmall)
                     } else {
                         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(top = 4.dp)) {
                             modes.forEachIndexed { at, (mode, label) ->

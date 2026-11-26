@@ -161,6 +161,16 @@ func (e *Engine) doctorStore(fs *StoreState, add addCheck) {
 	} else if left := e.stagingLeftovers(fs); left != "" {
 		raise(api.CheckWarn, "switched to stream; items the migration did not recognise were left in "+left, "look through them and move or delete what you want")
 	}
+	// Streamed: its files live in full on the holders (DESIGN: holders).
+	if v, ok := e.cfg.StoreView(fs.name); ok && fs.stream && len(v.Holders) > 0 {
+		e.mu.Lock()
+		up := slices.ContainsFunc(v.Holders, func(h string) bool { _, ok := e.sends[h]; return ok })
+		e.mu.Unlock()
+		if !up {
+			raise(api.CheckWarn, "no holder connected ("+strings.Join(v.Holders, ", ")+"): files not already here can't be read, and changes queue until one is",
+				"check that "+strings.Join(v.Holders, " or ")+" is up and reachable")
+		}
+	}
 	if fs.stream {
 		if !fs.mounted() && !fs.migrationBlocked() {
 			raise(api.CheckFail, "the streamed mount is not up", "the folder shows nothing; check the daemon log for the mount error (is /dev/fuse available?)")
