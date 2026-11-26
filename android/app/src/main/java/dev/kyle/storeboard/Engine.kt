@@ -3,6 +3,8 @@ package dev.kyle.storeboard
 import android.content.Context
 import mobile.Daemon
 import mobile.Mobile
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -161,50 +163,67 @@ object Engine {
 
     fun configFile(context: Context): File = File(dataDir(context), "config.json")
 
+    /** Whether the phone has been set up: it has a config. */
+    fun configured(context: Context): Boolean = configFile(context).exists()
+
     /**
-     * What the config editor opens with: this phone and the two stores a
-     * phone usually wants — the camera roll, which lives here and syncs out,
-     * and the photo library, which comes down from the pool and stays
-     * readable offline.
+     * The config setup writes: this phone, the first peer to learn stores
+     * from, and a policy of streaming every store that peer offers (DESIGN:
+     * learned stores) until the person chooses otherwise. No stores and no
+     * groups: they come from the peer. The phone dials out, so it needs no
+     * endpoint of its own; the peer's config must list this phone, by this
+     * name, in a group with it.
      *
-     * The root is the one place the phone's bytes live: every store is a
-     * directory directly under it. The peer list must name this phone exactly
-     * as the pool's config declares it, and must carry the pool's own name
-     * and a dialable endpoint — the phone dials out, so the endpoint is what
-     * makes the pool reachable. The pool needs the matching line on its side:
-     * this phone listed in its group, no endpoint needed, because a declared
-     * but unaddressed peer simply waits to be dialled.
+     * The root is where a store kept on the phone lives, beside the data
+     * directory, never inside it.
      *
-     * This document is pinned by TestAppDefaultConfigIsValid in mobile/ —
-     * the config is strict (an unknown key is an error), so the two have to
-     * move together.
+     * This document is pinned by TestAppDefaultConfigIsValid in mobile/: the
+     * config is strict, so the two move together.
      */
-    fun defaultConfig(context: Context): String {
+    fun setupConfig(context: Context, phone: String, peer: String, endpoint: String): String {
         val data = dataDir(context)
-        // The root lives beside the data directory, never inside it: that
-        // tree is the daemon's own (blobs, journals, history) and a store
-        // rooted in there would index the daemon's state.
         val root = File(context.filesDir, "Storeboard").absolutePath
-        return """
-        {
-          "configVersion": 2,
-          "root": "$root",
-          "peer": "phone",
-          "dataDir": "${data.absolutePath}",
-          "socket": "${File(data, "storeboard.sock").absolutePath}",
-          "backup": { "enable": true, "keep": "1y" },
-          "peers": {
-            "phone": {},
-            "pool": { "endpoints": ["192.168.1.10:4242"] }
-          },
-          "groups": {
-            "kyle": { "peers": ["phone", "pool"] }
-          },
-          "stores": {
-            "camera": { "group": "kyle" },
-            "photos": { "group": "kyle" }
-          }
-        }
-        """.trimIndent()
+        return JSONObject()
+            .put("configVersion", 2)
+            .put("root", root)
+            .put("peer", phone)
+            .put("dataDir", data.absolutePath)
+            .put("socket", File(data, "storeboard.sock").absolutePath)
+            .put("backup", JSONObject().put("enable", true).put("keep", "1y"))
+            .put("learn", JSONObject().put("subscribe", "stream"))
+            .put(
+                "peers",
+                JSONObject()
+                    .put(phone, JSONObject())
+                    .put(peer, JSONObject().put("endpoints", JSONArray().put(endpoint))),
+            )
+            .toString(2)
+    }
+
+    /** Adds a peer to the config: another machine to sync and learn from. */
+    fun addPeer(context: Context, name: String, endpoint: String) {
+        val cfg = JSONObject(configFile(context).readText())
+        val peers = cfg.optJSONObject("peers") ?: JSONObject().also { cfg.put("peers", it) }
+        peers.put(name, JSONObject().put("endpoints", JSONArray().put(endpoint)))
+        configFile(context).writeText(cfg.toString(2))
+    }
+
+    /** The offered stores and what the phone does with each (api.Offered). */
+    fun offers(): String = daemon?.let { runCatching { it.offers() }.getOrElse { "" } } ?: ""
+
+    /**
+     * Chooses what to do with an offered store: "stream", "local", "off".
+     * True when the engine must start again to carry it.
+     */
+    fun subscribe(name: String, sync: String): Boolean = engine().subscribe(name, sync)
+
+    /** The stores to carry changed: a subscription, or a peer's offer. */
+    fun restartWanted(): Boolean = daemon?.restartWanted() ?: false
+
+    /** Stop and start, in order, with the config as it is now. */
+    fun restartAsync(context: Context, done: (Boolean) -> Unit = {}) {
+        stopAsync()
+        val cfg = configFile(context)
+        if (cfg.exists()) startAsync(context, cfg.readText(), done)
     }
 }

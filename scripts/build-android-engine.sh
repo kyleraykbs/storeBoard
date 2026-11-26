@@ -45,7 +45,9 @@ if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
 fi
 echo "SDK=$ANDROID_HOME NDK=${ANDROID_NDK_HOME:-none}"
 
+# 64-bit only: go-fuse's splice does not build for 32-bit ARM, and phones
+# that need 32-bit are a decade old (amd64 is for emulators).
 nix shell --impure nixpkgs#gomobile nixpkgs#jdk21 -c \
-	gomobile bind -target=android -androidapi 26 -o "$out" ./mobile
+	gomobile bind -target=android/arm64,android/amd64 -androidapi 26 -o "$out" ./mobile
 
 echo "wrote $out"

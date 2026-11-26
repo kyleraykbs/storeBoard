@@ -1,6 +1,7 @@
 package dev.kyle.storeboard
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -10,30 +11,56 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
@@ -41,36 +68,62 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
 /**
- * One screen: whether the engine is up, what it thinks, where files come
- * from, the config it reads, and the tail of its log. Small on purpose — the
- * document it renders is the daemon's own, so there is nothing to invent.
+ * Setup the first time (this phone's name, and a machine to learn stores
+ * from), then one screen: what the engine is doing, the stores peers offer
+ * and how the phone carries each, camera backup, sharing, the peers, and the
+ * raw config and log for when something is wrong.
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Android 15 draws apps under the system bars; the screen keeps
+        // clear of them itself (safeDrawingPadding).
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        val config = Engine.configFile(this)
-        if (!config.exists()) config.writeText(Engine.defaultConfig(this))
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
-
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { App() }
+            val dark = isSystemInDarkTheme()
+            val scheme = when {
+                Build.VERSION.SDK_INT >= 31 && dark -> dynamicDarkColorScheme(this)
+                Build.VERSION.SDK_INT >= 31 -> dynamicLightColorScheme(this)
+                dark -> darkColorScheme()
+                else -> lightColorScheme()
+            }
+            MaterialTheme(colorScheme = scheme) {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    var configured by remember { mutableStateOf(Engine.configured(this)) }
+                    if (configured) {
+                        App()
+                    } else {
+                        Setup { phone, peer, endpoint ->
+                            Engine.configFile(this).writeText(Engine.setupConfig(this, phone, peer, endpoint))
+                            askNotifications()
+                            SyncService.start(this)
+                            configured = true
+                        }
+                    }
+                }
             }
         }
 
-        if (!Engine.running()) SyncService.start(this)
+        if (Engine.configured(this)) {
+            askNotifications()
+            if (!Engine.running()) SyncService.start(this)
+        }
         // A recreated activity (rotation, process restore) carries the same
         // launching intent; only a fresh launch is a new share, or every
         // rotation would send the file again.
         if (savedInstanceState == null) handleSend(intent)
+    }
+
+    private fun askNotifications() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -79,7 +132,7 @@ class MainActivity : ComponentActivity() {
         handleSend(intent)
     }
 
-    /** A file shared into storeboard is a send into the camera folder. */
+    /** A file shared into storeboard is a send, to where the person chose. */
     private fun handleSend(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
         // Reopened from recents, the activity is handed the share that
@@ -99,7 +152,7 @@ class MainActivity : ComponentActivity() {
                 if (Engine.awaitRunning()) {
                     send(uri)
                 } else {
-                    "send failed: ${Engine.lastError ?: "the engine did not start"}"
+                    "Couldn't send it: ${Engine.lastError ?: "storeboard isn't running"}"
                 }
             }
             Toast.makeText(this@MainActivity, result, Toast.LENGTH_LONG).show()
@@ -111,6 +164,8 @@ class MainActivity : ComponentActivity() {
     // The engine copies, never moves, so the cache copy is this side's to
     // delete — whether or not the send succeeded.
     private fun send(uri: Uri): String {
+        val target = SharedFiles.target(this)
+            ?: return "Choose where shared files go first, in storeboard"
         var copy: File? = null
         return try {
             val name = displayName(uri)
@@ -119,13 +174,12 @@ class MainActivity : ComponentActivity() {
             copy = file
             contentResolver.openInputStream(uri)?.use { input ->
                 file.outputStream().use { output -> input.copyTo(output) }
-            } ?: return "could not read $name"
-
-            val raw = Engine.send("camera", file, "shared/$name")
-            val sent = JSONObject(raw)
-            "sent ${sent.optString("path")} (${sent.optLong("size")} bytes)"
+            } ?: return "Couldn't read $name"
+            val dest = if (target.second.isEmpty()) name else "${target.second}/$name"
+            val sent = JSONObject(Engine.send(target.first, file, dest))
+            "Sent to ${target.first}/${sent.optString("path")}"
         } catch (e: Exception) {
-            "send failed: ${e.message}"
+            "Couldn't send it: ${e.message}"
         } finally {
             copy?.delete()
         }
@@ -142,122 +196,419 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** Where files shared into storeboard go: a store and a folder in it. */
+object SharedFiles {
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences("shared-files", Context.MODE_PRIVATE)
+
+    fun target(ctx: Context): Pair<String, String>? {
+        val store = prefs(ctx).getString("store", "") ?: ""
+        return if (store.isEmpty()) null else store to (prefs(ctx).getString("folder", "") ?: "")
+    }
+
+    fun set(ctx: Context, store: String, folder: String) {
+        prefs(ctx).edit().putString("store", store).putString("folder", folder.trim('/')).apply()
+    }
+}
+
+/** A name storeboard accepts for a peer: letters, digits, '-', '_', '.'. */
+private fun validName(s: String) = s.isNotEmpty() && !s.startsWith(".") && s.all { it.isLetterOrDigit() || it in "-_." }
+
+@Composable
+private fun Setup(onDone: (String, String, String) -> Unit) {
+    var phone by remember { mutableStateOf("") }
+    var peer by remember { mutableStateOf("") }
+    var endpoint by remember { mutableStateOf("") }
+    Column(
+        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("storeboard", style = MaterialTheme.typography.headlineMedium)
+        Text(
+            "This phone syncs with machines that list it in their config. Name it as they do, " +
+                "and give one of them to start from: the stores it offers show up here, and you " +
+                "choose which the phone carries.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        OutlinedTextField(
+            phone, { phone = it.trim() }, label = { Text("This phone's name") }, placeholder = { Text("phone") },
+            singleLine = true, isError = phone.isNotEmpty() && !validName(phone), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            peer, { peer = it.trim() }, label = { Text("A machine to sync with") }, placeholder = { Text("server") },
+            singleLine = true, isError = peer.isNotEmpty() && !validName(peer), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            endpoint, { endpoint = it.trim() }, label = { Text("Its address") }, placeholder = { Text("server.example.org:4242") },
+            supportingText = { Text("host:port where its storeboard listens") },
+            singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth(),
+        )
+        Button(
+            enabled = validName(phone) && validName(peer) && phone != peer && endpoint.contains(':'),
+            onClick = { onDone(phone, peer, endpoint) },
+        ) { Text("Start") }
+    }
+}
+
+/** What the screen shows, read off the main thread. */
+private data class Snapshot(
+    val running: Boolean = false,
+    val status: JSONObject? = null,
+    val offers: JSONObject? = null,
+    val error: String = "",
+    val log: String = "",
+)
+
+private fun snapshot(ctx: Context) = Snapshot(
+    running = Engine.running(),
+    status = Engine.status().takeIf { it.isNotEmpty() }?.let { runCatching { JSONObject(it) }.getOrNull() },
+    offers = Engine.offers().takeIf { it.isNotEmpty() }?.let { runCatching { JSONObject(it) }.getOrNull() },
+    error = Engine.lastError ?: "",
+    log = tail(Engine.logFile(ctx)),
+)
+
 @Composable
 private fun App() {
-    var running by remember { mutableStateOf(Engine.running()) }
-    var status by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
-    var log by remember { mutableStateOf("") }
-    var config by remember { mutableStateOf("") }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val activity = context as MainActivity
+    val ctx = LocalContext.current
+    val activity = ctx as MainActivity
+    val scope = rememberCoroutineScope()
+    var snap by remember { mutableStateOf(Snapshot()) }
+    var busy by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf("") }
+    var tick by remember { mutableStateOf(0) }
 
-    LaunchedEffect(Unit) {
-        config = Engine.configFile(activity).takeIf { it.exists() }?.readText()
-            ?: Engine.defaultConfig(activity)
+    LaunchedEffect(tick) {
         while (true) {
-            // status() marshals the whole document through the engine and
-            // tail() reads the log file: both are off the main thread, and
-            // only the assignments come back to it.
-            val polled = withContext(Dispatchers.IO) {
-                listOf(Engine.status(), Engine.lastError ?: "", tail(Engine.logFile(activity)))
-            }
-            running = Engine.running()
-            status = polled[0]
-            error = polled[1]
-            log = polled[2]
+            snap = withContext(Dispatchers.IO) { snapshot(ctx) }
+            if (busy.isNotEmpty() && snap.running && !Engine.restartWanted()) busy = ""
             delay(2000)
         }
     }
 
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri -> if (uri != null) activity.sendUri(uri) }
+    /** A subscription change: record it, and start again when it changes what is carried. */
+    fun choose(store: String, mode: String) {
+        message = ""
+        scope.launch {
+            val r = withContext(Dispatchers.IO) { runCatching { Engine.subscribe(store, mode) } }
+            r.onSuccess { restart ->
+                if (restart) {
+                    busy = "Applying…"
+                    Engine.restartAsync(ctx)
+                }
+            }.onFailure { message = it.message ?: it.toString() }
+            tick++
+        }
+    }
+
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) activity.sendUri(uri)
+    }
 
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("storeboard", style = MaterialTheme.typography.headlineSmall)
-        Text(if (running) "engine: running" else "engine: stopped")
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { SyncService.start(activity) }) { Text("start") }
-            OutlinedButton(onClick = { SyncService.stop(activity) }) { Text("stop") }
-            OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }) { Text("send a file") }
+        val connections = snap.status?.optJSONArray("connections") ?: JSONArray()
+        val up = (0 until connections.length()).map { connections.getJSONObject(it) }.filter { it.optString("state") == "connected" }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("storeboard", style = MaterialTheme.typography.headlineMedium)
+                Text(
+                    when {
+                        !snap.running -> "Off"
+                        up.isNotEmpty() -> "Syncing with " + up.joinToString(", ") { it.optString("peer") }
+                        else -> "On, waiting for a peer"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Switch(
+                checked = snap.running,
+                onCheckedChange = {
+                    if (it) SyncService.start(ctx) else SyncService.stop(ctx)
+                    tick++
+                },
+            )
+        }
+        if (busy.isNotEmpty()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text(busy)
+            }
+        }
+        val problem = message.ifEmpty { snap.error }
+        if (problem.isNotEmpty()) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Text(problem, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
+            }
         }
 
-        if (error.isNotEmpty()) Text("error: $error", color = MaterialTheme.colorScheme.error)
-
-        Summary(status)
-
-        HorizontalDivider()
-        Text("config", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(
-            value = config,
-            onValueChange = { config = it },
-            modifier = Modifier.fillMaxWidth(),
-            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            minLines = 8,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = {
-                Engine.configFile(activity).writeText(config)
-                Toast.makeText(activity, "saved; restart to apply", Toast.LENGTH_SHORT).show()
-            }) { Text("save") }
-        }
-
-        HorizontalDivider()
-        Text("log", style = MaterialTheme.typography.titleMedium)
-        Text(
-            log.ifEmpty { "(nothing yet)" },
-            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-        )
+        StoresCard(snap, ::choose)
+        val carried = carriedStores(snap)
+        CameraCard(carried)
+        SharedCard(carried) { picker.launch(arrayOf("*/*")) }
+        PeersCard(snap) { tick++ }
+        AdvancedCard(snap) { tick++ }
     }
 }
 
-/** The status document, rendered: stores, connections, and the peer name. */
+/** The stores the phone carries now, by name. */
+private fun carriedStores(snap: Snapshot): List<String> {
+    val sync = snap.status?.optJSONArray("sync") ?: return emptyList()
+    return (0 until sync.length()).map { sync.getJSONObject(it).optString("store") }.filter { it.isNotEmpty() }.sorted()
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Summary(status: String) {
-    if (status.isEmpty()) {
-        Text("no status yet")
-        return
-    }
-    val doc = runCatching { JSONObject(status) }.getOrNull() ?: run {
-        Text(status, style = MaterialTheme.typography.bodySmall)
-        return
-    }
-
-    Text("peer ${doc.optString("peer")} (${doc.optString("version")})")
-
-    val sync = doc.optJSONArray("sync")
-    if (sync != null) {
-        for (i in 0 until sync.length()) {
-            val f = sync.optJSONObject(i) ?: continue
-            val pending = if (f.has("pending")) ", ${f.optInt("pending")} pending" else ""
+private fun StoresCard(snap: Snapshot, choose: (String, String) -> Unit) {
+    val offers = snap.offers?.optJSONArray("offers") ?: JSONArray()
+    val sync = snap.status?.optJSONArray("sync") ?: JSONArray()
+    val state = (0 until sync.length()).associate { sync.getJSONObject(it).let { s -> s.optString("store") to s } }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Stores", style = MaterialTheme.typography.titleMedium)
             Text(
-                "${f.optString("store")}: ${f.optString("state")}, " +
-                    "${f.optInt("entries")} entries$pending",
-                style = MaterialTheme.typography.bodyMedium,
+                "Stream: in the Files app, fetched as you open things. Keep: a full copy on the phone, for offline.",
+                style = MaterialTheme.typography.bodySmall,
             )
+            if (offers.length() == 0) {
+                Text(
+                    if (snap.running) {
+                        "No stores offered yet. They come when a peer connects; its config must list this phone in a group with it."
+                    } else {
+                        "Turn storeboard on to see the stores your peers offer."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            val modes = listOf("off" to "Off", "stream" to "Stream", "local" to "Keep")
+            for (i in 0 until offers.length()) {
+                val o = offers.getJSONObject(i)
+                val name = o.getString("name")
+                val from = o.optJSONArray("from")?.let { a -> (0 until a.length()).joinToString(", ") { a.getString(it) } } ?: ""
+                val s = state[name]
+                val detail = buildString {
+                    append("from $from")
+                    if (s != null) {
+                        append(" · ${s.optInt("entries")} files")
+                        if (s.optInt("pending") > 0) append(", ${s.optInt("pending")} to send")
+                    }
+                }
+                Column {
+                    Text(name, style = MaterialTheme.typography.bodyLarge)
+                    Text(detail, style = MaterialTheme.typography.bodySmall)
+                    if (o.optString("carried") == "declared") {
+                        Text("Set in this phone's config", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                            modes.forEachIndexed { at, (mode, label) ->
+                                SegmentedButton(
+                                    selected = o.optString("mode") == mode,
+                                    onClick = { if (o.optString("mode") != mode) choose(name, mode) },
+                                    shape = SegmentedButtonDefaults.itemShape(at, modes.size),
+                                ) { Text(label) }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+}
 
-    val connections = doc.optJSONArray("connections")
-    if (connections == null || connections.length() == 0) {
-        Text("no one connected", style = MaterialTheme.typography.bodyMedium)
-    } else {
-        for (i in 0 until connections.length()) {
-            val c = connections.optJSONObject(i) ?: continue
-            val endpoint = c.optString("endpoint")
-            val suffix = if (endpoint.isEmpty()) "" else " at $endpoint"
+/** A store and a folder in it, chosen from the stores the phone carries. */
+@Composable
+private fun StoreAndFolder(
+    carried: List<String>,
+    store: String,
+    folder: String,
+    onStore: (String) -> Unit,
+    onFolder: (String) -> Unit,
+    folderHint: String,
+) {
+    if (carried.isEmpty()) {
+        Text("Subscribe to a store first.", style = MaterialTheme.typography.bodySmall)
+        return
+    }
+    Text("Into the store", style = MaterialTheme.typography.labelLarge)
+    for (s in carried) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RadioButton(selected = store == s, onClick = { onStore(s) })
+            Text(s)
+        }
+    }
+    OutlinedTextField(
+        folder, onFolder, label = { Text("Folder in it") }, placeholder = { Text(folderHint) },
+        supportingText = { Text("Empty puts them at the top of the store") },
+        singleLine = true, modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+@Composable
+private fun CameraCard(carried: List<String>) {
+    val ctx = LocalContext.current
+    var settings by remember { mutableStateOf(CameraBackup.settings(ctx)) }
+    var editing by remember { mutableStateOf(false) }
+    var store by remember { mutableStateOf(settings.store) }
+    var folder by remember { mutableStateOf(settings.folder) }
+    var existing by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf(CameraBackup.lastResult) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            result = CameraBackup.lastResult
+            delay(2000)
+        }
+    }
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
+        if (granted.values.all { it }) {
+            CameraBackup.enable(ctx, store, folder, existing)
+            settings = CameraBackup.settings(ctx)
+            editing = false
+        } else {
+            result = "Camera backup needs permission to read photos and videos"
+        }
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Camera backup", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        if (settings.enabled) {
+                            "What the camera takes goes to ${settings.store}" + (if (settings.folder.isNotEmpty()) "/${settings.folder}" else "")
+                        } else {
+                            "Off"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(checked = settings.enabled || editing, onCheckedChange = {
+                    if (it) {
+                        editing = true
+                    } else {
+                        editing = false
+                        CameraBackup.disable(ctx)
+                        settings = CameraBackup.settings(ctx)
+                    }
+                })
+            }
+            if (editing) {
+                StoreAndFolder(carried, store, folder, { store = it }, { folder = it }, "Phone/Camera")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(existing, { existing = it })
+                    Text("Also the photos already on the phone", style = MaterialTheme.typography.bodyMedium)
+                }
+                Button(enabled = store.isNotEmpty(), onClick = { ask.launch(CameraBackup.permissions()) }) { Text("Turn on") }
+            }
+            if (settings.enabled && result.isNotEmpty()) Text(result, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun SharedCard(carried: List<String>, onSendFile: () -> Unit) {
+    val ctx = LocalContext.current
+    var target by remember { mutableStateOf(SharedFiles.target(ctx)) }
+    var editing by remember { mutableStateOf(false) }
+    var store by remember { mutableStateOf(target?.first ?: "") }
+    var folder by remember { mutableStateOf(target?.second ?: "") }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Sharing into storeboard", style = MaterialTheme.typography.titleMedium)
             Text(
-                "peer ${c.optString("peer")}: ${c.optString("state")}$suffix",
-                style = MaterialTheme.typography.bodyMedium,
+                target?.let { "A file shared to storeboard goes to ${it.first}" + (if (it.second.isNotEmpty()) "/${it.second}" else "") }
+                    ?: "Choose where files shared to storeboard go.",
+                style = MaterialTheme.typography.bodySmall,
             )
+            if (editing) {
+                StoreAndFolder(carried, store, folder, { store = it }, { folder = it }, "Shared")
+                Button(enabled = store.isNotEmpty(), onClick = {
+                    SharedFiles.set(ctx, store, folder)
+                    target = SharedFiles.target(ctx)
+                    editing = false
+                }) { Text("Save") }
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { editing = true }) { Text(if (target == null) "Choose" else "Change") }
+                    if (target != null) OutlinedButton(onClick = onSendFile) { Text("Send a file") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PeersCard(snap: Snapshot, changed: () -> Unit) {
+    val ctx = LocalContext.current
+    val connections = snap.status?.optJSONArray("connections") ?: JSONArray()
+    var adding by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    var endpoint by remember { mutableStateOf("") }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Peers", style = MaterialTheme.typography.titleMedium)
+            for (i in 0 until connections.length()) {
+                val c = connections.getJSONObject(i)
+                val stateText = when (c.optString("state")) {
+                    "connected" -> "connected" + c.optString("endpoint").let { if (it.isEmpty()) "" else " at $it" }
+                    "dialing" -> "trying to reach it"
+                    "backoff" -> "not reachable; trying again soon"
+                    "unaddressed" -> "no address: it connects to this phone"
+                    else -> c.optString("state")
+                }
+                Text("${c.optString("peer")}: $stateText", style = MaterialTheme.typography.bodyMedium)
+            }
+            if (adding) {
+                OutlinedTextField(name, { name = it.trim() }, label = { Text("Its name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    endpoint, { endpoint = it.trim() }, label = { Text("Its address") }, placeholder = { Text("host:4242") },
+                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth(),
+                )
+                Button(enabled = validName(name) && endpoint.contains(':'), onClick = {
+                    Engine.addPeer(ctx, name, endpoint)
+                    Engine.restartAsync(ctx)
+                    adding = false
+                    name = ""
+                    endpoint = ""
+                    changed()
+                }) { Text("Add") }
+            } else {
+                TextButton(onClick = { adding = true }) { Text("Add a peer") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdvancedCard(snap: Snapshot, changed: () -> Unit) {
+    val ctx = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    var config by remember { mutableStateOf("") }
+    TextButton(onClick = {
+        open = !open
+        if (open) config = Engine.configFile(ctx).takeIf { it.exists() }?.readText() ?: ""
+    }) { Text(if (open) "Hide the config and log" else "Config and log") }
+    if (!open) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Config", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(
+                config, { config = it }, modifier = Modifier.fillMaxWidth(),
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), minLines = 8,
+            )
+            Button(onClick = {
+                Engine.configFile(ctx).writeText(config)
+                Engine.restartAsync(ctx)
+                changed()
+                Toast.makeText(ctx, "Saved; starting again with it", Toast.LENGTH_SHORT).show()
+            }) { Text("Save and restart") }
+            Text("Log", style = MaterialTheme.typography.titleMedium)
+            SelectionContainer {
+                Text(
+                    snap.log.ifEmpty { "Nothing logged yet." },
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                )
+            }
         }
     }
 }

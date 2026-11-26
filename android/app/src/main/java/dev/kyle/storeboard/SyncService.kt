@@ -8,8 +8,13 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.provider.MediaStore
+import java.util.concurrent.Executors
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -53,11 +58,45 @@ class SyncService : Service() {
             // not sit there pretending the mesh is up.
             if (!ok) stopSelf()
         }
+        // New photos wake camera backup at once, not at the next tick.
+        observer = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean) {
+                handler.removeCallbacks(backupSoon)
+                handler.postDelayed(backupSoon, 5_000)
+            }
+        }.also {
+            contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, it)
+            contentResolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, it)
+        }
+        handler.postDelayed(tick, TICK_MS)
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var observer: ContentObserver? = null
+    private var ticks = 0
+    private val background = Executors.newSingleThreadExecutor()
+
+    private val backupSoon = Runnable { background.execute { CameraBackup.run(applicationContext) } }
+
+    /**
+     * Every few seconds: the engine asks to start again when the stores to
+     * carry changed (a subscription, or a peer's offer under the policy);
+     * every few minutes, camera backup looks for anything it missed.
+     */
+    private val tick = object : Runnable {
+        override fun run() {
+            if (Engine.restartWanted()) Engine.restartAsync(applicationContext)
+            if (++ticks % (BACKUP_EVERY_MS / TICK_MS).toInt() == 0) backupSoon.run()
+            handler.postDelayed(this, TICK_MS)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        observer?.let { contentResolver.unregisterContentObserver(it) }
+        background.shutdown()
         Engine.stopAsync()
         super.onDestroy()
     }
@@ -92,6 +131,8 @@ class SyncService : Service() {
     companion object {
         private const val CHANNEL_ID = "storeboard.sync"
         private const val NOTIFICATION_ID = 1
+        private const val TICK_MS = 5_000L
+        private const val BACKUP_EVERY_MS = 300_000L
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, SyncService::class.java))
