@@ -191,8 +191,14 @@ func TestFriendSyncsOnlyWhatTheyAreGiven(t *testing.T) {
 	write(t, filepath.Join(host.storeDir("Photos"), "beach.jpg"), "sand")
 	write(t, filepath.Join(host.storeDir("Music"), "song.flac"), "private")
 	write(t, filepath.Join(host.storeDir("Notes"), "todo.txt"), "milk")
-	waitFor(t, "Photos reaches lain", func() bool { b, _ := os.ReadFile(filepath.Join(lain.storeDir("Photos"), "beach.jpg")); return string(b) == "sand" })
-	waitFor(t, "Notes reaches lain", func() bool { b, _ := os.ReadFile(filepath.Join(lain.storeDir("Notes"), "todo.txt")); return string(b) == "milk" })
+	waitFor(t, "Photos reaches lain", func() bool {
+		b, _ := os.ReadFile(filepath.Join(lain.storeDir("Photos"), "beach.jpg"))
+		return string(b) == "sand"
+	})
+	waitFor(t, "Notes reaches lain", func() bool {
+		b, _ := os.ReadFile(filepath.Join(lain.storeDir("Notes"), "todo.txt"))
+		return string(b) == "milk"
+	})
 
 	// She writes where she may, and nowhere else.
 	write(t, filepath.Join(lain.storeDir("Notes"), "from-lain.txt"), "hi")

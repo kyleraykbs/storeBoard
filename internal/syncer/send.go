@@ -123,6 +123,9 @@ func (e *Engine) Send(name string, uid int, src, dst string) (api.SendResult, er
 // no lock the FUSE handlers need: taking the scan lock here deadlocked the
 // send against the close that records it.
 func (e *Engine) sendStreamed(fs *StoreState, in *os.File, src, dst string, info os.FileInfo) (api.SendResult, error) {
+	if !fs.mountUp.Load() {
+		return e.sendStreamedDirect(fs, in, src, dst, info)
+	}
 	target := filepath.Join(fs.root, dst)
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return api.SendResult{}, err
@@ -243,4 +246,52 @@ func writeThroughMount(in *os.File, target string, info os.FileInfo) error {
 		return err
 	}
 	return out.Close()
+}
+
+// sendStreamedDirect is a send into a streamed store with no mount: a phone,
+// where apps get no FUSE, serves streamed stores from the journal only. The
+// write goes through the same mutator the mount would call, so it is
+// journalled and queued exactly as a write through the mount is.
+func (e *Engine) sendStreamedDirect(fs *StoreState, in *os.File, src, dst string, info os.FileInfo) (api.SendResult, error) {
+	m := &storeMutator{e: e, fs: fs}
+	parked := ""
+	if ent := fs.db.Get(dst); ent != nil && !ent.Deleted && !ent.Dir {
+		parked = conflictPath(dst, ent.Blob)
+		if err := m.Rename(dst, parked); err != nil {
+			return api.SendResult{}, fmt.Errorf("park existing %s: %w", dst, err)
+		}
+	}
+	pf, err := m.Create(dst, uint32(info.Mode().Perm()))
+	if err != nil {
+		return api.SendResult{}, err
+	}
+	buf := make([]byte, 1<<20)
+	var off int64
+	for {
+		n, rerr := in.Read(buf)
+		if n > 0 {
+			if _, werr := pf.WriteAt(buf[:n], off); werr != nil {
+				pf.Close()
+				return api.SendResult{}, werr
+			}
+			off += int64(n)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			pf.Close()
+			return api.SendResult{}, rerr
+		}
+	}
+	if err := pf.Sync(); err != nil {
+		pf.Close()
+		return api.SendResult{}, err
+	}
+	if err := pf.Close(); err != nil {
+		return api.SendResult{}, err
+	}
+	e.flushQueue(fs)
+	e.logger.Info("sent a file into the streamed store", "store", fs.name, "path", dst, "from", src, "mount", false)
+	return api.SendResult{Store: fs.name, Path: dst, Parked: parked, Size: off}, nil
 }

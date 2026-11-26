@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
@@ -384,5 +385,63 @@ func TestEmbeddedBrowseAfterStop(t *testing.T) {
 		if _, err := d.ReadAt("documents", "a.txt", 0, 1); !errors.Is(err, errStopped) {
 			t.Errorf("ReadAt = %v, want errStopped", err)
 		}
+	}
+}
+
+// A phone has no FUSE: a streamed store is served from its journal, and a
+// file sent into it (a camera backup) goes through the mutator the mount
+// would use, journalled and queued for a holder.
+func TestEmbeddedSendIntoStreamedStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "configVersion": 2,
+  "root": "` + filepath.Join(dir, "root") + `",
+  "peer": "phone",
+  "dataDir": "` + filepath.Join(dir, "data") + `",
+  "socket": "` + filepath.Join(dir, "unused.sock") + `",
+  "peers": {"phone": {}, "amanita": {"endpoints": ["127.0.0.1:1"]}},
+  "groups": {"kyle": {"peers": ["phone", "amanita"]}},
+  "stores": {"Pictures": {"group": "kyle", "sync": "stream"}}
+}`
+	d, err := Start(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop()
+	src := filepath.Join(dir, "IMG_0001.jpg")
+	if err := os.WriteFile(src, []byte("a picture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Phone/IMG_0001.jpg", "Phone/IMG_0001.jpg"} {
+		if _, err := d.Send("Pictures", src, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Through a mount (where FUSE exists) the kernel's release lands a moment
+	// after the write returns; the journal-only path records at once.
+	var raw string
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, err = d.Browse("Pictures", "Phone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kids []api.BrowseEntry
+		if err := json.Unmarshal([]byte(raw), &kids); err != nil {
+			t.Fatal(err)
+		}
+		// The second send of the same name parks the first, never
+		// overwrites.
+		if len(kids) == 2 && kids[0].Size == 9 && kids[1].Size == 9 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Phone = %s", raw)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	got, err := d.ReadAt("Pictures", "Phone/IMG_0001.jpg", 0, 100)
+	if err != nil || string(got) != "a picture" {
+		t.Fatalf("ReadAt = %q, %v", got, err)
 	}
 }

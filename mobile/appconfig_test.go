@@ -22,16 +22,10 @@ func TestAppDefaultConfigIsValid(t *testing.T) {
   "dataDir": "` + data + `",
   "socket": "` + filepath.Join(data, "storeboard.sock") + `",
   "backup": { "enable": true, "keep": "1y" },
+  "learn": { "subscribe": "stream" },
   "peers": {
     "phone": {},
-    "pool": { "endpoints": ["192.168.1.10:4242"] }
-  },
-  "groups": {
-    "kyle": { "peers": ["phone", "pool"] }
-  },
-  "stores": {
-    "camera": { "group": "kyle" },
-    "photos": { "group": "kyle" }
+    "amanita": { "endpoints": ["amanita.grid:4242"] }
   }
 }`
 
@@ -42,13 +36,13 @@ func TestAppDefaultConfigIsValid(t *testing.T) {
 	}
 	defer d.Stop()
 
-	// A phone that has never heard from the pool still reports a sane
-	// document: this peer, both folders, nobody addressed but its own name.
+	// A phone that has never heard from its peer still reports a sane
+	// document: this peer, no stores until the peer offers them.
 	raw, err := d.Status()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(raw, `"peer":"phone"`) || !strings.Contains(raw, `"camera"`) || !strings.Contains(raw, `"photos"`) {
+	if !strings.Contains(raw, `"peer":"phone"`) {
 		t.Fatalf("status = %s", raw)
 	}
 

@@ -216,17 +216,17 @@ type Engine struct {
 	me      string
 	store   *store.Store
 
-	mu          sync.Mutex
+	mu sync.Mutex
 	// learnedChanged asks the daemon to rebuild with new offers (offers.go).
 	learnedChanged func()
-	stores      []*StoreState
-	byName      map[string]*StoreState
-	sends       map[string]transport.Sender
-	wants       map[string]map[string]*pending // wantKey -> slot -> want
-	incoming    map[string]*incomingBlob
-	reads       map[int64]chan readReply
-	readSeq     int64
-	holderRates map[string]holderRate
+	stores         []*StoreState
+	byName         map[string]*StoreState
+	sends          map[string]transport.Sender
+	wants          map[string]map[string]*pending // wantKey -> slot -> want
+	incoming       map[string]*incomingBlob
+	reads          map[int64]chan readReply
+	readSeq        int64
+	holderRates    map[string]holderRate
 	// readGates bounds streamed reads in flight per holder (readgate.go).
 	readGates map[string]*readGate
 	// lastHeard is when each peer last sent a frame (*atomic.Int64 nanos).
@@ -243,11 +243,11 @@ type Engine struct {
 	sx          streamExtra // stream.go: open write handles, read bookkeeping
 	// grants answers whether a person GateHouse knows may act on a store
 	// beyond its Linux owner (the acting verbs); nil grants nothing.
-	grants         gatehouse.Checker
+	grants gatehouse.Checker
 	// Friends' devices (friends.go).
-	friends      friendState
-	friendPerson func(peer string) string
-	friendMay    func(person, perm, store string) bool
+	friends        friendState
+	friendPerson   func(peer string) string
+	friendMay      func(person, perm, store string) bool
 	closed         chan struct{}
 	closeOnce      sync.Once
 	frameStartOnce sync.Once
