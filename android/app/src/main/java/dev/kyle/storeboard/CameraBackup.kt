@@ -36,6 +36,23 @@ object CameraBackup {
     /** What the last pass did, for the screen. */
     @Volatile var lastResult: String = ""
 
+    /**
+     * A streamed store's sends wait in the engine's queue on the phone until
+     * a holder takes them. Past this much, a pass waits for the queue to
+     * drain rather than copying the whole camera roll onto the phone again.
+     */
+    private const val QUEUE_LIMIT = 1L shl 30
+    private const val DRAIN_WAIT_MS = 10 * 60 * 1000L
+
+    private fun queueBytes(ctx: Context, store: String): Long =
+        File(File(Engine.dataDir(ctx), "queue"), store).walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    /** Starts a pass off the main thread; one runs at a time. */
+    fun runSoon(ctx: Context) {
+        val app = ctx.applicationContext
+        Thread({ run(app) }, "camera-backup").start()
+    }
+
     private val clock = DateTimeFormatter.ofPattern("HH:mm")
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("camera-backup", Context.MODE_PRIVATE)
@@ -138,10 +155,28 @@ object CameraBackup {
             lastResult = "Couldn't read the camera roll: ${e.message}"
             return 0
         }
-        if (items.isEmpty()) return 0
+        if (items.isEmpty()) {
+            if (lastResult.isEmpty()) lastResult = "Up to date"
+            return 0
+        }
         val inbox = File(ctx.cacheDir, "camera").apply { mkdirs() }
         var sent = 0
         for (it in items) {
+            lastResult = "Backing up: ${sent + 1} of ${items.size}"
+            // Let the holder catch up before queueing more on the phone.
+            val waitUntil = System.currentTimeMillis() + DRAIN_WAIT_MS
+            while (queueBytes(ctx, s.store) > QUEUE_LIMIT) {
+                if (System.currentTimeMillis() > waitUntil || !Engine.running() || !settings(ctx).enabled) {
+                    lastResult = "Paused after $sent of ${items.size}: waiting for a holder to take what's queued"
+                    return sent
+                }
+                lastResult = "Backing up: ${sent + 1} of ${items.size} (waiting for the upload to catch up)"
+                Thread.sleep(5_000)
+            }
+            if (!settings(ctx).enabled) {
+                lastResult = "Stopped after $sent"
+                return sent
+            }
             val copy = File(inbox, it.name)
             try {
                 ctx.contentResolver.openInputStream(it.uri)?.use { input ->

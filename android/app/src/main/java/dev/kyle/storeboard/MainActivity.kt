@@ -482,6 +482,7 @@ private fun CameraCard(carried: List<String>) {
             CameraBackup.enable(ctx, store, folder, existing)
             settings = CameraBackup.settings(ctx)
             editing = false
+            CameraBackup.runSoon(ctx)
         } else {
             result = "Camera backup needs permission to read photos and videos"
         }
@@ -518,7 +519,10 @@ private fun CameraCard(carried: List<String>) {
                 }
                 Button(enabled = store.isNotEmpty(), onClick = { ask.launch(CameraBackup.permissions()) }) { Text("Turn on") }
             }
-            if (settings.enabled && result.isNotEmpty()) Text(result, style = MaterialTheme.typography.bodySmall)
+            if (settings.enabled && !editing) {
+                if (result.isNotEmpty()) Text(result, style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { CameraBackup.runSoon(ctx) }) { Text("Back up now") }
+            }
         }
     }
 }

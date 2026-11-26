@@ -86,7 +86,8 @@ class SyncService : Service() {
     private val tick = object : Runnable {
         override fun run() {
             if (Engine.restartWanted()) Engine.restartAsync(applicationContext)
-            if (++ticks % (BACKUP_EVERY_MS / TICK_MS).toInt() == 0) backupSoon.run()
+            // Shortly after starting, then every few minutes.
+            if (++ticks == 3 || ticks % (BACKUP_EVERY_MS / TICK_MS).toInt() == 0) backupSoon.run()
             handler.postDelayed(this, TICK_MS)
         }
     }
