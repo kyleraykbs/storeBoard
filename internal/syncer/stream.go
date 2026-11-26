@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"slices"
 	"sort"
 	"sync"
@@ -562,6 +563,15 @@ func (fs *StoreState) observeTree() {
 // - is noticed here and replaced, rather than leaving the store's folder empty
 // until the daemon restarts.
 func (e *Engine) mountStream(fs *StoreState) {
+	// Android gives apps no FUSE: a streamed store there is served from its
+	// journal (the app's document provider browses and reads through the
+	// engine), and trying every link check only fills the log.
+	if runtime.GOOS == "android" {
+		if fs.noMountSaid.CompareAndSwap(false, true) {
+			e.logger.Info("streamed store served from its journal (no FUSE on Android)", "store", fs.name)
+		}
+		return
+	}
 	if fs.mount != nil {
 		if fs.mount.Alive() {
 			return

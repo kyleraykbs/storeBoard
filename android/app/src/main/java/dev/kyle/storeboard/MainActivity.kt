@@ -104,6 +104,7 @@ class MainActivity : ComponentActivity() {
                             askNotifications()
                             SyncService.start(this)
                             configured = true
+                            Background.ask(this)
                         }
                     }
                 }
@@ -343,6 +344,7 @@ private fun App() {
             }
         }
 
+        BackgroundCard()
         StoresCard(snap, ::choose)
         val carried = carriedStores(snap)
         CameraCard(carried)
@@ -400,7 +402,12 @@ private fun StoresCard(snap: Snapshot, choose: (String, String) -> Unit) {
                     }
                     if (s != null) {
                         append(" · ${s.optInt("entries")} files")
-                        if (s.optInt("pending") > 0) append(", ${s.optInt("pending")} to send")
+                        // Pending is what the store has that is not on the
+                        // phone: all of a streamed store, by design. Only a
+                        // kept store is still waiting for it.
+                        if (o.optString("mode") == "local" && s.optInt("pending") > 0) {
+                            append(", ${s.optInt("pending")} still arriving")
+                        }
                     }
                 }
                 Column {
@@ -638,5 +645,61 @@ private fun tail(file: File, bytes: Long = 32 * 1024, lines: Int = 60): String {
         text.lines().takeLast(lines).joinToString("\n")
     } catch (e: Exception) {
         "log unreadable: ${e.message}"
+    }
+}
+
+/** Running in the background: Android's battery optimization and notifications. */
+object Background {
+    fun unrestricted(ctx: Context): Boolean =
+        ctx.getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)
+
+    fun notificationsAllowed(ctx: Context): Boolean =
+        Build.VERSION.SDK_INT < 33 ||
+            ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /** Android's own dialog: let storeboard run in the background. */
+    fun ask(ctx: Context) {
+        if (unrestricted(ctx)) return
+        runCatching {
+            ctx.startActivity(
+                Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${ctx.packageName}")),
+            )
+        }
+    }
+}
+
+/** Shown until storeboard may run in the background and show its notification. */
+@Composable
+private fun BackgroundCard() {
+    val ctx = LocalContext.current
+    var unrestricted by remember { mutableStateOf(Background.unrestricted(ctx)) }
+    var notifications by remember { mutableStateOf(Background.notificationsAllowed(ctx)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            unrestricted = Background.unrestricted(ctx)
+            notifications = Background.notificationsAllowed(ctx)
+            delay(2000)
+        }
+    }
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { notifications = it }
+    if (unrestricted && notifications) return
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Keep syncing in the background", style = MaterialTheme.typography.titleMedium)
+            if (!unrestricted) {
+                Text(
+                    "Android may stop storeboard to save battery, and then this phone drops off your mesh and camera backup waits. Let it run unrestricted.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Button(onClick = { Background.ask(ctx) }) { Text("Allow background use") }
+            }
+            if (!notifications && Build.VERSION.SDK_INT >= 33) {
+                Text(
+                    "Its notification is how Android knows it is working; without it, it may be stopped sooner.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(onClick = { askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) }) { Text("Allow notifications") }
+            }
+        }
     }
 }

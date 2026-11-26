@@ -22,7 +22,7 @@ func TestAppDefaultConfigIsValid(t *testing.T) {
   "dataDir": "` + data + `",
   "socket": "` + filepath.Join(data, "storeboard.sock") + `",
   "backup": { "enable": true, "keep": "1y" },
-  "learn": { "subscribe": "stream" },
+  "learn": { "subscribe": "off" },
   "peers": {
     "phone": {},
     "amanita": { "endpoints": ["amanita.grid:4242"] }

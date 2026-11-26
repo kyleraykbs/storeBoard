@@ -167,10 +167,9 @@ object Engine {
     fun configured(context: Context): Boolean = configFile(context).exists()
 
     /**
-     * The config setup writes: this phone, the first peer to learn stores
-     * from, and a policy of streaming every store that peer offers (DESIGN:
-     * learned stores) until the person chooses otherwise. No stores and no
-     * groups: they come from the peer. The phone dials out, so it needs no
+     * The config setup writes: this phone and the first peer to learn stores
+     * from (DESIGN: learned stores). No stores and no groups: they come from
+     * the peer, each off until the person chooses stream or keep. The phone dials out, so it needs no
      * endpoint of its own; the peer's config must list this phone, by this
      * name, in a group with it.
      *
@@ -190,7 +189,7 @@ object Engine {
             .put("dataDir", data.absolutePath)
             .put("socket", File(data, "storeboard.sock").absolutePath)
             .put("backup", JSONObject().put("enable", true).put("keep", "1y"))
-            .put("learn", JSONObject().put("subscribe", "stream"))
+            .put("learn", JSONObject().put("subscribe", "off"))
             .put(
                 "peers",
                 JSONObject()

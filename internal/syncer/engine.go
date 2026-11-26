@@ -71,15 +71,17 @@ const (
 
 // StoreState is one top-level store's engine-side state.
 type StoreState struct {
-	name      string
-	group     string
-	stream    bool   // the canonical path is storeboard's FUSE mount
-	preferred string // declared holder preference, empty means none
-	root      string // canonical directory: <root>/<id>
-	symlinks  []string
-	links     map[string]string // target store id -> relative path
-	linkState []api.StoreSymlink
-	state     string
+	// noMountSaid: the no-FUSE note was logged once (stream.go).
+	noMountSaid atomic.Bool
+	name        string
+	group       string
+	stream      bool   // the canonical path is storeboard's FUSE mount
+	preferred   string // declared holder preference, empty means none
+	root        string // canonical directory: <root>/<id>
+	symlinks    []string
+	links       map[string]string // target store id -> relative path
+	linkState   []api.StoreSymlink
+	state       string
 
 	// tree is a streamed store's journal as a directory index, kept in step
 	// with every journal write; mount serves it, non-nil while mounted.
