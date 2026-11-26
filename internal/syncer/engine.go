@@ -217,6 +217,8 @@ type Engine struct {
 	store   *store.Store
 
 	mu          sync.Mutex
+	// learnedChanged asks the daemon to rebuild with new offers (offers.go).
+	learnedChanged func()
 	stores      []*StoreState
 	byName      map[string]*StoreState
 	sends       map[string]transport.Sender
@@ -1127,6 +1129,9 @@ func (e *Engine) OnPeerConnected(peer string, send transport.Sender) {
 		}
 		e.markFullSent(peer, fs, gen)
 	}
+	if peerHasFeature(send, featureOffers) {
+		e.sendOffers(peer)
+	}
 	e.requestEvaluate()
 }
 
@@ -1232,6 +1237,9 @@ func (e *Engine) OnPeerFrame(peer string, line []byte) {
 		e.enqueueBlob(e.blobFrames[blobShard(peer, &fr)], pf, e.peerMetered(peer))
 	case "blobCredit":
 		e.gotCredit(peer, fr.Length)
+	case "offers":
+		// Rare and small; off the read loop, since it writes a file.
+		go e.handleOffers(peer, &fr)
 	}
 }
 

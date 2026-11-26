@@ -216,6 +216,30 @@ owned by storeboard, and file bytes are not retained on this machine.
 - A remote update that would land on top of an unscanned local change parks
   that change as a conflict copy first.
 
+### Learned stores (decided 2026-11-25)
+
+The tree of stores is shared by every peer; what a machine chooses is
+whether it carries a store and how (the model, above). So a machine need not
+be told the tree by its config: its peers tell it.
+
+- On connecting, each side sends a declared peer an `offers` frame (feature
+  `offers`): every store whose group includes that peer, with its group and
+  links. The receiver keeps them in `<dataDir>/offers.json`; a peer's next
+  offers replace its last, and a store nobody offers any more is forgotten.
+- What the machine does with an offered store is its subscription
+  (`<dataDir>/subscribed.json`: stream, local or off; `storeboard subscribe`,
+  root only, or the app), else its policy (`learn.subscribe`, default off).
+- Each daemon pass is the config, then requested stores, then the learned
+  ones. The config always wins, and so does a request. A learned store joins
+  the offer's group: the one declared here if it includes this machine,
+  else a group of this machine and the declared peers that offered it.
+  Links between learned stores follow the offer.
+- Machines are still never learned (invariant 12): an offer counts only
+  from a declared peer, and a learned group holds only declared peers.
+- An offer or subscription that changes what the machine carries rebuilds
+  the daemon, as a request does. Unsubscribing deletes nothing (invariant
+  1): the files stay where they are.
+
 ## Enforced today
 
 - 1, 2: nothing is destroyed without a copy — remote deletes go to trash,

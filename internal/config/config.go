@@ -329,6 +329,16 @@ type Config struct {
 	// RequestedBy names, for stores merged from runtime requests
 	// (WithRequested), who asked. It is never read from the config file.
 	RequestedBy map[string]string `json:"-"`
+
+	// Learn, per machine, is what happens to stores peers offer (see
+	// Learn).
+	Learn *Learn `json:"learn,omitempty"`
+
+	// LearnedFrom names, for stores merged from offers (WithLearned), the
+	// peers that offered them; LearnedGroups are the groups made for them.
+	// Neither is read from the config file.
+	LearnedFrom   map[string][]string `json:"-"`
+	LearnedGroups map[string]bool     `json:"-"`
 }
 
 type StoreView struct {
@@ -561,6 +571,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Root == "" {
 		return fmt.Errorf("root is empty; cannot determine where the store tree lives")
+	}
+	if c.Learn != nil && c.Learn.Subscribe != "" && !ValidSubscribe(c.Learn.Subscribe) {
+		return fmt.Errorf("learn.subscribe %q: want off, stream or local", c.Learn.Subscribe)
 	}
 	if !filepath.IsAbs(c.Root) {
 		return fmt.Errorf("root %q: path must be absolute", c.Root)
@@ -948,6 +961,7 @@ func (c *Config) Stores() []api.Store {
 			Symlinks:    symlinks,
 			Links:       v.Links,
 			RequestedBy: c.RequestedBy[v.ID],
+			LearnedFrom: c.LearnedFrom[v.ID],
 		})
 	}
 	return out

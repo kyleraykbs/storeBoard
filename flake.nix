@@ -190,6 +190,10 @@
                             type = lib.types.attrsOf lib.types.anything;
                             default = { };
                           };
+                          systemd.tmpfiles.rules = lib.mkOption {
+                            type = lib.types.listOf lib.types.str;
+                            default = [ ];
+                          };
                           users.groups = lib.mkOption {
                             type = lib.types.attrsOf lib.types.anything;
                             default = { };

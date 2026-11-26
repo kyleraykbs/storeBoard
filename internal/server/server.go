@@ -157,6 +157,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		lock:      lock,
 	}
 	s.transport.SetHandler(engine)
+	// Offers that change what this machine carries rebuild it, as a request
+	// does.
+	engine.SetLearnedChanged(func() { s.restartOnce.Do(func() { close(s.restart) }) })
 	// Friends' devices, checked by the local GateHouse agent (DESIGN 12).
 	if cfg.Friends != nil {
 		sock := gatehouse.Socket()
@@ -210,6 +213,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/v1/cleanup", s.handleCleanup)
 	mux.HandleFunc("/v1/stores", s.handleRequestStore)
 	mux.HandleFunc("/v1/stores/", s.handleStore)
+	mux.HandleFunc("/v1/offers", s.handleOffers)
+	mux.HandleFunc("/v1/subscribe", s.handleSubscribe)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such endpoint"})
 	})

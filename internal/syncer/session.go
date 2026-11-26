@@ -52,6 +52,8 @@ type frame struct {
 	Bits    int    `json:"bits,omitempty"`
 	Sums    []byte `json:"sums,omitempty"`
 	Buckets []int  `json:"buckets,omitempty"`
+	// Offers are the stores a peer may carry with the sender (offers.go).
+	Offers []storeOffer `json:"offers,omitempty"`
 }
 
 // pending is a blob this side asked for: either a plain update to apply, or

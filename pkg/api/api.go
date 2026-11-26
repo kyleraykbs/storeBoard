@@ -48,6 +48,31 @@ type Store struct {
 	// RequestedBy is set for a store a program requested at runtime instead
 	// of one the config declares: the service that asked, or "root".
 	RequestedBy string `json:"requestedBy,omitempty"`
+	// LearnedFrom is set for a store this machine carries because peers
+	// offered it (DESIGN: learned stores): the peers that did.
+	LearnedFrom []string `json:"learnedFrom,omitempty"`
+}
+
+// Offered is a store peers offered this machine (GET /v1/offers).
+type Offered struct {
+	Name  string    `json:"name"`
+	Group string    `json:"group"`
+	From  []string  `json:"from"`
+	Seen  time.Time `json:"seen"`
+	// Mode is what this machine does with it: "stream", "local" or "off".
+	// Subscribed says it was chosen here rather than by the policy.
+	Mode       string `json:"mode"`
+	Subscribed bool   `json:"subscribed,omitempty"`
+	// Carried is how this machine has it now: "declared" (its config wins),
+	// "requested", "learned", or empty.
+	Carried string `json:"carried,omitempty"`
+}
+
+// Subscribe chooses what to do with an offered store (POST /v1/subscribe).
+type Subscribe struct {
+	Name string `json:"name"`
+	// Sync is "stream", "local", "off", or "" to follow the policy again.
+	Sync string `json:"sync"`
 }
 
 // Connection is this machine's link to one declared peer, as the daemon

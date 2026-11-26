@@ -52,8 +52,9 @@ func run() int {
 		stop()
 	}()
 
-	// Each pass is the declared config plus the stores programs requested;
-	// a new request ends the pass and the next one carries it.
+	// Each pass is the declared config plus the stores programs requested
+	// and the offered stores this machine subscribes to; a new request or a
+	// change in those ends the pass and the next one carries it.
 	for {
 		req, err := config.LoadRequested(declared.DataDir)
 		if err != nil {
@@ -64,6 +65,24 @@ func run() int {
 		if len(merged) > 0 {
 			logger.Info("carrying requested stores", "stores", merged)
 		}
+		offers, err := config.LoadOffers(declared.DataDir)
+		if err != nil {
+			logger.Error("offered stores", "error", err)
+			return 1
+		}
+		subs, err := config.LoadSubscriptions(declared.DataDir)
+		if err != nil {
+			logger.Error("subscriptions", "error", err)
+			return 1
+		}
+		if learned, names := cfg.WithLearned(offers, subs); len(names) > 0 {
+			if err := learned.Validate(); err != nil {
+				logger.Warn("offered stores left out: they would make the config invalid", "error", err)
+			} else {
+				logger.Info("carrying offered stores", "stores", names)
+				cfg = learned
+			}
+		}
 		srv, err := server.New(cfg, logger)
 		if err != nil {
 			logger.Error("startup failed", "error", err)
@@ -73,7 +92,7 @@ func run() int {
 		go func() {
 			select {
 			case <-srv.Restart():
-				logger.Info("a store was requested; starting again to carry it")
+				logger.Info("the stores to carry changed; starting again to carry them")
 			case <-pass.Done():
 			}
 			endPass()

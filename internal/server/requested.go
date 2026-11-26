@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
+	"codeberg.org/kyleraykbs/storeboard/pkg/api"
 )
 
 // peerPIDKey carries the socket peer's pid through the request context.
@@ -135,4 +136,54 @@ func unitOfPID(pid int) string {
 		}
 	}
 	return ""
+}
+
+// handleOffers lists the stores peers offer this machine and what it does
+// with each (GET /v1/offers). Anyone with the socket may read it, like the
+// status.
+func (s *Server) handleOffers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	offers, err := config.LoadOffers(s.cfg.DataDir)
+	if err == nil {
+		var subs map[string]config.Subscription
+		if subs, err = config.LoadSubscriptions(s.cfg.DataDir); err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"policy": s.cfg.SubscribeDefault(), "offers": s.cfg.OfferList(offers, subs)})
+			return
+		}
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+}
+
+// handleSubscribe chooses what this machine does with an offered store
+// (POST /v1/subscribe). It changes what the machine carries, so only root
+// may, as with a requested store; the daemon rebuilds itself when it does.
+func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	uid, ok := requestUID(r)
+	if !ok || uid != 0 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only root may choose the stores this machine carries"})
+		return
+	}
+	var p api.Subscribe
+	if !decodeBody(w, r, &p) {
+		return
+	}
+	changed, err := s.cfg.Subscribe(p.Name, p.Sync, "root")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.logger.Info("subscription", "store", p.Name, "sync", p.Sync, "changes", changed)
+	writeJSON(w, http.StatusOK, map[string]any{"name": p.Name, "sync": p.Sync, "restarting": changed})
+	if changed {
+		s.restartOnce.Do(func() { close(s.restart) })
+	}
 }

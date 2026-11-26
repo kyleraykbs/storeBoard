@@ -138,6 +138,7 @@ in
       peer
       peers
       groups
+      learn
       friends
       stores
       permissions

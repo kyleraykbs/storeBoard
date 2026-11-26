@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/kyleraykbs/storeboard/internal/config"
@@ -47,6 +48,10 @@ type Daemon struct {
 	// holder runs under it, so Stop cuts a stalled fetch short instead of
 	// waiting out its timeout.
 	ctx context.Context
+	// restart is set when the stores to carry changed: the app starts the
+	// engine again (Stop, Start) to carry them.
+	restart *atomic.Bool
+
 	// calls counts browse calls in flight. Stop waits for them before it
 	// closes the journals they read: a document provider calls in from
 	// binder threads the service's lifecycle knows nothing about.
@@ -65,6 +70,18 @@ func Start(configJSON, logPath string) (*Daemon, error) {
 	cfg, err := config.Parse([]byte(configJSON))
 	if err != nil {
 		return nil, err
+	}
+	// As the daemon does each pass: requested stores, then the offered
+	// stores this phone subscribes to (DESIGN: learned stores).
+	if req, err := config.LoadRequested(cfg.DataDir); err == nil {
+		cfg, _ = cfg.WithRequested(req)
+	}
+	if offers, err := config.LoadOffers(cfg.DataDir); err == nil {
+		if subs, err := config.LoadSubscriptions(cfg.DataDir); err == nil {
+			if learned, names := cfg.WithLearned(offers, subs); len(names) > 0 && learned.Validate() == nil {
+				cfg = learned
+			}
+		}
 	}
 
 	var out io.Writer = io.Discard
@@ -108,6 +125,8 @@ func Start(configJSON, logPath string) (*Daemon, error) {
 	}
 	mgr := transport.New(cfg, logger)
 	mgr.SetHandler(eng)
+	var restart atomic.Bool
+	eng.SetLearnedChanged(func() { restart.Store(true) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -121,6 +140,7 @@ func Start(configJSON, logPath string) (*Daemon, error) {
 		engineRun: done,
 		logw:      closer,
 		ctx:       ctx,
+		restart:   &restart,
 	}
 	go func() {
 		defer close(done)
@@ -323,3 +343,33 @@ func (d *Daemon) Doctor() (string, error) {
 	b, err := json.Marshal(d.eng.Doctor(d.mgr.Snapshot()))
 	return string(b), err
 }
+
+// Offers is the stores peers offer this phone and what it does with each,
+// as JSON: {"policy": ..., "offers": [api.Offered...]}, as GET /v1/offers.
+func (d *Daemon) Offers() (string, error) {
+	offers, err := config.LoadOffers(d.cfg.DataDir)
+	if err != nil {
+		return "", err
+	}
+	subs, err := config.LoadSubscriptions(d.cfg.DataDir)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(map[string]any{"policy": d.cfg.SubscribeDefault(), "offers": d.cfg.OfferList(offers, subs)})
+	return string(b), err
+}
+
+// Subscribe chooses what this phone does with an offered store: sync is
+// "stream", "local", "off", or "" for the policy. It reports whether the
+// engine must start again to carry the change (RestartWanted turns true).
+func (d *Daemon) Subscribe(name, sync string) (bool, error) {
+	changed, err := d.cfg.Subscribe(name, sync, "app")
+	if changed {
+		d.restart.Store(true)
+	}
+	return changed, err
+}
+
+// RestartWanted reports that the stores to carry changed (a subscription,
+// or a peer's offer under the policy): the app stops and starts the engine.
+func (d *Daemon) RestartWanted() bool { return d.restart.Load() }

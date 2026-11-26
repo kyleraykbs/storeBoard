@@ -37,6 +37,13 @@ Commands:
   store takeover <name>
                   turn a declared symlink path that already holds files
                   into a link to the store, keeping and syncing that content
+  stores          the stores peers offer this machine, and how it
+                  carries each (declared, learned, or not at all)
+  subscribe <store> [--sync stream|local|policy]
+                  carry an offered store here, streamed (the default) or
+                  in full; policy follows learn.subscribe again (root only)
+  unsubscribe <store>
+                  stop carrying an offered store; its files stay (root only)
   send <store> <file> [--as PATH]
                   copy a file of yours into a store (the original stays
                   where it is); a name already taken is parked, not lost
@@ -101,6 +108,12 @@ func Run(ctx context.Context, args []string, configPath string, stdout, stderr i
 		return doctorCmd(ctx, configPath, rest, stdout, stderr)
 	case "send":
 		return sendCmd(ctx, configPath, rest, stdout, stderr)
+	case "stores":
+		return storesCmd(ctx, configPath, rest, stdout, stderr)
+	case "subscribe":
+		return subscribeCmd(ctx, configPath, rest, false, stdout, stderr)
+	case "unsubscribe":
+		return subscribeCmd(ctx, configPath, rest, true, stdout, stderr)
 	case "store":
 		return storeCmd(ctx, configPath, rest, stdout, stderr)
 	case "backup":

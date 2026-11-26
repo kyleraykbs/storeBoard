@@ -96,6 +96,29 @@ rec {
     description = "Devices this machine may sync with, by name.";
   };
 
+  learn = lib.mkOption {
+    type = lib.types.nullOr (
+      lib.types.submodule {
+        options.subscribe = lib.mkOption {
+          type = lib.types.enum [
+            "off"
+            "stream"
+            "local"
+          ];
+          default = "off";
+          description = ''
+            What a store a peer offers this machine (one in a group with it
+            that this config does not declare) becomes until someone chooses:
+            off (listed by `storeboard stores`, carried only once someone runs
+            `storeboard subscribe`), streamed, or kept in full.
+          '';
+        };
+      }
+    );
+    default = null;
+    description = "Stores learned from peers (DESIGN: learned stores). Declared stores always win.";
+  };
+
   friends = lib.mkOption {
     type = lib.types.nullOr (
       lib.types.submodule {
@@ -332,6 +355,9 @@ rec {
       ) cfg.groups;
     }
     // lib.optionalAttrs (cfg ? stores) { stores = storesJSON cfg.stores; }
+    // lib.optionalAttrs (cfg ? learn && cfg.learn != null) {
+      learn = { subscribe = cfg.learn.subscribe; };
+    }
     // lib.optionalAttrs (cfg ? friends && cfg.friends != null) {
       friends = { listen = cfg.friends.listen; } // lib.optionalAttrs (cfg.friends.gatehouse != null) { gatehouse = cfg.friends.gatehouse; };
     }
