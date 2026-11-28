@@ -914,13 +914,17 @@ func (m *storeMutator) Remove(path string) error {
 	if ent = m.fs.db.Get(path); ent == nil || ent.Deleted {
 		return os.ErrNotExist
 	}
+	changed, err := m.keepParentLocked(path, "")
+	if err != nil {
+		return err
+	}
 	vv := m.e.nextVV(m.fs, ent)
 	tomb := &Entry{Path: path, Deleted: true, Dir: ent.Dir, VV: vv}
 	_ = m.fs.db.Put(tomb)
 	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opDelete, Path: path, VV: vv}); err != nil {
 		return err
 	}
-	go m.e.broadcastIndex(m.fs, []*Entry{tomb})
+	go m.e.broadcastIndex(m.fs, append(changed, tomb))
 	go m.e.flushQueue(m.fs)
 	return nil
 }
@@ -951,15 +955,68 @@ func (m *storeMutator) RemoveDir(path string) error {
 	if len(m.fs.childrenLocked(path)) > 0 {
 		return os.ErrExist
 	}
+	changed, err := m.keepParentLocked(path, "")
+	if err != nil {
+		return err
+	}
 	vv := m.e.nextVV(m.fs, m.fs.db.Get(path))
 	tomb := &Entry{Path: path, Dir: true, Deleted: true, VV: vv}
 	_ = m.fs.db.Put(tomb)
 	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opRmdir, Path: path, VV: vv}); err != nil {
 		return err
 	}
-	go m.e.broadcastIndex(m.fs, []*Entry{tomb})
+	go m.e.broadcastIndex(m.fs, append(changed, tomb))
 	go m.e.flushQueue(m.fs)
 	return nil
+}
+
+// parentToKeepLocked is the directory entry that keeps path's parent in place
+// once path leaves it, or nil when nothing needs recording. Callers hold
+// scanMu.
+//
+// A directory the user never made exists only because something is in it,
+// and it vanishes with its last child. On the mount that breaks what every
+// program expects of a directory: a file manager moving a folder to another
+// mount copies it, unlinks each file and then rmdirs the folder - which by
+// then had disappeared, so the move "failed" with ENOENT, and every implied
+// parent above it went too. Emptying a directory through the mount therefore
+// records it, exactly as mkdir would have; rmdir is what removes it.
+//
+// to is a rename's destination: a move that stays inside the parent leaves
+// it non-empty.
+func (m *storeMutator) parentToKeepLocked(path, to string) *Entry {
+	i := strings.LastIndex(path, "/")
+	if i <= 0 || m.fs.tree == nil {
+		return nil // the store root always exists
+	}
+	dir := path[:i]
+	if to != "" && (to == dir || strings.HasPrefix(to, dir+"/")) {
+		return nil
+	}
+	cur := m.fs.db.Get(dir)
+	if cur != nil && !cur.Deleted && cur.Dir {
+		return nil // already recorded: it stays until rmdir
+	}
+	if !m.fs.tree.OnlyChild(dir, path[i+1:]) {
+		return nil
+	}
+	return &Entry{Path: dir, Dir: true, Mode: 0o755, VV: m.e.nextVV(m.fs, cur)}
+}
+
+// keepParentLocked records and queues the parent parentToKeepLocked names,
+// before path itself goes: recorded first, the mounted view never sees the
+// directory vanish, and queued first, a holder's own pruning of emptied
+// directories stops at it. Callers hold scanMu and not queueMu.
+func (m *storeMutator) keepParentLocked(path, to string) ([]*Entry, error) {
+	keep := m.parentToKeepLocked(path, to)
+	if keep == nil {
+		return nil, nil
+	}
+	if err := m.e.enqueueOp(m.fs, queueOp{ID: newOpID(m.e), Op: opMkdir, Path: keep.Path, Mode: keep.Mode, VV: keep.VV}); err != nil {
+		return nil, err
+	}
+	_ = m.fs.db.Put(keep)
+	return []*Entry{keep}, nil
 }
 
 // moveQueuedPut changes the destination of a pending upload without making a
@@ -1032,6 +1089,11 @@ func (m *storeMutator) Rename(from, to string) error {
 		dstTomb = &Entry{Path: to, Deleted: true, Dir: dst.Dir, VV: vv}
 		records = append(records, queueOp{ID: newOpID(m.e), Op: opDelete, Path: to, VV: vv})
 	}
+	// Moving the last thing out of a directory leaves the directory.
+	keep := m.parentToKeepLocked(from, to)
+	if keep != nil {
+		records = append(records, queueOp{ID: newOpID(m.e), Op: opMkdir, Path: keep.Path, Mode: keep.Mode, VV: keep.VV})
+	}
 
 	// The whole move is planned first and lands as one batch: one append to
 	// the queue file, one fsync, one compaction. Done per file, a folder of
@@ -1098,6 +1160,9 @@ func (m *storeMutator) Rename(from, to string) error {
 	// Durable first: if the queue cannot take it, nothing has moved.
 	if err := m.e.appendQueue(m.fs, records, true); err != nil {
 		return err
+	}
+	if keep != nil {
+		_ = m.fs.db.Put(keep)
 	}
 	if dstTomb != nil {
 		_ = m.fs.db.Put(dstTomb)

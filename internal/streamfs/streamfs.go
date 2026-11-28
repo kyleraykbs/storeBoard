@@ -318,6 +318,16 @@ func (t *Tree) Children(dir string) []Entry {
 	return out
 }
 
+// OnlyChild reports whether name is the one thing directly inside dir: the
+// child whose removal would leave dir empty.
+func (t *Tree) OnlyChild(dir, name string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	kids := t.kids[cleanPath(dir)]
+	_, ok := kids[name]
+	return ok && len(kids) == 1
+}
+
 // hasChildren reports whether a directory has anything beneath it.
 func (t *Tree) hasChildren(dir string) bool {
 	t.mu.RLock()
